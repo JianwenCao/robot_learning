@@ -1,0 +1,38 @@
+[project]
+name = "isaac-so-arm101"
+version = "1.2.0"
+description = "Reinforcement Learning with the SO-ARM100 / SO-ARM101 in Isaac Lab"
+readme = "README.md"
+authors = [
+    { name = "Louis Le Lay", email = "le.lay.louis@gmail.com" }
+]
+requires-python = "==3.11.*"
+dependencies = [
+    "isaaclab[all,isaacsim]==2.3.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+]
+
+[project.scripts]
+train = "isaac_so_arm101.scripts.rsl_rl.train:main"
+play = "isaac_so_arm101.scripts.rsl_rl.play:main"
+list_envs = "isaac_so_arm101.scripts.list_envs:main"
+zero_agent = "isaac_so_arm101.scripts.zero_agent:main"
+random_agent = "isaac_so_arm101.scripts.random_agent:main"
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+environments = [
+  "sys_platform == 'linux' and implementation_name == 'cpython' and python_version == '3.11'",
+  "sys_platform == 'win32' and implementation_name == 'cpython' and python_version == '3.11'"
+]
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com/"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
+
+[build-system]
+requires = ["uv_build>=0.8.21,<0.9.0"]
+build-backend = "uv_build"

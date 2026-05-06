@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Claude
+.claude/
+
+# Training artifacts
+logs/
+outputs/
+wandb/
+runs/
+checkpoints/
+*.ckpt
+
+# Misc large/binary
+*.mp4
+*.avi
+*.bag
