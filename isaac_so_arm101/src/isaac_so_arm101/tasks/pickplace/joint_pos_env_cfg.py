@@ -20,17 +20,24 @@ DexCube — its size is the spec, so we encode it directly.
 import isaaclab.sim as sim_utils
 import isaaclab_tasks.manager_based.manipulation.lift.mdp as lift_mdp  # noqa: F401
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.sensors.camera.camera_cfg import CameraCfg
+from isaaclab.sensors.camera.tiled_camera_cfg import TiledCameraCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import (
     FrameTransformerCfg,
     OffsetCfg,
 )
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
 from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
+from isaaclab.sim.spawners.sensors.sensors_cfg import PinholeCameraCfg
 from isaaclab.utils import configclass
 
 import isaac_so_arm101.tasks.pickplace.mdp as mdp
 from isaac_so_arm101.robots import SO_ARM101_CFG  # noqa: F401
-from isaac_so_arm101.tasks.pickplace.pickplace_env_cfg import PickPlaceBowlEnvCfg
+from isaac_so_arm101.tasks.pickplace.pickplace_env_cfg import (
+    PickPlaceBowlEnvCfg,
+    WRIST_RGB_HEIGHT,
+    WRIST_RGB_WIDTH,
+)
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
@@ -47,8 +54,20 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # SO-ARM101 articulation
-        self.scene.robot = SO_ARM101_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # SO-ARM101 articulation. Override the home gripper joint to be
+        # **open** (0.5 rad ≈ matches the lift-task ``open_command_expr``)
+        # instead of the SO_ARM101_CFG default 0 rad (closed). With jaws
+        # already open at start, the policy's grasp problem reduces to
+        # "close gripper when ee is close to block", which is one-step
+        # rather than the longer sequence (open → approach → close) that
+        # plagued the closed-jaw home in earlier diagnostics.
+        home_state = SO_ARM101_CFG.init_state.replace(
+            joint_pos={**SO_ARM101_CFG.init_state.joint_pos, "gripper": 0.5},
+        )
+        self.scene.robot = SO_ARM101_CFG.replace(
+            prim_path="{ENV_REGEX_NS}/Robot",
+            init_state=home_state,
+        )
 
         # Joint-position action — absolute-around-home with scale=0.5,
         # exactly the lift-task wiring (EVAL1_PLAN §3.2). Setting action=0
@@ -63,9 +82,13 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
         self.actions.gripper_action = mdp.BinaryJointPositionActionCfg(
             asset_name="robot",
             joint_names=["gripper"],
-            # Open command widened from lift's 0.5 → 1.5 because the 2 cm
-            # block needs more clearance than the 2.5 cm shrunk-DexCube.
-            open_command_expr={"gripper": 1.5},
+            # Open command matches the lift task (0.5 rad). Earlier we used
+            # 1.5 rad for "more clearance" around the 2 cm block, but with
+            # identical PD gains and effort_limit=2.5 N, closing 1.5 → 0 is
+            # ~3× slower than 0.5 → 0, and at 50 Hz control the gripper
+            # never finishes closing before the arm moves on. Lift task
+            # grips a 2.5 cm cube fine at 0.5; our 2 cm cube is smaller.
+            open_command_expr={"gripper": 0.5},
             close_command_expr={"gripper": 0.0},
         )
 
@@ -120,6 +143,56 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
                     offset=OffsetCfg(pos=[0.01, 0.0, -0.09]),
                 ),
             ],
+        )
+
+        # ------------------------------------------------------------------
+        # Wrist camera — TiledCamera parented to gripper_link.
+        # ------------------------------------------------------------------
+        # Intrinsics are loaded from camera_intrinsics.yaml (the real wrist
+        # cam's calibration) and converted to USD pinhole parameters. This
+        # makes the simulated horizontal FOV match the real camera's exactly,
+        # which is what we rely on for sim-to-real visual transfer.
+        #
+        # Render resolution is 16:9 (WRIST_RGB_WIDTH × WRIST_RGB_HEIGHT) so
+        # the aspect ratio matches the real cam — preserving the wide
+        # horizontal FOV (~102°) that the policy uses to search for the
+        # block when it spawns at a workspace edge (EVAL1_PLAN §4).
+        #
+        # Extrinsic offset is a starting estimate; measure with calipers
+        # before deployment and update both the sim OffsetCfg and the
+        # deploy-side FK chain in lockstep.
+        intrinsics = mdp.load_wrist_cam_intrinsics()
+        self.scene.wrist_cam = TiledCameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/gripper_link/wrist_cam",
+            update_period=self.sim.dt * self.decimation,  # match policy step
+            height=WRIST_RGB_HEIGHT,
+            width=WRIST_RGB_WIDTH,
+            data_types=["rgb"],
+            spawn=PinholeCameraCfg(
+                focal_length=intrinsics["focal_length"],
+                horizontal_aperture=intrinsics["horizontal_aperture"],
+                # Vertical aperture auto-derived to keep square pixels (we
+                # already verified fx ≈ fy in the loader). Far clipping
+                # tightened to 2 m — workspace is ≤ 0.5 m from cam.
+                clipping_range=(0.01, 2.0),
+            ),
+            # Wrist-cam mounting offset on gripper_link. Verbatim from
+            # LeIsaac's `single_arm_env_cfg.py`, which targets the same
+            # physical robot (TheRobotStudio SO-ARM101) and the same
+            # standard LeRobot/WOWROBO side-bracket wrist-cam mount we
+            # use. Their USD link `Robot/gripper` and our URDF-converted
+            # `Robot/gripper_link` are the same physical link with the
+            # same frame, so the 7 numbers transfer directly:
+            #   https://github.com/LightwheelAI/leisaac/blob/main/source/leisaac/leisaac/tasks/template/single_arm_env_cfg.py
+            # The bracket sits ~10 cm out in gripper +Y (the side away
+            # from the moving jaw) and tilts the lens ~48° down-and-
+            # toward-fingers so the table and gripper tips are both in
+            # frame at home pose.
+            offset=CameraCfg.OffsetCfg(
+                pos=(-0.001, 0.1, -0.04),
+                rot=(-0.404379, -0.912179, -0.0451242, 0.0486914),
+                convention="ros",
+            ),
         )
 
 

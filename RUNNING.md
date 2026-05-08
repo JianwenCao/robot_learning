@@ -107,7 +107,7 @@ Expect 10 tasks — Reach, Lift, and PickPlace, with the ARM100/ARM101 and train
 | 9 | `Isaac-SO-ARM101-Reach-v0` |
 | 10 | `Isaac-SO-ARM101-Reach-Play-v0` |
 
-`PickPlace-Bowl` is the SO-ARM101 single-object pick-and-place task added for Eval 1 of the project; see `EVAL1_PLAN.md` for design and `tasks/pickplace/` for the source.
+`PickPlace-Bowl` is the SO-ARM101 single-object pick-and-place task added for Eval 1 of the project; see `EVAL1_PLAN.md` for design and `tasks/pickplace/` for the source. **It is vision-based** — a wrist-mounted `TiledCamera` is parented to `gripper_link` and ``wrist_rgb`` is a deployable obs group. Always pass `--enable_cameras` to `train`, `play`, `zero_agent`, `random_agent`, or any other entry point that instantiates this env; without the flag the camera fails to initialize and the env raises ``RuntimeError: A camera was spawned without the --enable_cameras flag`` on the first step.
 
 > ⚠️ **The upstream README task names are stale.** It writes `SO-ARM100-Reach-Play-v0`; the registered gym IDs are prefixed with `Isaac-`. Use the table above (or `list_envs`) as the source of truth — `--task SO-ARM100-Reach-Play-v0` will fail with a gym registration error.
 
@@ -136,11 +136,14 @@ train --task Isaac-SO-ARM100-Reach-v0 --headless
 - `--video --video_length 200 --video_interval 2000` — record rollouts to MP4
 - `--logger tensorboard|wandb|neptune` — defaults to TensorBoard
 
-Logs and checkpoints land under `isaac_so_arm101/logs/rsl_rl/<experiment_name>/<run>/`. Watch them live:
+Logs and checkpoints land under `<CWD>/logs/rsl_rl/<experiment_name>/<run>/`. The training script uses a relative `logs/rsl_rl/...` path, so the destination is whatever directory you ran `train` from. Run from the project root and they end up at `project3/logs/rsl_rl/...`:
 
 ```bash
-tensorboard --logdir isaac_so_arm101/logs/rsl_rl
+cd /home/rui/Projects/Course_Code/Robot_Learning/project3
+tensorboard --logdir logs/rsl_rl
 ```
+
+(Earlier versions of this doc pointed at `isaac_so_arm101/logs/rsl_rl` — that path is wrong unless you `cd isaac_so_arm101` before launching `train`.)
 
 ### 6. Evaluate a trained policy
 

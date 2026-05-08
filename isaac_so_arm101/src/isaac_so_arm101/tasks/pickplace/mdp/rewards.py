@@ -49,17 +49,19 @@ def _grasped_mask(
     grasp_distance: float,
     minimal_height: float,
 ) -> torch.Tensor:
-    """Bool tensor (num_envs,) — same heuristic as ``observations.is_grasped``.
+    """Bool tensor (num_envs,) — "block has been lifted off the table".
 
-    Duplicated locally so reward functions don't take a hard dep on the obs
-    module's signatures (and so they can be tweaked independently).
+    Earlier this also required ``||ee - block|| < grasp_distance`` but that
+    was a chicken-and-egg trap: the policy couldn't earn grasp until block
+    was lifted, but couldn't lift the block until something gripped it. The
+    lift task uses just ``z > minimal_height`` and that's enough — a block
+    can't levitate on its own, so any non-trivial lift implies a grasp.
+    The ``grasp_distance`` parameter is kept on the call signature for
+    backward-compat with reward terms that still pass it.
     """
     obj: RigidObject = env.scene[object_cfg.name]
-    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     block_pos_w = obj.data.root_pos_w
-    ee_w = ee_frame.data.target_pos_w[..., 0, :]
-    dist = torch.norm(block_pos_w - ee_w, dim=1)
-    return (block_pos_w[:, 2] > minimal_height) & (dist < grasp_distance)
+    return block_pos_w[:, 2] > minimal_height
 
 
 def _bowl_xy_w(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
@@ -73,6 +75,91 @@ def _bowl_xy_w(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return robot.data.root_pos_w[:, :2] + bowl_b
 
 
+def _episode_lifted_mask(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    minimal_height: float = 0.025,
+) -> torch.Tensor:
+    """Per-episode latched flag: "block has been lifted ≥ ``minimal_height`` at any
+    step of the current episode".
+
+    Updated every call (idempotent OR-latch); reset to all-False on episode
+    reset by :func:`mdp.events.reset_was_grasped` (event-term, mode=``reset``).
+    Lives on the env instance under ``env._was_grasped``.
+
+    Used by :func:`place_in_bowl` and :func:`release_in_bowl` to gate the
+    bowl-region rewards on the policy having actually grasped + lifted the
+    cube at some point in the episode. Without this gate the policy can
+    earn place / release by *dragging* the cube laterally with the gripper
+    closed at z≈0.01 (block_z stays below ``minimal_height`` so
+    :func:`_grasped_mask` returns False, but block xy reaches the bowl
+    footprint via lateral pushing) — a strategy that doesn't transfer to
+    real hardware. Gating both rewards on this latch closes that shortcut.
+
+    Returns shape ``(num_envs,)`` bool.
+    """
+    obj: RigidObject = env.scene[object_cfg.name]
+    lifted_now = obj.data.root_pos_w[:, 2] > minimal_height
+    if not hasattr(env, "_was_grasped"):
+        env._was_grasped = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    # Idempotent OR-latch — safe to call multiple times per step.
+    env._was_grasped |= lifted_now
+    return env._was_grasped
+
+
+# ---------------------------------------------------------------------------
+# Stage 0 — pre-grasp pose: ee close to block AND jaws open
+# ---------------------------------------------------------------------------
+
+
+def pre_grasp_pose(
+    env: ManagerBasedRLEnv,
+    std: float = 0.05,
+    grasp_distance: float = 0.04,
+    minimal_height: float = 0.025,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    gripper_joint_name: str = "gripper",
+    gripper_open_value: float = 1.5,
+) -> torch.Tensor:
+    """Dense reward for *pre-grasp* posture, gated off once block is grasped.
+
+    This term decomposes the temporally-extended grasp prerequisite ("open
+    jaws → approach → close jaws around block → lift") into a step-level
+    gradient that PPO can hill-climb on. Without it, a 1500-iter state-
+    only run plateaued at reach-only because the policy couldn't credit-
+    assign the gripper-opening sub-task.
+
+    Returns ``proximity * jaw_openness * (1 - is_grasped)``:
+
+    * ``proximity = exp(-||ee - block||² / std²)``  → 1 at zero distance,
+      drops smoothly to 0 by ~0.15 m.
+    * ``jaw_openness = clamp(gripper_q / gripper_open_value, 0, 1)`` —
+      0 when fully closed, 1 when fully open.
+    * ``(1 - is_grasped)`` — **critical**: without this gate the policy
+      camps at pre-grasp pose forever (observed empirically: pre_grasp
+      reward saturated at 1.89/step weight=2.0 with grasp reward at 0).
+      Gating off on grasp makes attempting a grasp net-positive: lose
+      ≤ 2/step pre_grasp → gain 5/step grasp.
+    """
+    obj: RigidObject = env.scene[object_cfg.name]
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+
+    block_pos_w = obj.data.root_pos_w
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    d2 = torch.sum((block_pos_w - ee_w) ** 2, dim=1)
+    proximity = torch.exp(-d2 / (std * std))
+
+    gripper_idx = robot.find_joints(gripper_joint_name)[0][0]
+    gripper_q = robot.data.joint_pos[:, gripper_idx]
+    jaw_openness = (gripper_q / gripper_open_value).clamp(0.0, 1.0)
+
+    grasped = _grasped_mask(env, object_cfg, ee_frame_cfg, grasp_distance, minimal_height)
+    return proximity * jaw_openness * (1.0 - grasped.float())
+
+
 # ---------------------------------------------------------------------------
 # Stage 1 — reach
 # ---------------------------------------------------------------------------
@@ -80,22 +167,32 @@ def _bowl_xy_w(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
 def reach_block(
     env: ManagerBasedRLEnv,
-    std: float = 0.1,
-    grasp_distance: float = 0.04,
-    minimal_height: float = 0.025,
+    std: float = 0.05,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """Dense reach reward, *gated off* once the block is grasped.
+    """Dense reach reward, ungated.
 
-    Without the gate this term dominates throughout the episode and the
-    policy hovers above the block instead of advancing to grasp.
+    Earlier we gated this term off when the block was grasped (``× (1 -
+    is_grasped)``) on the theory that the policy would hover above the
+    block to farm reach reward. In practice this created a reward cliff at
+    the moment of grasping (reach: 1 → 0 stepwise) which is a gradient
+    discontinuity PPO doesn't handle well — and the upstream lift task
+    leaves its analogous reach reward ungated and converges fine. So we
+    drop the gate.
+
+    Keeping reach ungated only works while its weight stays small relative
+    to the lift signal (``grasp`` term, w=15). Run 7 (5.0 → 1.0 reach revert,
+    see :class:`pickplace_env_cfg.RewardsCfg`) restored that ratio after a
+    w=5 run created a hover-at-cube basin the policy never escaped.
+
+    The ``std`` was also tightened from 0.1 → 0.05 to match the lift task's
+    sharper attractor at the cube position.
     """
     obj: RigidObject = env.scene[object_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     dist = torch.norm(obj.data.root_pos_w - ee_frame.data.target_pos_w[..., 0, :], dim=1)
-    grasped = _grasped_mask(env, object_cfg, ee_frame_cfg, grasp_distance, minimal_height)
-    return (1.0 - grasped.float()) * (1.0 - torch.tanh(dist / std))
+    return 1.0 - torch.tanh(dist / std)
 
 
 # ---------------------------------------------------------------------------
@@ -156,23 +253,29 @@ def transport_to_bowl(
 def place_in_bowl(
     env: ManagerBasedRLEnv,
     r_safe: float = 0.06,
-    bowl_height: float = 0.06,
-    grasp_distance: float = 0.04,
+    bowl_height: float = 0.08,
     minimal_height: float = 0.025,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
-    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """Reward for *positioning* the held block over the bowl.
+    """Reward for the block being inside the bowl footprint **after a grasp**.
 
-    Gated on ``is_grasped`` — without that gate, a block sitting on the
-    table that happened to spawn near the bowl xy pays out every step
-    (observed empirically in the 100-iter smoke run: place reward 1.2/episode
-    with grasp reward ~0). This matches the lift-task pattern of
-    ``object_goal_distance`` multiplied by ``(object.z > minimal_height)``.
+    Gated on the per-episode :func:`_episode_lifted_mask` latch (block was
+    lifted ≥ ``minimal_height`` at some prior step of this episode). Without
+    this gate the policy can drag the block laterally with the gripper
+    closed at z≈0.01 to reach the bowl footprint without ever lifting,
+    which doesn't transfer to real hardware. With it, place reward only
+    starts paying out after the policy has *grasped + lifted* the block
+    at least once in the episode — making lift the necessary precondition
+    for any place / release reward.
 
-    See §3.3 of EVAL1_PLAN — the bowl is not modeled as a mesh, so the
-    geometric check is "xy near goal AND block roughly at table height".
+    The geometric "in bowl" condition itself is unchanged — block xy
+    within ``r_safe`` of bowl xy AND block z below ``bowl_height`` (so
+    a held block hovering above the bowl rim still pays out, covering
+    the gripper-jaw closure depth). The earlier rationale — that the
+    BowlPoseCommand rejection sampler keeps ``‖block − bowl‖ ≥ 0.10``
+    at reset, preventing init-overlap farming — is preserved; the new
+    gate covers the *dragging* exploit specifically.
     """
     obj: RigidObject = env.scene[object_cfg.name]
     block_xy = obj.data.root_pos_w[:, :2]
@@ -180,8 +283,8 @@ def place_in_bowl(
     bowl_w = _bowl_xy_w(env, command_name)
     in_xy = torch.norm(block_xy - bowl_w, dim=1) < r_safe
     low = block_z < bowl_height
-    grasped = _grasped_mask(env, object_cfg, ee_frame_cfg, grasp_distance, minimal_height)
-    return (in_xy & low & grasped).float()
+    was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
+    return (in_xy & low & was_lifted).float()
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +298,7 @@ def release_in_bowl(
     bowl_height: float = 0.06,
     gripper_open_threshold: float = 0.2,
     block_speed_threshold: float = 0.05,
+    minimal_height: float = 0.025,
     command_name: str = "bowl_pose",
     gripper_joint_name: str = "gripper",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
@@ -202,8 +306,17 @@ def release_in_bowl(
 ) -> torch.Tensor:
     """Terminal release reward — fires when the policy actually lets go.
 
-    All three conditions must hold simultaneously:
+    Gated on the same per-episode lift latch as :func:`place_in_bowl` so the
+    drag-to-bowl shortcut can't farm release either. Without this gate, the
+    policy can keep the gripper open the whole episode (it spawns open at
+    home pose with ``gripper=0.5``), nudge the block laterally to the bowl
+    via random arm motion, and immediately satisfy
+    ``opened AND settled AND in_xy AND low`` without any lift — exactly the
+    failure mode flagged at iter ~650 of run 2026-05-08_22-36-11.
 
+    All conditions must hold simultaneously:
+
+    * episode lift latch (block was raised ≥ ``minimal_height`` at some step),
     * place condition (block xy near bowl, block low),
     * gripper joint position above ``gripper_open_threshold`` (i.e. open),
     * block linear speed below ``block_speed_threshold`` m/s (settled).
@@ -229,7 +342,10 @@ def release_in_bowl(
     # block roughly stationary
     settled = torch.norm(obj.data.root_lin_vel_w, dim=1) < block_speed_threshold
 
-    return (in_xy & low & opened & settled).float()
+    # episode lift latch — must have grasped + lifted at some prior step
+    was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
+
+    return (in_xy & low & opened & settled & was_lifted).float()
 
 
 # ---------------------------------------------------------------------------
@@ -255,3 +371,98 @@ def block_dropped(
     far_from_bowl = torch.norm(obj.data.root_pos_w[:, :2] - bowl_w, dim=1) >= r_safe
     on_table = block_z < drop_height
     return (on_table & far_from_bowl).float()
+
+
+# ---------------------------------------------------------------------------
+# Metrics — wired as a CurriculumTerm in cfg, not a RewardTerm. CurriculumTerms
+# whose function returns a ``dict[str, float]`` get logged automatically by
+# Isaac Lab's CurriculumManager as ``Curriculum/<term_name>/<key>``. The earlier
+# attempt to side-effect-write into ``env.extras["log"]`` from a reward
+# function was lost because Isaac Lab replaces ``extras["log"]`` between the
+# reward step and the runner's read, so reward-side-effect writes never reach
+# TensorBoard. Curriculum-return-dict writes do.
+# ---------------------------------------------------------------------------
+
+
+def log_bootstrap_metrics(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,  # CurriculumTerm requires this be mandatory (no default); unused here
+    r_safe: float = 0.06,
+    bowl_height: float = 0.06,
+    gripper_open_threshold: float = 0.2,
+    block_speed_threshold: float = 0.05,
+    minimal_height: float = 0.025,
+    command_name: str = "bowl_pose",
+    gripper_joint_name: str = "gripper",
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> dict[str, float]:
+    """Per-bootstrap-status TB metrics. Returns a dict, logged as
+    ``Curriculum/log_metrics/<key>`` by Isaac Lab's CurriculumManager.
+
+    Reads ``env._is_bootstrapped`` (set by :func:`init_block_in_gripper`) and
+    returns:
+
+    * ``p_bootstrapped`` — fraction of envs currently in the bootstrap
+      regime. Equals the curriculum's ``p_grasped`` parameter in
+      expectation; useful as a sanity check that the curriculum is
+      actually decaying.
+    * ``release_bootstrap`` — mean release-success indicator across
+      bootstrapped envs only. Should be near 1 for a competent policy on
+      the easy regime.
+    * ``release_from_scratch`` — mean release-success indicator across
+      non-bootstrapped envs only. **The key signal**: if this stays near
+      0 while ``release_bootstrap`` is near 1, the policy is riding the
+      subsidy and will collapse when ``p_grasped`` decays.
+    * ``grasp_bootstrap`` / ``grasp_from_scratch`` — same split for the
+      lift signal (block above ``minimal_height``). Ramps up earlier than
+      release; useful for catching from-scratch failure before it's
+      hopeless.
+
+    Wired as a :class:`CurriculumTermCfg`. Has no side effects on the env;
+    the dict it returns is the only output.
+    """
+    flag = getattr(env, "_is_bootstrapped", None)
+    if flag is None:
+        return {}
+
+    is_boot = flag.float()
+    is_scratch = 1.0 - is_boot
+    n_boot = is_boot.sum()
+    n_scratch = is_scratch.sum()
+
+    # Lift / grasp signal: block above minimal_height. Cheap to compute
+    # and gives a much earlier signal than release does.
+    obj: RigidObject = env.scene[object_cfg.name]
+    block_z = obj.data.root_pos_w[:, 2]
+    grasp_signal = (block_z > minimal_height).float()
+
+    # Release signal: replicate release_in_bowl so we don't recurse.
+    # NOTE: keep the gating identical to :func:`release_in_bowl` (now also
+    # requires the per-episode lift latch ``env._was_grasped``) so the
+    # ``release_from_scratch`` TB metric reflects the same event the
+    # policy is actually rewarded for. Without the latch, this metric
+    # would over-count drag-to-bowl episodes that no longer earn reward.
+    robot: Articulation = env.scene[robot_cfg.name]
+    block_xy = obj.data.root_pos_w[:, :2]
+    bowl_w = _bowl_xy_w(env, command_name)
+    in_xy = torch.norm(block_xy - bowl_w, dim=1) < r_safe
+    low = block_z < bowl_height
+    gripper_idx = robot.find_joints(gripper_joint_name)[0][0]
+    opened = robot.data.joint_pos[:, gripper_idx] > gripper_open_threshold
+    settled = torch.norm(obj.data.root_lin_vel_w, dim=1) < block_speed_threshold
+    was_lifted = getattr(env, "_was_grasped", None)
+    if was_lifted is None:
+        # Latch hasn't been initialized yet (first call before any reward
+        # term touched it); treat as all-False.
+        was_lifted = torch.zeros_like(in_xy, dtype=torch.bool)
+    release_signal = (in_xy & low & opened & settled & was_lifted).float()
+
+    metrics: dict[str, float] = {"p_bootstrapped": is_boot.mean().item()}
+    if n_boot > 0:
+        metrics["release_bootstrap"] = (release_signal * is_boot).sum().item() / n_boot.item()
+        metrics["grasp_bootstrap"] = (grasp_signal * is_boot).sum().item() / n_boot.item()
+    if n_scratch > 0:
+        metrics["release_from_scratch"] = (release_signal * is_scratch).sum().item() / n_scratch.item()
+        metrics["grasp_from_scratch"] = (grasp_signal * is_scratch).sum().item() / n_scratch.item()
+    return metrics
