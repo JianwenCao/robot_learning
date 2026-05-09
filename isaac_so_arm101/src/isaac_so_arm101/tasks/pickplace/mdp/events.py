@@ -254,6 +254,53 @@ def reset_was_grasped(
     flag[env_ids] = False
 
 
+def randomize_wrist_image_tint(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    rgb_scale_range: tuple[float, float] = (0.7, 1.3),
+    brightness_range: tuple[float, float] = (-0.15, 0.15),
+) -> None:
+    """Per-episode color tint applied to the wrist RGB obs.
+
+    Samples a per-env ``(r_scale, g_scale, b_scale, brightness_shift)`` at
+    reset and stores it on ``env._wrist_image_dr`` (shape ``(num_envs, 4)``).
+    :func:`mdp.observations.wrist_image` reads this buffer and applies the
+    transform inside the obs function.
+
+    This is a deliberate substitute for material-level cube / table color
+    randomization. Isaac Lab's ``randomize_visual_color`` requires
+    ``replicate_physics=False``, which would force a scene-level rewrite.
+    Tinting the *rendered camera output* instead achieves the same end —
+    the encoder sees the cube and table at varied apparent colors across
+    episodes — at zero scene-cfg cost. The two differ on specular shading,
+    which is negligible for our matte cube + matte table.
+
+    The tint is **constant within an episode** (re-sampled only on reset),
+    matching how true material DR would behave. Per-step jitter (small
+    additive Gaussian noise, brightness wiggle) lives separately in the obs
+    function as the DrQ-style frame-to-frame regularizer.
+    """
+    if not hasattr(env, "_wrist_image_dr"):
+        # 4 cols: r_scale, g_scale, b_scale, brightness_shift. Default is
+        # identity so any env that hasn't been touched by this event yet
+        # sees an unmodified image.
+        env._wrist_image_dr = torch.tensor([1.0, 1.0, 1.0, 0.0], device=env.device).repeat(env.num_envs, 1)
+
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+    elif len(env_ids) == 0:
+        return
+
+    n = len(env_ids) if not isinstance(env_ids, torch.Tensor) else env_ids.numel()
+    lo_s, hi_s = rgb_scale_range
+    lo_b, hi_b = brightness_range
+    new = torch.empty((n, 4), device=env.device)
+    new[:, :3] = lo_s + (hi_s - lo_s) * torch.rand((n, 3), device=env.device)
+    new[:, 3] = lo_b + (hi_b - lo_b) * torch.rand((n,), device=env.device)
+    env._wrist_image_dr[env_ids] = new
+
+
 def randomize_camera_uniform(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,

@@ -122,6 +122,13 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
                     static_friction=0.8,
                     dynamic_friction=0.6,
                 ),
+                # Semantic class label so the wrist camera's
+                # ``semantic_segmentation`` output produces a clean binary
+                # mask of the block (channel 4 of ``mdp.wrist_image``).
+                # The class string ``"block"`` is matched against
+                # ``cam.data.info["semantic_segmentation"]`` at obs time
+                # to find the right ID; see :func:`mdp.wrist_image`.
+                semantic_tags=[("class", "block")],
             ),
         )
 
@@ -167,7 +174,25 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
             update_period=self.sim.dt * self.decimation,  # match policy step
             height=WRIST_RGB_HEIGHT,
             width=WRIST_RGB_WIDTH,
-            data_types=["rgb"],
+            # RGB + depth + semantic seg → assembled into a 5-channel
+            # ``wrist_image`` obs in :func:`mdp.wrist_image`. Depth fuels
+            # the geometric "step function at the cube" cue (sim-real
+            # invariant); semantic seg becomes the binary cube-mask
+            # channel (replicated on the real side via HSV thresholding).
+            # ``colorize_semantic_segmentation=False`` keeps the seg
+            # output as a single-channel int8 ID map (not RGB), which is
+            # what the obs function reads.
+            data_types=["rgb", "distance_to_camera", "semantic_segmentation"],
+            colorize_semantic_segmentation=False,
+            # ``semantic_filter="class:block"`` restricts the segmentation
+            # output to only prims tagged ``("class", "block")`` — every
+            # other prim (table, robot, ground) is treated as unlabeled
+            # (ID 0). Without this filter, the default ``"*:*"`` labels
+            # every prim with a non-zero ID and our binary mask
+            # ``(seg > 0)`` ends up covering the entire image (caught
+            # this in the post-implementation smoke test: mask_frac=0.935
+            # before this fix).
+            semantic_filter="class:block",
             spawn=PinholeCameraCfg(
                 focal_length=intrinsics["focal_length"],
                 horizontal_aperture=intrinsics["horizontal_aperture"],
@@ -206,3 +231,9 @@ class SoArm101PickPlaceBowlEnvCfg_PLAY(SoArm101PickPlaceBowlEnvCfg):
         self.scene.env_spacing = 2.5
         # Disable obs corruption when visualizing (DR is tested at train time).
         self.observations.policy.enable_corruption = False
+        # Turn off the per-step image corruption inside ``mdp.wrist_image``
+        # too, otherwise eval frames carry the same Gaussian noise / depth
+        # jitter the training run does. The per-episode tint event still
+        # fires (kept it on so the eval distribution matches training) but
+        # the `corrupt=False` arg short-circuits the per-frame jitters.
+        self.observations.wrist_image.wrist_image.params = {"corrupt": False}

@@ -1,335 +1,164 @@
-# Eval 1 — Single-Object Pick-and-Place: Sim-to-Real RL Plan
+# Eval 1 — Single-Object Pick-and-Place: Method
 
-> Goal-conditioned PPO on SO-ARM101 in Isaac Lab → zero-shot deploy on the real arm. No teleop data; the only "data" is what the policy generates inside sim.
+> Goal-conditioned PPO on SO-ARM101 in Isaac Lab → zero-shot deploy on the real arm. No teleop data; the only training signal is sim rollouts. Task gym ID: `Isaac-SO-ARM101-PickPlace-Bowl-v0`. For env setup, training, evaluation, and deploy commands, see [`RUNNING.md`](./RUNNING.md) and [`DEPLOY.md`](./DEPLOY.md).
+>
+> **Recipe lineage.** Asymmetric actor–critic (Pinto et al. 2018, privileged critic + image actor) + Levine spatial-softmax CNN + DrQ random-shift augmentation. Hyperparameter and DR envelopes anchored on two peer projects on the same robot family: **ManiSkill3 PickCube → SO-100** (StoneT2000, ≈ 91.6 % zero-shot real success, 25–40 M env-steps) and **CS6341 SO-101 vision** (Evans & Hegde 2025, partial vision transfer, surfaced the visual-DR gap). Hyperparameters that diverge from ManiSkill3 are flagged in §6.
 
-Status: state-only MDP sanity check (Day 3) is done. **Now pivoting to vision.** This doc is the working spec for the rest of the work.
+## 1. MDP
 
----
+A single PPO actor–critic over thousands of randomized envs. The block (2 cm cube) is randomized in xy; the bowl is **not a scene prim** — it is a 2-D goal `(x, y)` sampled per episode by `BowlPoseCommandCfg` in the robot base frame, with rejection sampling that keeps `‖block − bowl‖ ≥ 0.10 m`. Same frame at deploy (`--bowl_xy x y`), so no coordinate transform.
 
-## 1. TL;DR
-
-A single PPO actor over thousands of randomized envs. Actor (deployable): wrist RGB + proprio + bowl `(x, y)` in robot base frame + projected ee_xy → 6-D action (5 arm joint offsets around home + 1 binary gripper). Critic (sim-only): same + privileged block pose / distances. Heavy DR transfers it to the real arm. Bowl is **not modeled** — it is a 2-D goal coord, success judged geometrically. Same policy runs at 50 Hz on hardware via Feetech `goal_position`. Eval-time bowl input is already in the robot base frame, so no coordinate conversion is needed between sim and real.
-
----
-
-## 2. Eval 1 spec
-
-| Item | Spec | Implication |
-|---|---|---|
-| Object | 1 wooden block, 2×2×2 cm, color free | Aggressive block-color DR; size jitter ±5–10% |
-| Target | Bowl Ø 15.5 cm, h ≈ 5 cm, pose given as `(x, y)` in **robot base frame** per rollout | Goal-condition on `bowl_xy`; no perception of bowl. Frame matches sim — no coordinate transform at deploy |
-| Block init | Random | Heavy initial-state DR |
-| Observation | Wrist-cam RGB | CNN encoder; bowl comes from CLI arg, not pixels |
-| Action | Pick → place → **release** | Reward must include release |
-| Success | Block in bowl AND released | Geometric check, §3.3 |
-| Method | BC or RL | Pure RL (no teleop) |
-| Eval table | `#B8ADA9` gray, 5 rollouts | Match in sim; randomize around it |
-
-Two non-obvious points: (i) the bowl is **given**, not perceived — the camera only needs to find the *block*; (ii) "easy to modify target" at eval = the network must be conditioned on `bowl_xy`, not have it baked in.
-
----
-
-## 3. Sim env design — `Isaac-SO-ARM101-PickPlace-Bowl-v0`
-
-### 3.1 Scene
-
-| Prim | Type | Notes |
-|---|---|---|
-| Table | thin cuboid, kinematic, `z=0` top | `#B8ADA9` ± 15 RGB DR; friction DR |
-| SO-ARM101 | `SO_ARM101_CFG` at `{ENV_REGEX_NS}/Robot` | Joint order: `shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper`. Home: `wrist_flex=1.57` (gripper down), `gripper=0` (closed) |
-| Block | `RigidObjectCfg` + `CuboidCfg(size=(0.02,0.02,0.02))`, ~4.8 g | Per-env color, mass, friction DR |
-| Bowl | **No prim** | `UniformPoseCommandCfg("bowl_pose")`, sampled per reset |
-| Wrist cam | `TiledCameraCfg` parented to `gripper_link` | Real intrinsics from `camera_intrinsics.yaml` (§3.5) |
-| `ee_frame` | `FrameTransformer(target=gripper_link, offset=[0.01,0,-0.09])` | Reuse from lift task |
-
-Workspace (robot frame, m): `bowl_xy ∈ x[0.10, 0.30] × y[-0.15, 0.15]`. `block_xy` same box, with `‖block − bowl‖ ≥ 0.10`. Narrow after measuring real reachable workspace.
-
-### 3.2 Action — same as `SoArm101LiftCubeEnvCfg`
-
-```python
-arm = JointPositionActionCfg(joints=[shoulder_pan, …, wrist_roll],
-                             scale=0.5, use_default_offset=True)   # absolute around home
-gripper = BinaryJointPositionActionCfg(joints=["gripper"],
-                                       open_command_expr={"gripper": 1.5},
-                                       close_command_expr={"gripper": 0.0})
-```
-
-`scale=0.5` covers the workspace from home; bump to `1.0` only if reach fails. Gripper range `[-0.17, 1.75]` rad — open=1.5 gives extra clearance for the 2 cm block. Action vector: 5 continuous in `[-1,1]` + 1 binary-thresholded at 0.
-
-### 3.3 Bowl as goal — geometric success
-
-```
-in_bowl  = ‖block_xy − bowl_xy‖ < 0.06  AND  block_z < 0.06  AND  steady k=5 frames
-released = gripper_cmd==OPEN AND no block↔gripper contact
-success  = in_bowl AND released
-```
-
-`r_safe = 0.06 m` is well inside the 0.0775 m bowl radius. We don't need bowl-rim dynamics in sim because the real bowl (15.5 cm, shallow) catches anything released near `bowl_xy` at table height.
-
-### 3.4 Observations
-
-**Policy (deployable):**
-
-| Field | Dim | Sim source | Real source |
-|---|---|---|---|
-| `wrist_rgb` | 3×72×128 (single frame; 3-stack deferred) | TiledCamera output, undistort+resize+normalize | USB cam, **same** undistort+resize+normalize |
-| `joint_pos` | 6 | `mdp.joint_pos_rel` | Feetech `present_position` − home |
-| `joint_vel` | 6 | `mdp.joint_vel_rel` | Feetech `present_velocity` |
-| `last_action` | 6 | `mdp.last_action` | rolled buffer |
-| `bowl_xy` | 2 | `command_manager.get_command("bowl_pose")[:,:2]` | `--bowl_xy x y` |
-| `ee_proj_xy` | 2 | `(ee_w − base_w)[:, :2]` from `ee_frame` | URDF FK on `qpos` |
-| `ee_to_bowl_xy` | 2 | `bowl_xy − ee_proj_xy` | same |
-
-`ee_proj_xy` is a deliberate inductive bias — gives the policy a 2-D Cartesian "where is my gripper" feature so the CNN specializes in *block* localization. 3-frame stack at 50 Hz gives parallax (free monocular-depth signal during descent).
-
-**Critic (sim-only, asymmetric):** policy obs + `block_xyz` + `block_quat` + `gripper_xyz` + `block_to_bowl_xy` + `gripper_to_block` + `is_grasped` (approximated from `gripper_cmd==CLOSE` AND `block_z>thresh` until contact sensors enabled in `SO_ARM101_CFG`).
-
-Wired via `obs_groups={"actor":["policy"], "critic":["policy","critic"]}` in RSL-RL 3.0.
-
-### 3.5 Wrist camera — real intrinsics baked in
-
-`camera_intrinsics.yaml` is the wrist cam:
-
-```
-fx=509.236, fy=508.176,  cx=656.214, cy=356.472
-W=1280, H=720
-distortion = [0.063, -0.113, -0.0024, 0.00127, 0.0356]
-```
-
-Convert to Isaac `CameraCfg`:
-
-- `horizontal_aperture` (free choice; pick 20.955 mm — Isaac default)
-- `focal_length = fx * horizontal_aperture / W = 509.236 * 20.955 / 1280 ≈ 8.336 mm`
-- `vertical_aperture = horizontal_aperture * H / W = 11.787 mm` (verify `fy*va/H ≈ focal_length`)
-- Render the wrist `TiledCamera` at **128×72** (1/10 of native 1280×720 — exact 16:9 aspect ratio, no letterbox needed). Real frames undistort → resize to 128×72 to match.
-- Isaac is a perfect pinhole (no distortion). Real-side `preprocess()` runs `cv2.undistort` first so both inputs match.
-- Principal point: `(cx,cy) ≈ (656, 356)` — slightly off-center vs ideal `(640, 360)`. Negligible (≤ 4 px); leave Isaac centered.
-- Extrinsic on `gripper_link`: ported verbatim from LeIsaac's `single_arm_env_cfg.py` — `pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914)`, `convention="ros"`. The bracket sits ~10 cm out in gripper +Y (the side away from the moving jaw) and tilts the lens ~48° down-and-toward-fingers so the table and gripper tips are both in frame at home pose. Earlier on-axis placements at `(0, 0, ≤0.025)` were buried in the wrist-roll coupling / sts3215 motor body and saw nothing of the table; the real WOWROBO mount uses the same side-bracket pattern for the same reason. Verified visually via `scripts/probe_wrist_cam.py` (output at `outputs/wrist_cam_probe.png`). Replace with caliper measurement of the real WOWROBO mount on day 6 and update the deploy-side FK chain in lockstep. Per-reset DR is ±25 mm / ±2.5° (see `randomize_wrist_cam_pose` in `pickplace_env_cfg.py`).
-
-Add a small `load_intrinsics(yaml_path)` helper in `tasks/pickplace/mdp/observations.py` that emits the `CameraCfg` kwargs — single source of truth for sim and the deploy preprocess.
-
-### 3.6 Reward shaping (`mdp/rewards.py`)
-
-```
-r_reach   = (1 - is_grasped) * (1 - tanh(d_ee_block / 0.05))         # w=1.0
-r_grasp   = is_grasped_now AND not_before                            # w=5.0  (edge)
-r_transp  = object_goal_distance(std=0.20, minimal_height=0.025,
-                                 command="bowl_pose")                # w=2.0
-r_place   = (‖block_xy − bowl_xy‖ < 0.06) AND (block_z < 0.06)       # w=5.0
-r_release = r_place AND gripper_open AND ‖block_vel‖ small           # w=10.0
-p_action  = -1e-4 * action_rate_l2
-p_jvel    = -1e-4 * joint_vel_l2
-p_drop    = -2.0  if was_grasped AND block_z<0.005 AND not in_bowl
-p_offtab  = -2.0  if block_xy outside workspace
-```
-
-Two pre-empts: `r_transp` must keep `minimal_height ≥ 0.025` so it can't fire pre-grasp; `r_release` requires `r_place` first or the policy opens everywhere. Inherit the lift-task curriculum that decays `action_rate`/`joint_vel` weights `1e-4 → 1e-1` over 10k steps.
-
-### 3.7 Terminations
-
-- `success` — `r_release` condition (terminate with success).
-- `time_out` — 8.0 s = 400 steps @ 50 Hz (longer than lift's 5.0 s to allow search + release).
-- `block_off_table` — `mdp.root_height_below_minimum(-0.05, "object")`.
-- `joint_limit_violation` — penalize, don't terminate.
-
-### 3.8 Domain randomization (`mdp/events.py`)
-
-| Category | Knob | Range |
-|---|---|---|
-| Visual | block color | uniform RGB, biased away from table ±25 |
-| | table color | `#B8ADA9` ± 15 RGB |
-| | PBR | roughness [0.4, 0.9], metallic [0, 0.1] |
-| | lights | 1–3, 500–2000 lux, full hemisphere |
-| | cam intrinsics | fx,fy ±5%; cx,cy ±2 px |
-| | cam extrinsic | ±25 mm, ±2.5° on `gripper_link` (matches LeIsaac `randomize_camera_uniform` envelope; `mdp.events.randomize_camera_uniform`) |
-| | image noise | Gauss σ ∈ [0, 5/255], blur 0–3 px, JPEG q ∈ [70, 100] |
-| | distractors | 0–3 random boxes outside workspace |
-| Physical | block size | ±5–10% per axis |
-| | block mass | ±50% of 4.8 g |
-| | friction (table/block/pads) | μ ∈ [0.4, 1.2] |
-| | bowl_xy / block_xy | full workspace (§3.1) |
-| | robot base | ±2 mm, ±1° |
-| Dynamics | servo PD gains | ±30% around `SO_ARM101_CFG.actuators` |
-| | action latency | 1–5 sim steps (20–100 ms) |
-| | obs latency | 1–3 sim steps |
-| | action noise | Gauss σ=0.01 |
-| Initial | joint config | small jitter around home (tighter than reach task; keep wrist down) |
-
-If only one is shipped well, **make it visual block randomization.** Wrist-cam policies most often fail to transfer there.
-
-### 3.9 Network
-
-```
-wrist_rgb (3×72×128, single frame) ─CNN──┐
-joint_pos, joint_vel, last_action  ─┤
-bowl_xy, ee_proj_xy, ee_to_bowl_xy ─┼──concat──GRU(128)──MLP[256,128,64]──μ,σ──action(6)
-                                     │
-                            critic  ─┴──+ block pose, distances, contact ──V(s)
-```
-
-CNN: `Conv(8/4)→Conv(4/2)→Conv(3/1)→FC(128)→LN→ELU` (matches the upstream MLP activation choice). **GRU** (or LSTM) on the post-CNN features — required for the search behavior in §4. Drop-in via RSL-RL 3.0's recurrent ActorCritic.
-
-**Aux loss:** small head on the visual latent regressing `block_xy` (privileged in sim, MSE ≈ 0.1× policy loss). Forces the encoder to localize the block instead of summarizing pixels. Drop at deploy. **Mask the loss when `block_xy` is outside the wrist FOV** so the encoder doesn't try to hallucinate off-screen positions.
-
-### 3.10 PPO config
-
-`rsl_rl` 3.0.1, fork of `LiftCubePPORunnerCfg`:
-
-```python
-num_steps_per_env  = 24
-max_iterations     = 5000     # 5–8× lift; vision is slower
-save_interval      = 100
-init_noise_std     = 1.0
-actor_hidden       = [256, 128, 64]      # behind GRU
-critic_hidden      = [256, 128, 64]
-clip_param         = 0.2
-entropy_coef       = 0.006
-num_learning_epochs= 5
-num_mini_batches   = 4
-lr                 = 1e-4 (adaptive, KL=0.01)
-gamma=0.98, lam=0.95, max_grad_norm=1.0
-```
-
-Scale: 2048 envs (drop to 1024 if cameras blow VRAM on the 5090). Budget 100–300 M env steps, ~8–24 h on the 5090.
-
----
-
-## 4. Block out of camera sight — RL handles this
-
-Since `bowl_xy` is given but block position is not, the policy may start with the block outside the wrist frame. Yes, RL can learn to **search** — but only with the right ingredients:
-
-1. **Wide FOV gets us most of the way.** Real cam horizontal FOV ≈ `2·atan(640/509) ≈ 102°`. At home pose with the gripper ~0.20 m above the table, that's a ~0.5 m patch — the entire `[0.10,0.30] × [-0.15,0.15]` workspace is visible. So in the steady state, "block out of frame" mostly happens *during* motion, not at rollout start. Plan §3.5 already preserves this 16:9 aspect ratio end-to-end, so don't square-crop the real input — you'd lose ~40° of horizontal FOV.
-
-2. **Asymmetric critic carries the gradient.** The critic sees `block_xyz` regardless. So `r_reach = 1 - tanh(d/0.05)` shapes V(s) even when the actor sees nothing useful in pixels. The actor learns "scan toward where V is higher" via the advantage signal, without the encoder ever localizing the block in that frame. This is the single biggest reason asymmetric A-C is the right choice here.
-
-3. **Recurrent policy (GRU) for memory.** A 3-frame stack at 50 Hz is 60 ms — too short to remember "I scanned left, didn't see it, try right." Add a GRU on the post-CNN features (RSL-RL 3.0 supports this directly). Hidden state = persistent search state.
-
-4. **Visibility curriculum.** Early training: spawn block in a small patch under the home view (always visible) — encoder learns to localize first. Mid training: full workspace. Late training: block can spawn at workspace edge (forces search). Implement via `mdp.modify_event_term(num_steps=…)` shrinking → expanding the block-pose ranges.
-
-5. **Episode budget.** Bumped to 8.0 s (400 steps @ 50 Hz) — leaves headroom for a 1–2 s scan before grasping.
-
-6. **Aux block-xy head must mask off-frame samples.** Otherwise the head is pushed to predict random off-screen positions and corrupts the encoder.
-
-7. **Optional scan-home.** If after items 1–6 search still fails, tilt the home pose (`wrist_flex=1.3` instead of `1.57`) so the cam sees a wider patch at rollout start. Keep `scale=0.5` — the tilt is cheap insurance.
-
-This is exactly the recipe used in OpenAI Solving Rubik's Cube and in active-vision papers — wide FOV + asymmetric critic + recurrence + curriculum.
-
----
-
-## 5. Real-robot deployment
-
-### 5.1 Camera
-
-Intrinsics already calibrated → `camera_intrinsics.yaml` (this is the wrist cam). Plug the same values into the sim `CameraCfg` (§3.5). Real-side preprocess: `cv2.undistort` (using YAML distortion coeffs) → BGR→RGB → resize to 128×72 (native 16:9 — no crop / letterbox needed) → `float/255`. **Identical preprocess in sim and on robot, period.**
-
-Measure the wrist-cam mounting offset on `gripper_link` once with calipers (the WOWROBO 32×32 module on top of the wrist-roll motor); mirror on the sim prim's `OffsetCfg`. Current sim offset is the LeIsaac verbatim port (§3.5) — replace with the caliper measurement on day 6 and update the deploy-side FK chain in lockstep. Disable USB auto-focus / auto-exposure with `v4l2-ctl` before each run.
-
-### 5.2 Servo I/O (`so101_io.py`)
-
-| Joint | URDF limit (rad) | Notes |
-|---|---|---|
-| shoulder_pan | ±1.91986 | |
-| shoulder_lift | ±1.74533 | |
-| elbow_flex | ±1.69 | |
-| wrist_flex | ±1.65806 | home `1.57` |
-| wrist_roll | [-2.74, 2.84] | asymmetric |
-| gripper | [-0.17, 1.75] | **asymmetric**, 0=closed, larger=open |
-
-Things to pin down once and unit-test: servo-ID → URDF joint-index map; counts↔rad scaling (Feetech default 4096/360°); per-joint sign vs URDF; servo home offset (sim `q=0` ≠ servo zero counts); soft limits (clip every command before write). This layer is the last line of defense against the policy commanding into the floor.
-
-### 5.3 Control loop
-
-```python
-policy = torch.jit.load("policy.pt").eval().cuda()                # exported by play
-cam, bus = WristCam(...), FeetechBus(...)
-home_q = [0,0,0,1.57,0,0]; ACTION_SCALE = 0.5
-hidden = None                                                     # GRU state
-img_buf = deque(maxlen=3)
-bus.go_home(); rate = Rate(50)
-
-while not stop:
-    img_buf.append(preprocess(cam.read()))
-    qpos, qvel = bus.read_pos_rad(), bus.read_vel_rad()
-    obs = pack(wrist_rgb=stack(img_buf), joint_pos=qpos-home_q, joint_vel=qvel,
-               bowl_xy=args.bowl_xy, ee_proj_xy=fk_proj(qpos),
-               ee_to_bowl_xy=args.bowl_xy-fk_proj(qpos), last_action=last_a)
-    action, hidden = policy(obs, hidden)                          # recurrent
-    arm_cmd     = home_q[:5] + ACTION_SCALE*action[:5]            # absolute around home
-    gripper_cmd = 1.5 if action[5] > 0 else 0.0
-    bus.write_pos_rad(clip(cat(arm_cmd, gripper_cmd), q_min, q_max))
-    last_a = action
-    rate.sleep()
-```
-
-**Five things that must match sim exactly:** control rate (50 Hz), action semantics (absolute-around-home, scale 0.5, binary gripper, gripper open=0.5 / close=0.0), joint order/signs (URDF order), image preprocess (undistort + 16:9 + 128×72 + [0,1] float, single frame), `fk_proj` (URDF FK + same `[0.01, 0, -0.09]` `gripper_link` offset, drop z). A mismatch on any one of these silently breaks transfer.
-
-### 5.4 Safety
-
-- Esc-key user_stop → loop exit → bus go_home.
-- Workspace box check on every commanded `target_q` (FK to ee_xyz; reject if outside `x[0,0.35]×y[-0.20,0.20]×z[0,0.30]`).
-- Per-step joint-velocity cap in IO (Feetech STS3215 ~1.5 rad/s — matches `velocity_limit_sim` in `SO_ARM101_CFG`).
-- First runs: gripper open, hand on power switch.
-
-### 5.5 Pre-flight diagnostic
-
-1. Hold real arm at known pose → dump `qpos` from bus, compare to sim with same target → ≤ 1° agreement.
-2. Render sim wrist-cam frame at that pose; compare visually to real frame (FOV, object scale, perspective). If off, fix intrinsics/extrinsics.
-3. Sweep gripper through a small XY square; overlay `ee_proj_xy` from bus FK vs sim — should agree within 5 mm.
-
-This catches 90% of "worked in sim, didn't on robot" failures before you burn rollouts.
-
----
-
-## 6. Risks
-
-| Risk | Mitigation |
+| Item | Value |
 |---|---|
-| Block out of frame at start | Wide FOV (102°), GRU memory, visibility curriculum, asymmetric critic shapes V (§4) |
-| Monocular depth ambiguity at grasp | 3-frame stack (parallax during descent); aux block-xy head |
-| 2 cm block ungraspable | Verify finger geometry vs cube; lift task grasps a 2.5 cm cube — should be fine. Print finger pads if not |
-| Action latency mismatch | Step-response test on real, add measured latency + margin to sim DR |
-| Policy releases too high | Add soft penalty on gripper z at release moment |
-| Bowl pose outside training distribution | Sample `bowl_xy` over full reachable workspace, not "expected" region |
-| Vision encoder collapse | Aux block-xy head from start; fallback to frozen R3M / DINOv2-small |
-| Cam intrinsics drift | Disable USB auto-focus/exposure via `v4l2-ctl`; recalibrate if lens is bumped |
-| Servo overheat | Cooldown sleeps between rollouts; monitor temperature register |
-| Contact sensors disabled in `SO_ARM101_CFG` | Approximate `is_grasped` from `gripper_cmd==CLOSE` AND `block_z > thresh`; flip flag back on once Isaac Lab supports it on capsule-replaced links |
+| Control | 50 Hz (decimation 2, sim 100 Hz) |
+| Episode | 6.0 s = 300 steps |
+| Action | 5 absolute-around-home arm joint targets (`scale=0.5`) + 1 binary gripper (`open=0.5`, `close=0.0`) |
+| Workspace | `x ∈ [0.10, 0.30] m`, `y ∈ [−0.15, 0.15] m`, both block & bowl |
+| Home `q` | `(0, 0, 0, 1.5708, 0, 0)` with gripper *open* (`gripper=0.5`) |
+| Terminations | `time_out`, `block_off_table`. **No** success-termination (it incentivized "hold and hover" over release). |
 
----
+## 2. Observations (asymmetric A-C)
 
-## 7. Execution plan — what's left
+Three obs groups in `tasks/pickplace/pickplace_env_cfg.py::ObservationsCfg`. Runner cfg routes:
 
-| Day | Goal | Deliverable |
+```
+actor   = policy + wrist_image      (deployable)
+critic  = policy + critic            (privileged, sim-only; no image)
+```
+
+The critic deliberately does **not** receive the image — it has ground-truth block pose, so an image encoder is redundant compute. Only the actor has a CNN.
+
+| Group | Fields | Shape |
 |---|---|---|
-| ~~1–3~~ | ~~Scaffold, register, state-only PPO~~ | **Done** — MDP solves with privileged block pose |
-| 4a (in progress) | Wire `TiledCameraCfg` with real intrinsics; add `wrist_rgb` obs group; custom `PickPlaceVisionActorCritic` (CNN encoder + asymmetric critic) | **Done** — `wrist_rgb` is `(N, 3, 72, 128)`, smoke test green |
-| 4b | Long vision PPO run; basic DR (visual block color, lighting); no GRU / no aux head yet | First overnight run, ≥ partial reach success |
-| 5 | Iterate DR ranges from per-stage success curves; add aux block-xy head if encoder collapses; add GRU + visibility curriculum if search fails; tune entropy coef if exploration stalls | ≥ 60% success in sim play, checkpoint saved |
-| 6 | Measure wrist-cam extrinsic; write `so101_io.py`; run §5.5 diagnostic | Sim and real frames overlay; `ee_proj_xy` agrees ≤ 5 mm |
-| 7 | First real-robot rollouts; widen whichever DR axis was too narrow; retrain delta if needed | Non-zero successes on hardware |
-| 8 | Tune; record 5 evaluation rollouts + video | Submission-ready policy + video |
+| `policy` (deployable) | `joint_pos_rel`, `joint_vel_rel`, `gripper_state`, `bowl_xy`, `ee_proj_xy`, `ee_to_bowl_xy`, `last_action` | 1-D, concatenated |
+| `critic` (privileged) | policy fields + `block_position`, `block_to_bowl_xy`, `gripper_to_block`, `is_grasped` | 1-D, concatenated |
+| `wrist_image` | RGB + depth + binary block mask, all in `[0,1]` | `(N, 5, 72, 128)` (see §8) |
 
-If a stage stalls, instrument first (per-stage success in TB), don't blindly scale DR.
+`ee_proj_xy` is taken from the `ee_frame` `FrameTransformer` at `gripper_link + offset=(0.01, 0, -0.09)`. The wrist `TiledCamera` is parented to `gripper_link` at `pos=(-0.001, 0.1, -0.04)`, ros-convention quaternion `(-0.404379, -0.912179, -0.0451242, 0.0486914)` (LeIsaac's verbatim mount). Intrinsics from `camera_intrinsics.yaml` via `mdp.load_wrist_cam_intrinsics()` → USD pinhole (`focal_length = fx · horizontal_aperture / W`); horizontal FOV ≈ 102°, identical to the real cam.
 
----
+## 3. Network — `PickPlaceVisionActorCritic`
 
-## 8. Open decisions (things to settle as we hit them)
+Subclass of `rsl_rl.modules.ActorCritic` in `tasks/pickplace/agents/vision_actor_critic.py`. Registered into RSL-RL's runner namespace at import time so `class_name="PickPlaceVisionActorCritic"` resolves.
 
-1. Render resolution for sim — 1280×720 native then downsample (preferred, matches real) vs. lower-res render for speed.
-2. CNN end-to-end vs frozen R3M / DINOv2-small — start end-to-end; switch if encoder collapses.
-3. Visibility-curriculum schedule — when to widen `block_xy` range. Start: full at iter 0; only narrow if reach stalls.
-4. Recurrent unit — GRU(128) by default; LSTM if GRU underfits.
-5. `scan-home` tilt — only if §4 items 1–6 don't produce search behavior.
-6. Continuous vs binary gripper — stay binary unless thresholding becomes a bottleneck.
+```
+wrist_image (5×72×128) ──[Spatial-Softmax CNN]── 128-D keypoints ─┐
+state (policy group) ─────────────────────────────────────────── concat ── MLP[256,128,64] ── μ
+                                                                 │           σ (scalar Param)
+critic state (policy + critic groups) ───── MLP[256,128,64] ── V(s)
+```
 
----
+CNN: `Conv(8/4)→ELU → Conv(4/2)→ELU → Conv(3/1, K channels)` → spatial softmax per channel → expected `(x, y)` per keypoint → LayerNorm. Output is `2K = 128` dims (Levine et al. 2016). The spatial softmax is the inductive bias for "small object on a flat workspace": each channel becomes a soft-argmax keypoint, which dense MLP projection failed to discover from grasp gradient alone.
 
-## 9. References
+**DrQ random-shift** (Kostrikov et al., ICLR 2021): 4-pixel pad-and-crop on the actor's image input during training only.
 
-- Project doc: `Project 3_ Reinforcement Learning – Final Details.pdf`
-- Daily run instructions: `RUNNING.md`
-- Upstream task we forked: `isaac_so_arm101/src/isaac_so_arm101/tasks/lift/`
-- Robot config: `isaac_so_arm101/src/isaac_so_arm101/robots/trs_so101/so_arm101.py`
-- URDF (joint limits, link names): `isaac_so_arm101/src/isaac_so_arm101/robots/trs_so101/urdf/so_arm101.urdf`
-- Wrist-cam intrinsics: `camera_intrinsics.yaml`
-- RSL-RL 3.0 asymmetric / recurrent A-C: `rsl_rl.modules.ActorCritic` (`obs_groups`, `rnn`)
+No recurrence — `is_recurrent=False`. The reach-stage curriculum (§5) keeps the cube under the home FOV from iter 0, and the wide horizontal FOV makes search unnecessary.
+
+## 4. Reward (in `mdp/rewards.py`)
+
+Stage-gated; weights in `RewardsCfg`:
+
+| Term | Weight | Condition |
+|---|---|---|
+| `pre_grasp_pose` | 2.0 | `proximity * jaw_openness * (1 − is_grasped)` |
+| `reach_block` | 1.0 | `1 − tanh(d_ee_block / 0.05)`, ungated |
+| `grasp_event` | 15.0 | indicator: `block_z > 0.025` (lift = grasp proxy) |
+| `transport_to_bowl` | 4.0 | `(1 − tanh(d_ee_bowl / 0.15))` × `is_grasped` |
+| `place_in_bowl` | 5.0 | `block_xy near bowl AND block_z < 0.08`, gated on per-episode lift latch |
+| `release_in_bowl` | 20.0 | place AND gripper open AND block settled, same lift latch |
+| `action_l2`, `action_rate_l2`, `joint_vel_l2` | −1e-4 → −1e-2 | curriculum ramp at 10 k env-steps |
+| `block_dropped` | −2.0 | block on table away from bowl |
+
+The per-episode `_was_grasped` latch (in `_episode_lifted_mask`) closes the "drag-the-cube laterally" exploit — `place`/`release` only pay out after the policy has lifted the block ≥ 2.5 cm at some prior step that episode.
+
+## 5. Curriculum & DR (in `mdp/events.py`, `CurriculumCfg`)
+
+**Currently shipped:**
+- **Block-xy expansion** (`expand_block_xy_range`): ±2 cm × ±2 cm → ±10 cm × ±15 cm linearly over 12 k warm-up + 180 k expand env-steps.
+- **Bootstrap grasp** (`init_block_in_gripper`, p=0.10 *constant floor*): 10 % of resets start with the block in a closed gripper. Floor not decay — the decay version collapsed when p hit 0 (memory: `bootstrap-curriculum-pitfall`).
+- **Wrist-cam pose DR** (`randomize_camera_uniform`, ros): ±25 mm / ±2.5° per reset on `gripper_link`. LeIsaac envelope.
+- **Action / joint-vel penalty ramp**: −1e-4 → −1e-2 at 10 k env-steps.
+- **DrQ random-shift** on actor image during training (`vision_actor_critic.py::_random_shift_pad`).
+
+**Required visual DR before real-robot deploy** (currently missing — peer-project failures point to this as the actual transfer blocker):
+- **Cube color / material DR** — uniform diffuse RGB biased away from `#B8ADA9`, roughness `[0.4, 0.9]`. Per-env at reset.
+- **Table color jitter** — `#B8ADA9 ± 15 RGB` per env.
+- **Lighting** — 1–3 light sources, intensity `[500, 1500]`, color temperature `[2500, 9500] K` (CS6341 + NVIDIA SO-101 envelopes). Random HDRI dome if available.
+- **Image corruption** — Gaussian noise σ ∈ `[0, 5/255]`, brightness ±15 %, motion blur 0–3 px, JPEG q `[70, 100]`. Apply *after* the camera read, identically replicated in deploy preprocess.
+- **Greenscreen / HDRI background overlay** — composite a random HDRI behind the table in sim. ManiSkill3 PickCube's bridge for the "sim has no clutter / real has whatever's on the desk" gap.
+- **Distractors** — 0–3 random small boxes outside the workspace.
+
+Per-bootstrap-status TB metrics (`log_bootstrap_metrics`): `release_from_scratch`, `grasp_from_scratch`, `release_bootstrap`, `grasp_bootstrap`, `p_bootstrapped`. **`*_from_scratch` are the only success curves to watch** — they exclude the bootstrapped 10 %.
+
+## 6. PPO config (`tasks/pickplace/agents/rsl_rl_ppo_cfg.py`)
+
+Side-by-side with the **ManiSkill3 PickCube** recipe (validated to 91.6 % zero-shot real success on SO-100). If convergence stalls past ~50 M env-steps, **try the right column verbatim before adding more reward terms.** Lower `gamma=0.9` for short-horizon manipulation is the most striking divergence — 300-step episodes don't need a 0.98 horizon, and a tighter discount sharpens credit assignment on the grasp event.
+
+| Hyperparam | Ours | ManiSkill3 PickCube |
+|---|---|---|
+| `num_envs` | 2048 (1024 if VRAM-bound) | 1024–2048 |
+| `num_steps_per_env` | 24 | 16 |
+| `max_iterations` | 4000 (≈ 200 M env steps) | ≈ 25–40 M sufficed |
+| `init_noise_std` | 0.5 (scalar) | — |
+| `actor_hidden_dims` / `critic_hidden_dims` | `[256, 128, 64]`, ELU | Nature-CNN + small MLP |
+| `clip_param` | 0.2 | 0.2 |
+| `entropy_coef` | 0.003 | (default) |
+| `num_learning_epochs` / `num_mini_batches` | 5 / 8 | **8 / 32** |
+| `learning_rate` / `schedule` / `desired_kl` | `1e-4` / `adaptive` / `0.005` | `3e-4` (typical) |
+| `gamma` / `lam` / `max_grad_norm` | `0.98` / 0.95 / 1.0 | **0.9** / 0.95 / 1.0 |
+
+Asymmetric obs wiring:
+```python
+obs_groups = {"policy": ["policy", "wrist_image"],
+              "critic": ["policy", "critic"]}
+```
+
+## 7. Fallback: teacher–student distillation
+
+If end-to-end vision PPO doesn't converge after `max_iterations=4000` *with* §5 visual DR wired in, fall back to the DextrAH-G recipe:
+
+1. Train a *state-based teacher* — PPO over the privileged `critic` group only (block pose, distances, grasp flag) to high success in sim. Cheap; state-only PPO already solved this MDP at the Day-3 milestone.
+2. Distill into a *vision student* via DAgger or BC on teacher rollouts, student reading only `policy + wrist_image`. The student inherits the optimal action distribution rather than discovering it from grasp gradient through pixels.
+
+Only invoke if vision PPO has clearly stalled — adds a second training stage.
+
+## 8. Visual modality — RGB + depth + mask, same pipeline in sim and real
+
+The wrist camera is the only physical sensor; depth and the block mask are **derived** from its RGB feed at deploy. The key sim-to-real principle: **run the same derivation pipeline in both domains.** Don't rely on Isaac's perfect `distance_to_camera` for sim depth and DA3 for real depth — that just relocates the gap. Apply DA3 to the *sim-rendered RGB* identically to the real RGB, so the policy sees DA3-flavored depth (with its smoothing and edge artifacts) in both worlds. Same convention we already use for `cv2.undistort`: sim is a perfect pinhole but we still pipe both feeds through the same undistort to keep the preprocess identical.
+
+Wrist input is a 5-channel `(N, 5, 72, 128)` tensor stacking:
+
+| Channel | Source (sim *and* real) | Notes |
+|---|---|---|
+| 0–2 | RGB | sim TiledCamera (`rgb`) → cv2.undistort (no-op in sim, real distortion in deploy) → resize 128×72 → `/255`. |
+| 3 | **Depth from Depth Anything 3** | Run `depth-anything/DA3-Small` (80 M params, DINOv2-S backbone) on the same RGB above. Relative depth, calibrate to metric once per session via a linear fit against known FK distances at home pose; clip to `[0, 0.5 m]`, divide by 0.5. Run DA3 at 252×140 (DINOv2 patch is 14 px — 128×72 = 9×5 patches is below training distribution and degrades accuracy), downsample the depth map to 128×72. |
+| 4 | Binary block mask | sim: pull the cube class from `semantic_segmentation`. real: HSV `cv2.inRange` calibrated once on a wood-tone block on the gray table; optional 3×3 morphological close. Resize to 128×72. For Eval 2/3 the bounds become target-color-conditioned — same channel, no network change. |
+
+Network change: `_SpatialSoftmaxCNN` first conv goes `Conv2d(3 → 32) → Conv2d(5 → 32)`. Otherwise unchanged.
+
+**Why DA3.** Depth Anything 3 (ByteDance-Seed, 11/2025) is SOTA on indoor monocular metric depth (ETH3D δ₁ = 0.917, SUN-RGBD AbsRel = 0.105 — beats DA-V2, UniDepth v2, DepthPro, Metric3D v2 on standard indoor benchmarks). The Small checkpoint is the right speed/quality trade-off for the 50 Hz inner loop; upgrade to `DA3-Metric-Large` (350 M, directly metric, skips the calibration step) only if timing budget allows.
+
+**Why a mask.** ManiSkill3 PickCube went from 91.6 % (RGB) to 95 % (with object segmentation). The cube + uniform-gray table makes the segmentation easy at deploy — HSV thresholding gets a high-recall mask in 5 lines of OpenCV — and exact in sim. We keep the mask alongside RGB+depth (not as a replacement) so the policy stays robust if the real-side threshold ever misses.
+
+**Encoder fallback.** If the from-scratch spatial-softmax CNN doesn't transfer even with this 5-channel input + §5 visual DR, swap to a **frozen pretrained backbone**: Theia-Tiny (CMU, ~6 M params, manipulation-priored, distilled from DINOv2 + SAM + Depth-Anything) or DINOv2-Small (22 M). Keep the spatial-softmax head on top of the backbone's spatial feature map for the same positional inductive bias. ~10–20 ms inference, fits 50 Hz.
+
+**Deliberately skipped:**
+- Optical flow (wrist motion swamps object motion).
+- Full point cloud + PointNet (~3 % gain over RGBD-as-channels at 10× engineering cost).
+- Open-vocab detector → 2D block-center coordinate (~50 ms latency, unnecessary for one cube; reconsider for Eval 2/3).
+- Depth-only without RGB (loses the cube-vs-table-color cue when block sits flat).
+
+**Rollout order.** (1) Wire §5 visual DR on the current RGB pipeline first — most peer-project transfer failures are DR shortfalls, not modality shortfalls. (2) Add depth via DA3 in both sim and real. (3) Add the mask channel. (4) Only if 1–3 don't transfer, swap to frozen Theia / DINOv2 (this section) or fall back to teacher–student (§7). Steps 1–3 each touch only `mdp.wrist_image` and the CNN's first conv — surgical changes, no env restructure.
+
+## References
+
+**This repo:** `tasks/pickplace/{pickplace_env_cfg.py, joint_pos_env_cfg.py}`, `mdp/{observations,rewards,events,terminations,commands}.py`, `agents/{vision_actor_critic.py, rsl_rl_ppo_cfg.py}`, `camera_intrinsics.yaml`, `robots/trs_so101/{so_arm101.py, urdf/so_arm101.urdf}`. Run/deploy guides: [`RUNNING.md`](./RUNNING.md), [`DEPLOY.md`](./DEPLOY.md).
+
+**Method lineage / peer recipes:**
+- Pinto, Andrychowicz et al., *Asymmetric Actor Critic for Image-Based Robot Learning*, RSS 2018.
+- Levine et al., *End-to-End Training of Deep Visuomotor Policies*, JMLR 2016 — spatial-softmax CNN.
+- Kostrikov et al., *DrQ*, ICLR 2021 — random-shift augmentation.
+- ByteDance-Seed, *Depth Anything 3*, arXiv 2511.10647 (11/2025). <https://github.com/ByteDance-Seed/Depth-Anything-3>.
+- Tao et al., *ManiSkill3*, 2024. <https://github.com/StoneT2000/lerobot-sim2real>, <https://github.com/haosulab/ManiSkill>.
+- Evans & Hegde, *Vision-Based Manipulation via Sim-to-Real RL — SO-101 with Isaac Lab*, CS6341 Fall 2025. <https://yuxng.github.io/Courses/CS6341Fall2025/project_group_15.pdf>.
+- Lum, Allshire et al., *DextrAH-G*, 2024. <https://sites.google.com/view/dextrah-g>.
+- LeIsaac (LightwheelAI). <https://github.com/LightwheelAI/leisaac>.

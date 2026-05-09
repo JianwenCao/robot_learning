@@ -326,29 +326,140 @@ def load_wrist_cam_intrinsics(
     }
 
 
-def wrist_rgb(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
-) -> torch.Tensor:
-    """Wrist-camera RGB image, normalized to ``[0, 1]`` floats in ``(N, C, H, W)``.
-
-    The TiledCamera returns ``(N, H, W, 3)`` uint8 (or float in [0,255]); we
-    permute to channel-first and divide by 255 to match standard CNN input
-    conventions. The shape ``(N, 3, H, W)`` matches what the real-side deploy
-    preprocess produces after ``cv2.undistort`` + resize, so the policy sees
-    the same tensor layout in both worlds.
-
-    No further normalization (mean/std subtraction) is applied — keeping the
-    raw [0,1] range means the encoder can learn its own statistics, and
-    sim/real preprocessing stays as simple as possible.
-    """
-    cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
-    img = cam.data.output["rgb"]  # (N, H, W, 3) — TiledCamera convention
-    # Some Isaac builds emit uint8, others float in [0,255]; normalize either.
+def _normalize_rgb(img: torch.Tensor) -> torch.Tensor:
+    """Convert a TiledCamera RGB tensor to ``(N, 3, H, W)`` float in ``[0,1]``."""
     if img.dtype == torch.uint8:
         img = img.float() / 255.0
     else:
         img = img.float()
-        if img.max() > 1.5:  # heuristic — assume [0,255] range
+        if img.max() > 1.5:
             img = img / 255.0
-    return img.permute(0, 3, 1, 2).contiguous()  # (N, 3, H, W)
+    return img.permute(0, 3, 1, 2).contiguous()
+
+
+def wrist_rgb(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+) -> torch.Tensor:
+    """Legacy 3-channel RGB obs. Kept for backward compat — the live env
+    uses :func:`wrist_image` (5 channels: RGB + depth + mask).
+    """
+    cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
+    return _normalize_rgb(cam.data.output["rgb"])
+
+
+def wrist_image(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    depth_clip_m: float = 0.5,
+    corrupt: bool = True,
+    rgb_brightness_jitter: float = 0.15,
+    rgb_noise_std: float = 5.0 / 255.0,
+    depth_scale_jitter: float = 0.05,
+    depth_noise_std: float = 0.01,
+) -> torch.Tensor:
+    """5-channel wrist-camera observation: ``[R, G, B, depth, mask]``.
+
+    Returns ``(N, 5, H, W)`` floats in ``[0, 1]``. Sim and real-side deploy
+    feed the same shape into the same CNN; on the real side, channels 3
+    and 4 come from Depth Anything 3 and HSV-thresholding respectively
+    (see ``DEPLOY.md`` and ``EVAL1_PLAN.md`` §8).
+
+    Channels:
+
+    * 0–2 RGB — TiledCamera ``rgb`` output. Optional per-step brightness
+      jitter (``±rgb_brightness_jitter``) and additive Gaussian noise
+      (σ=``rgb_noise_std``) when ``corrupt=True``.
+    * 3 Depth — TiledCamera ``distance_to_camera`` clipped to
+      ``[0, depth_clip_m]`` then divided by ``depth_clip_m`` so the
+      channel sits in ``[0, 1]``. With ``corrupt=True`` we add a per-env
+      multiplicative scale jitter (``±depth_scale_jitter``) and additive
+      Gaussian noise (σ=``depth_noise_std``) to *mimic the artifacts a
+      monocular metric depth model (DA3) produces on the real side*.
+      Without this, the policy locks onto sim's perfect geometric depth
+      and fails to transfer (the very gap §8 of EVAL1_PLAN warns about).
+    * 4 Mask — binary cube mask from ``semantic_segmentation``. Any
+      pixel labelled with the ``("class", "block")`` tag is 1.0; the
+      rest is 0.0. On real, replicate via
+      ``cv2.inRange(hsv, low, high)`` calibrated once on a wood-tone
+      block on the gray table.
+
+    ``corrupt`` is gated by a param the play config can override
+    (``params={"corrupt": False}``) so visual-DR doesn't pollute eval.
+    """
+    cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
+    out = cam.data.output
+
+    # ---- RGB ---------------------------------------------------------------
+    rgb = _normalize_rgb(out["rgb"])  # (N, 3, H, W) in [0, 1]
+    # Per-episode tint (constant within an episode; sampled at reset by
+    # :func:`mdp.events.randomize_wrist_image_tint`). Substitutes for
+    # material-level cube/table color DR — see that function's docstring
+    # for why we do it here instead of via Isaac's Replicator path.
+    dr = getattr(env, "_wrist_image_dr", None)
+    if dr is not None:
+        scale = dr[:, :3].view(-1, 3, 1, 1)
+        bright = dr[:, 3].view(-1, 1, 1, 1)
+        rgb = (rgb * scale + bright).clamp_(0.0, 1.0)
+    if corrupt and rgb_brightness_jitter > 0.0:
+        # Per-env scalar in [1-j, 1+j]. Broadcasts over C/H/W.
+        n = rgb.shape[0]
+        scale = 1.0 + (torch.rand(n, 1, 1, 1, device=rgb.device) * 2 - 1) * rgb_brightness_jitter
+        rgb = (rgb * scale).clamp_(0.0, 1.0)
+    if corrupt and rgb_noise_std > 0.0:
+        rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
+
+    # ---- Depth -------------------------------------------------------------
+    # ``distance_to_camera`` is (N, H, W, 1) in metres. Inf/NaN at sky/far →
+    # treat as far-clip value, then clip to the workspace range.
+    depth = out["distance_to_camera"].float()
+    if depth.dim() == 4 and depth.shape[-1] == 1:
+        depth = depth.squeeze(-1)
+    depth = torch.nan_to_num(depth, nan=depth_clip_m, posinf=depth_clip_m, neginf=0.0)
+    depth = depth.clamp_(0.0, depth_clip_m) / depth_clip_m  # (N, H, W) in [0, 1]
+    if corrupt:
+        if depth_scale_jitter > 0.0:
+            n = depth.shape[0]
+            scale = 1.0 + (torch.rand(n, 1, 1, device=depth.device) * 2 - 1) * depth_scale_jitter
+            depth = (depth * scale).clamp_(0.0, 1.0)
+        if depth_noise_std > 0.0:
+            depth = (depth + torch.randn_like(depth) * depth_noise_std).clamp_(0.0, 1.0)
+    depth = depth.unsqueeze(1)  # (N, 1, H, W)
+
+    # ---- Semantic mask -----------------------------------------------------
+    # ``semantic_segmentation`` with ``colorize_semantic_segmentation=False``
+    # returns (N, H, W, 1) int class IDs. Even with
+    # ``semantic_filter="class:block"`` set on the camera, Isaac assigns
+    # **three** IDs: 0=BACKGROUND, 1=UNLABELLED (all prims without the
+    # block class — i.e. table, robot, ground), 2=block. So
+    # ``(seg > 0)`` would mask the entire scene; we need to match the
+    # block ID specifically. We look it up from ``info["idToLabels"]``
+    # at first call and cache on the camera object (the mapping is
+    # static after scene composition).
+    seg = out["semantic_segmentation"]
+    if seg.dim() == 4 and seg.shape[-1] == 1:
+        seg = seg.squeeze(-1)
+    # Cache the block ID, but ONLY after successfully matching it from
+    # the info dict — never fall back to "max ID" speculatively, since
+    # that would freeze the wrong ID forever (smoke test caught this:
+    # info dict was empty on the first call, max-ID heuristic returned
+    # 1 = UNLABELLED, mask covered 91% of the frame).
+    block_id = getattr(cam, "_block_class_id", None)
+    if block_id is None:
+        info = cam.data.info.get("semantic_segmentation", {}) or {}
+        id_map = info.get("idToLabels", {}) if isinstance(info, dict) else {}
+        block_id = next(
+            (int(k) for k, v in id_map.items() if isinstance(v, dict) and v.get("class") == "block"),
+            None,
+        )
+        if block_id is not None:
+            cam._block_class_id = block_id
+    if block_id is not None:
+        mask = (seg == block_id).float().unsqueeze(1)
+    else:
+        # Info dict not yet populated — this only happens on the very
+        # first call before any render has completed. Return zeros for
+        # this one frame; the next step will see the cached ID.
+        mask = torch.zeros(seg.shape[0], 1, *seg.shape[1:], device=seg.device, dtype=torch.float32)
+
+    return torch.cat([rgb, depth, mask], dim=1)  # (N, 5, H, W)

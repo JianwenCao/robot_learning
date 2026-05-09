@@ -41,8 +41,12 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 from torch.distributions import Normal
 
 # Default name of the image obs group. Kept in sync with
-# ``ObservationsCfg.WristRgbCfg`` in :mod:`pickplace_env_cfg`.
-DEFAULT_IMAGE_GROUP = "wrist_rgb"
+# ``ObservationsCfg.WristImageCfg`` in :mod:`pickplace_env_cfg`. The image
+# is 5-channel ``(R, G, B, depth, mask)`` — see :func:`mdp.wrist_image`
+# for channel construction. The CNN's first conv takes ``in_channels``
+# from the input shape so the same class auto-adapts to 3- or 5-channel
+# inputs without code changes.
+DEFAULT_IMAGE_GROUP = "wrist_image"
 
 # Default pad amount for the DrQ-style random-shift augmentation. 4 pixels
 # is ~3% of width / ~6% of height for our 128×72 wrist image and matches
@@ -288,12 +292,39 @@ class PickPlaceVisionActorCritic(ActorCritic):
         else:
             self.critic_obs_normalizer = nn.Identity()
 
-        # Action noise — same as parent class.
+        # Action noise — per-dim init: arm dims at the cfg-supplied
+        # ``init_noise_std``, gripper dim hardcoded to 0.1.
+        #
+        # Why a smaller gripper σ:
+        #     The gripper action goes through ``BinaryJointPositionAction``
+        #     which thresholds ``action[5] > 0`` → open / ≤ 0 → close.
+        #     With scalar σ=0.5 across all dims, the gripper command flips
+        #     ~once every 2-3 steps even when μ_gripper sits at e.g. -0.3
+        #     (P(action[5] > 0) ≈ 28%). The cube cannot survive 30 frames
+        #     in a closed grasp under that flip rate, so PPO never observes
+        #     a successful close-and-hold trajectory and never learns the
+        #     credit assignment "close jaws at cube → +15 grasp reward".
+        #     Run-12 diagnostic (2026-05-09 iter 100): grasp_bootstrap
+        #     decayed 0.41 → 0.010 within ~30 sim steps; grasp_from_scratch
+        #     stayed flat at 0.0 across 100 iters even after the
+        #     ``pre_grasp_pose`` latch fix removed the open-jaws attractor.
+        #     Bootstrap can't deliver useful gradient because the cube
+        #     drops out before any value-function tail can form.
+        # Lowering gripper-dim σ to 0.1 makes the binary command "decisive
+        # open" or "decisive close" for the first ~50-100 iters of training,
+        # giving sustained-grasp trajectories a fighting chance to appear in
+        # rollouts. ``self.std`` is still a learnable nn.Parameter, so PPO
+        # adapts the noise level from there as usual.
         self.noise_std_type = noise_std_type
+        gripper_init_std = 0.1
         if noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+            std_init = init_noise_std * torch.ones(num_actions)
+            std_init[-1] = gripper_init_std  # last dim = gripper (BinaryJointPositionAction)
+            self.std = nn.Parameter(std_init)
         elif noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            std_init = init_noise_std * torch.ones(num_actions)
+            std_init[-1] = gripper_init_std
+            self.log_std = nn.Parameter(torch.log(std_init))
         else:
             raise ValueError(f"Unknown noise_std_type {noise_std_type!r}")
 

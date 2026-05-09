@@ -62,29 +62,31 @@ class PickPlaceBowlPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     * ``policy.class_name`` swapped to the CNN-based actor-critic.
     """
 
-    # 24 steps × 2048 envs × 4000 iters ≈ 200 M env steps. Plan §3.10
-    # budget is 100–300 M steps. 4000 iters covers the bootstrap-decay
-    # curriculum end (~iter 3900 at 2048 envs × 24 steps = 49 152
-    # env-steps/iter, vs 192 k env-steps for warmup+decay) plus a bit
-    # of from-scratch tail. Kill earlier if per-stage success curves
-    # plateau on TB (``Curriculum/log_metrics/release_from_scratch``).
-    num_steps_per_env = 24
-    max_iterations = 4000
+    # ManiSkill3 PickCube SO-100 reports zero-shot real-world cube-grasp
+    # converging in 25–40 M env-steps with ``num_steps_per_env=16`` /
+    # ``gamma=0.9`` / ``num_mini_batches=32``. We adopt all three (this
+    # block + ``algorithm`` below). At 2048 envs × 16 steps = 32 768
+    # env-steps/iter, 25–40 M ≈ 760–1220 iters; 2000 iters is a comfortable
+    # 65 M budget that leaves headroom and still finishes the warmup +
+    # block-xy expand curriculum (192 k env-steps ≈ iter 6 at 32 k/iter →
+    # well within range). Kill earlier if ``release_from_scratch`` saturates.
+    num_steps_per_env = 16
+    max_iterations = 2000
     save_interval = 100
     experiment_name = "pickplace_bowl"
     empirical_normalization = False
 
-    # Asymmetric A-C wiring. ``wrist_rgb`` goes to the actor only — the
-    # critic already has ground-truth ``block_position`` etc. via the
-    # privileged ``critic`` group, so feeding it the image is redundant
-    # compute. Removing it cuts ~1 CNN forward+backward per iter and
-    # halves the encoder param count of the optimizer. The actor still
-    # gets the image (it's the only one that needs to localize the block
-    # from vision). Setting :attr:`PickPlaceVisionActorCritic.critic_cnn`
-    # to ``None`` happens automatically when ``wrist_rgb`` isn't in
-    # ``obs_groups["critic"]``.
+    # Asymmetric A-C wiring. ``wrist_image`` (5-channel RGB+depth+mask)
+    # goes to the actor only — the critic already has ground-truth
+    # ``block_position`` etc. via the privileged ``critic`` group, so
+    # feeding it the image is redundant compute. Removing it cuts ~1 CNN
+    # forward+backward per iter and halves the encoder param count of
+    # the optimizer. The actor still gets the image (it's the only one
+    # that needs to localize the block from vision). Setting
+    # :attr:`PickPlaceVisionActorCritic.critic_cnn` to ``None`` happens
+    # automatically when ``wrist_image`` isn't in ``obs_groups["critic"]``.
     obs_groups = {
-        "policy": ["policy", "wrist_rgb"],
+        "policy": ["policy", "wrist_image"],
         "critic": ["policy", "critic"],
     }
 
@@ -124,19 +126,32 @@ class PickPlaceBowlPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # exploration for stability — acceptable since the policy was
         # already roughly converged at iter 2400 (σ=2.15, reward ~38).
         entropy_coef=0.003,
-        num_learning_epochs=5,
-        # 8 mini-batches keeps the per-batch sample count at 2048×24/8 =
-        # 6144 — same as the 1024-env / 4-mini-batch baseline that runs 1-3
-        # were tuned against. With 2048 envs, sticking to 4 mini-batches
-        # would double the minibatch (12288 samples), which smooths
-        # gradients but halves the number of SGD steps per update.
-        # Holding minibatch size constant gives more SGD steps per iter
-        # (40 vs 20) → better convergence rate at the cost of slightly
-        # more GPU compute.
-        num_mini_batches=8,
+        # Bumped 5 → 8 to match ManiSkill3 PickCube; their convergence in
+        # 25–40 M env-steps is partly attributable to taking more SGD
+        # passes per rollout batch, and our per-iter sample count is
+        # smaller now (2048 × 16 vs 2048 × 24).
+        num_learning_epochs=8,
+        # Lowered 32 → 16 (run-11 throughput diagnostic 2026-05-09): at
+        # 2560 envs × 16 steps / 32 mini-batches = 1280 samples/batch the
+        # spatial-softmax CNN forward (~5 ms) was small enough that
+        # per-batch overhead (kernel launches, optimizer step) dominated,
+        # holding learning-phase GPU util at ~80% avg. Doubling per-batch
+        # to 2560 samples halves SGD step count (256→128/iter) but the
+        # ones that remain are GPU-saturating. Trade-off vs ManiSkill3's
+        # published 32: their batch was 1024 envs × 16 / 32 = 512 samples
+        # — we end up at 5x their per-batch size, on a slightly bigger
+        # network. Adaptive KL absorbs the noisier-gradient risk.
+        num_mini_batches=16,
         learning_rate=1.0e-4,
         schedule="adaptive",
-        gamma=0.98,
+        # Lowered 0.98 → 0.9 to match ManiSkill3 PickCube. Effective
+        # horizon ≈ 1/(1−γ) = 10 steps at γ=0.9 vs 50 steps at γ=0.98;
+        # the grasp event lives ~10–20 steps into the rollout from the
+        # reach phase, so a tighter discount actually sharpens credit
+        # assignment on the grasp transition rather than diluting it.
+        # Short-horizon manipulation tasks consistently benefit from
+        # γ ∈ [0.8, 0.95] in the literature; we sit at the upper edge.
+        gamma=0.9,
         lam=0.95,
         # ``desired_kl`` halved from the lift-task default 0.01 → 0.005 after
         # observing action-noise σ blow up to 2.12 by iter 2100 of the

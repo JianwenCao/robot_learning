@@ -237,18 +237,27 @@ class ObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
-    class WristRgbCfg(ObsGroup):
-        """Wrist-camera RGB image — 4-D ``(N, 3, H, W)``, **not** concatenated.
+    class WristImageCfg(ObsGroup):
+        """5-channel wrist-camera image — ``(N, 5, H, W)``, **not** concatenated.
 
-        Single-term group so the image keeps its spatial layout downstream.
-        The custom CNN-based actor-critic recognizes this group by name
-        (``wrist_rgb``) and routes it through the conv encoder.
-        Corruption is left off here — image-space DR (color jitter, blur,
-        noise) is implemented as ``EventTerm``s on the camera prim, not as
-        post-hoc obs corruption (kept consistent with sim-real preprocess).
+        Channels: RGB (0–2) + clipped/normalized depth (3) + binary cube
+        mask (4). All in ``[0, 1]``. Sim and real-side deploy feed the
+        same shape into the same CNN; on real, channels 3 and 4 come from
+        Depth Anything 3 and HSV thresholding respectively. See
+        :func:`mdp.wrist_image` for per-step DR (brightness, noise, depth
+        scale jitter mimicking DA3 artifacts) and
+        :func:`mdp.randomize_wrist_image_tint` for per-episode color tint
+        (sampled at reset).
+
+        Single-term group so the image keeps its spatial layout
+        downstream. The custom CNN-based actor-critic recognizes this
+        group by name (``wrist_image``) and routes it through the conv
+        encoder. ``corrupt=False`` on the play variant via
+        ``params={"corrupt": False}`` (set in
+        ``SoArm101PickPlaceBowlEnvCfg_PLAY.__post_init__``).
         """
 
-        wrist_rgb = ObsTerm(func=mdp.wrist_rgb)
+        wrist_image = ObsTerm(func=mdp.wrist_image)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -256,7 +265,7 @@ class ObservationsCfg:
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
-    wrist_rgb: WristRgbCfg = WristRgbCfg()
+    wrist_image: WristImageCfg = WristImageCfg()
 
 
 # ---------------------------------------------------------------------------
@@ -303,32 +312,42 @@ class EventCfg:
         },
     )
 
-    # Bootstrap-grasp event re-enabled at a *fixed floor* (no curriculum
-    # decay) after run 8 (2026-05-09 reach=1.0 revert + 1024 envs, 800
-    # iters) plateaued: reach saturated near 0.45 with grasp_from_scratch
-    # stuck at 0.0000 through 800 iters. The reach magnitude fix alone
-    # was insufficient — once the policy settles into a low-amplitude
-    # arm-wave that earns small reach reward, σ=1.0 noise no longer
-    # produces persistent grasps because the early transient closures
-    # get punished by joint_vel/action_rate while the lifted block
-    # carries the arm around.
+    # Bootstrap-grasp event — bumped 0.10 → 0.50 after run-13 (2026-05-09
+    # post-gripper-σ-fix, 400 iters) confirmed the diagnosis: with only
+    # 10% bootstrap, PPO never sees enough sustained-grasp trajectories
+    # to credit-assign back to "close gripper at cube". grasp_from_scratch
+    # peaked at 0.0009 around iter 150 then decayed back to 0; pre_grasp
+    # crept back to 0.30; grasp Episode_Reward fell 0.083 → 0.016 over
+    # iters 100→400. With p=0.50 half the rollouts contain post-grasp
+    # value-function tail that propagates back via advantage to the
+    # close-and-hold action.
     #
-    # Why a *floor* and not a decay: run 5 (and the
-    # ``bootstrap-curriculum-pitfall`` memory note) showed decay-to-zero
-    # caused reward collapse — the policy rode the subsidy and never
-    # learned grasp-from-scratch, so when p hit 0 the value function
-    # cliff-dropped. A *constant* p=0.10 keeps 10% of episodes starting
-    # grasped indefinitely, giving the value function steady gradient on
-    # the post-grasp stages (transport / place / release) that propagates
-    # back via advantage to "close gripper at cube" without the cliff.
-    # The function still maintains ``env._is_bootstrapped`` so the
-    # ``grasp_from_scratch`` metric (computed only over the 90% of
-    # episodes that did NOT get bootstrapped) remains a valid measure
-    # of from-scratch learning.
+    # Risk: ``bootstrap-curriculum-pitfall`` memory documents that policy
+    # can ride the subsidy and never learn from-scratch grasp. Mitigation:
+    # ``grasp_from_scratch`` and ``release_from_scratch`` curriculum
+    # metrics are computed *only* over the non-bootstrapped 50%, so they
+    # remain a clean signal of from-scratch competence. Stop the run if
+    # they don't break above 0.005 by iter ~500.
     bootstrap_grasped = EventTerm(
         func=mdp.init_block_in_gripper,
         mode="reset",
-        params={"p_grasped": 0.10, "gripper_closed_q": 0.05},
+        params={"p_grasped": 0.50, "gripper_closed_q": 0.05},
+    )
+
+    # Per-episode wrist-image color tint — substitutes for material-level
+    # cube/table-color DR (see :func:`mdp.randomize_wrist_image_tint`
+    # docstring for why this lives in obs-space rather than scene-space).
+    # rgb_scale ±30% covers ManiSkill3 / CS6341 cube color envelopes
+    # (the wood block on a near-gray table is well within ±30% of either
+    # axis). brightness ±0.15 layers a small global offset on top, which
+    # is the obs-space proxy for dome-light intensity DR.
+    randomize_wrist_image_tint = EventTerm(
+        func=mdp.randomize_wrist_image_tint,
+        mode="reset",
+        params={
+            "rgb_scale_range": (0.7, 1.3),
+            "brightness_range": (-0.15, 0.15),
+        },
     )
 
     # Wrist-cam extrinsic DR — ported from LeIsaac (cf. pick_orange_env_cfg.py
@@ -390,7 +409,15 @@ class RewardsCfg:
     # version of this idea" — that lower-risk version failed at iter
     # 615 (run 7 reach=5) and again at iter 250 (run 10 reach=1 +
     # bootstrap + low σ), so we're back to the design's intended fix.
-    pre_grasp = RewTerm(func=mdp.pre_grasp_pose, params={"std": 0.05}, weight=2.0)
+    # Weight halved 2.0 → 1.0 alongside the per-episode-latch gating fix in
+    # ``mdp.pre_grasp_pose`` (run-11 diagnostic 2026-05-09: at w=2.0 the
+    # term saturated at 0.96/episode while ``grasp`` paid only 0.015 →
+    # policy converged to "park EE near cube with jaws open" attractor;
+    # ``grasp_bootstrap`` decayed 0.41→0.006 over 100 iters). The
+    # latch fix removes the open-jaws-after-fumble exploit; halving the
+    # weight additionally shallows the open-jaws basin so PPO's
+    # exploration noise can find the close-and-lift action sequence.
+    pre_grasp = RewTerm(func=mdp.pre_grasp_pose, params={"std": 0.05}, weight=1.0)
 
     # Reach weight reverted 5.0 → 1.0 after run 7 (2026-05-08_23-57-07,
     # 615 iters, 30 M env-steps) plateaued at reach-only with grasp=0

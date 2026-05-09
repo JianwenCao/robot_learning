@@ -123,25 +123,34 @@ def pre_grasp_pose(
     gripper_joint_name: str = "gripper",
     gripper_open_value: float = 1.5,
 ) -> torch.Tensor:
-    """Dense reward for *pre-grasp* posture, gated off once block is grasped.
+    """Dense reward for *pre-grasp* posture, gated off once the block has
+    been lifted at any prior step of the episode (per-episode latch).
 
-    This term decomposes the temporally-extended grasp prerequisite ("open
-    jaws → approach → close jaws around block → lift") into a step-level
-    gradient that PPO can hill-climb on. Without it, a 1500-iter state-
-    only run plateaued at reach-only because the policy couldn't credit-
-    assign the gripper-opening sub-task.
+    Returns ``proximity * jaw_openness * (1 - was_lifted_this_episode)``:
 
-    Returns ``proximity * jaw_openness * (1 - is_grasped)``:
+    * ``proximity = exp(-||ee - block||² / std²)``.
+    * ``jaw_openness = clamp(gripper_q / gripper_open_value, 0, 1)``.
+    * ``(1 - was_lifted)`` — gated off the **per-episode lift latch**
+      (``env._was_grasped``, also used by ``place``/``release``).
 
-    * ``proximity = exp(-||ee - block||² / std²)``  → 1 at zero distance,
-      drops smoothly to 0 by ~0.15 m.
-    * ``jaw_openness = clamp(gripper_q / gripper_open_value, 0, 1)`` —
-      0 when fully closed, 1 when fully open.
-    * ``(1 - is_grasped)`` — **critical**: without this gate the policy
-      camps at pre-grasp pose forever (observed empirically: pre_grasp
-      reward saturated at 1.89/step weight=2.0 with grasp reward at 0).
-      Gating off on grasp makes attempting a grasp net-positive: lose
-      ≤ 2/step pre_grasp → gain 5/step grasp.
+    Why per-episode and not per-step:
+        Earlier this term was gated on ``(1 - is_grasped)`` where
+        ``is_grasped = block_z > 0.025`` is per-step. Run 11 (2026-05-09,
+        new full method, iter 100) showed the failure mode: bootstrap
+        envs would lose the grasp within ~30 steps from random gripper
+        action noise → block falls → ``is_grasped=False`` → pre_grasp
+        flips back on → policy trained to keep jaws open → never
+        recovers. ``grasp_bootstrap`` decayed 0.41 → 0.006 across 100
+        iters and ``grasp_from_scratch`` stayed flat at 0.000.
+        Gating on the **episode lift latch** makes the disable
+        permanent for the rest of the episode once the block has been
+        lifted ≥ ``minimal_height`` even once: a fumbled grasp can no
+        longer pay pre_grasp on the recovery, so the gradient pushes
+        toward "regrasp + lift" rather than "open jaws and farm".
+        Bootstrap envs spawn with the block already at gripper height
+        (≈ 0.09 m > 0.025) so the latch sets at step 0 → bootstrap
+        envs see pre_grasp = 0 throughout, eliminating the open-jaws
+        attractor for them entirely.
     """
     obj: RigidObject = env.scene[object_cfg.name]
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
@@ -156,8 +165,9 @@ def pre_grasp_pose(
     gripper_q = robot.data.joint_pos[:, gripper_idx]
     jaw_openness = (gripper_q / gripper_open_value).clamp(0.0, 1.0)
 
-    grasped = _grasped_mask(env, object_cfg, ee_frame_cfg, grasp_distance, minimal_height)
-    return proximity * jaw_openness * (1.0 - grasped.float())
+    # Per-episode latch (idempotent OR-update; reset by ``mdp.events.reset_was_grasped``).
+    was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
+    return proximity * jaw_openness * (1.0 - was_lifted.float())
 
 
 # ---------------------------------------------------------------------------
