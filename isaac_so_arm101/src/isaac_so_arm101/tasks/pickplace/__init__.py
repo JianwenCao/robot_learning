@@ -56,3 +56,29 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Vision student — DAgger distillation from the state teacher (model_*.pt
+# in pickplace_bowl_teacher). Same env cfg as the teacher (we need both
+# state and image obs in the obs dict — the env already produces all of
+# policy / critic / wrist_image groups). The runner cfg points at
+# DistillationRunner which auto-loads the teacher checkpoint via
+# StudentTeacher.load_state_dict (PPO ``actor.*`` → teacher MLP).
+gym.register(
+    id="Isaac-SO-ARM101-PickPlace-Bowl-Student-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.distill_cfg:PickPlaceBowlDistillRunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-PickPlace-Bowl-Student-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.distill_cfg:PickPlaceBowlDistillRunnerCfg",
+    },
+    disable_env_checker=True,
+)

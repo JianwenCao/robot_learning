@@ -32,6 +32,7 @@ import torch
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformer
+from isaaclab.utils.math import combine_frame_transforms
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -235,24 +236,58 @@ def grasp_event(
 
 def transport_to_bowl(
     env: ManagerBasedRLEnv,
-    std: float = 0.15,
-    grasp_distance: float = 0.04,
+    std: float = 0.30,
     minimal_height: float = 0.025,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    # Kept for backward compat with old callers that pass these:
+    grasp_distance: float = 0.04,
     ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
 ) -> torch.Tensor:
-    """Dense gripper-xy → bowl-xy reward, only active while holding the block.
+    """Dense **cube → goal_xyz** distance, gated on the per-episode lift latch.
 
-    Gating on ``is_grasped`` is what stops the policy from learning to fly
-    the empty gripper over the bowl.
+    Returns
+
+        was_lifted_this_episode * (1 - tanh(||cube - goal_xyz|| / std))
+
+    where the gate is the per-episode ``env._was_grasped`` latch (True if
+    the cube has been ≥ ``minimal_height`` at *any* prior step of the
+    current episode), maintained by :func:`_episode_lifted_mask` and
+    cleared each reset by :func:`mdp.events.reset_was_grasped`.
+
+    Why latch (not per-step lift gate, which is what stock Franka Lift
+    uses): stock task's goal is a 3-D pose ABOVE the table (z=0.25-0.50)
+    and the cube ends up *held* at that goal. The per-step lift gate
+    enforces "cube must currently be lifted" which works because the
+    goal IS lifted. Our task is place-into-bowl where the bowl sits on
+    the table at z≈0 — after release, cube ends up at cube_center ≈
+    0.01 (bowl on table, cube on bowl floor). With per-step lift gate,
+    transport reward goes to 0 the moment the cube enters the bowl
+    (cube_z drops below 0.025) even though the policy just *succeeded*
+    at placing. Latch instead pays continuously after lift-once-per-
+    episode regardless of cube z, so policy is rewarded for placing
+    AND for staying placed.
+
+    Drag-on-table exploit prevention: same as the latch on
+    place_in_bowl / release_in_bowl — drag without lifting → latch
+    stays False → transport pays 0.
+
+    ``grasp_distance`` and ``ee_frame_cfg`` kwargs kept on signature
+    for backward-compat with cfg call sites; unused.
     """
-    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
-    ee_xy_w = ee_frame.data.target_pos_w[..., 0, :2]
-    bowl_w = _bowl_xy_w(env, command_name)
-    dist = torch.norm(ee_xy_w - bowl_w, dim=1)
-    grasped = _grasped_mask(env, object_cfg, ee_frame_cfg, grasp_distance, minimal_height)
-    return grasped.float() * (1.0 - torch.tanh(dist / std))
+    del grasp_distance, ee_frame_cfg  # unused; kept for cfg backward-compat
+    obj: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    goal_pos_b = command[:, :3]  # goal in robot root frame
+    goal_pos_w, _ = combine_frame_transforms(
+        robot.data.root_pos_w, robot.data.root_quat_w, goal_pos_b
+    )
+    cube_pos_w = obj.data.root_pos_w
+    distance = torch.norm(goal_pos_w - cube_pos_w, dim=1)
+    was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
+    return was_lifted.float() * (1.0 - torch.tanh(distance / std))
 
 
 # ---------------------------------------------------------------------------

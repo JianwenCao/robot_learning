@@ -82,12 +82,23 @@ class PickPlaceBowlTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
       stack when the image group isn't in ``obs_groups``.
     """
 
-    # Same per-iter sample budget as vision (2560 envs × 16 = 40,960).
-    # State-PPO is cheaper per step (no image render through CNN) so this
-    # converges faster in wall-clock too. Target: ~1500 iters to maturity.
-    num_steps_per_env = 16
-    max_iterations = 2000
-    save_interval = 100
+    # Match stock Isaac Lab Franka Lift PPO config (rsl_rl_ppo_cfg.py at
+    # ``isaaclab_tasks/manager_based/manipulation/lift/config/franka/agents``).
+    # That config converges this same MDP class (state-based PPO on
+    # binary-gripper pick-and-place) reliably in ~1500 iters at 4096
+    # envs. We had drifted away from it across runs 11-15 with
+    # task-specific tweaks (γ=0.9 from ManiSkill, more mini-batches for
+    # GPU saturation, smaller init noise) — every drift compounded the
+    # divergence. This is a verbatim revert.
+    num_steps_per_env = 24
+    # Single-stage from-scratch training (no more two-stage). Stage 1's
+    # "lift to z=0.10" objective baked the wrong wrist posture; stage 2
+    # couldn't unlearn it cleanly. The new task design (latch-based
+    # transport, goal_z=0, release reward from start) lets the teacher
+    # learn pick + transport + place + release in one shot, no need
+    # for a staged warm-up.
+    max_iterations = 1500
+    save_interval = 50
     experiment_name = "pickplace_bowl_teacher"
     empirical_normalization = False
 
@@ -103,11 +114,13 @@ class PickPlaceBowlTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     policy = RslRlPpoActorCriticCfg(
         class_name="PickPlaceVisionActorCritic",
-        # Same gripper-σ-init logic as the vision config — even with
-        # privileged state, the binary-thresholded gripper action benefits
-        # from low init noise. Code path inside the class will set
-        # ``self.std[-1] = 0.1`` for us.
-        init_noise_std=0.5,
+        # Stock σ=1.0 across all dims, INCLUDING the binary gripper.
+        # Stock Franka Lift uses BinaryJointPositionActionCfg too, so
+        # this is a known-good config for our action space. Our prior
+        # gripper-σ override (0.1, then 0.2) is also disabled in the
+        # actor-critic class to honor stock semantics — see the
+        # gripper_init_std variable in vision_actor_critic.py.
+        init_noise_std=1.0,
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
         activation="elu",
@@ -116,13 +129,26 @@ class PickPlaceBowlTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.003,
-        num_learning_epochs=8,
-        num_mini_batches=16,
+        # Reverted 0.02 → 0.006 (stock Franka Lift) after run-17 TB
+        # diagnostic (2026-05-10, 350 iters, bootstrap=0): entropy_coef=0.02
+        # over-corrected — σ inflated 1.0 → 1.60 → 1.49 (high plateau),
+        # value_function loss converged to 0.0000, surrogate loss bouncing
+        # around 0, LR clamped to 1e-4 floor. PPO stopped updating because
+        # entropy bonus dominated the policy gradient. The σ=1.5 regime
+        # makes the binary gripper action essentially random (P(open)=
+        # P(close)=50% even with biased μ), so no sustained close-and-
+        # hold trajectory ever appeared in 614k frames except one
+        # transient grasp at iter 66. Stock entropy (0.006) lets σ decay
+        # naturally to a useful exploration band; bootstrap p=0.10 (set
+        # in pickplace_env_cfg.EventCfg) supplies the rollouts that
+        # exploration alone couldn't generate.
+        entropy_coef=0.006,
+        num_learning_epochs=5,
+        num_mini_batches=4,
         learning_rate=1.0e-4,
         schedule="adaptive",
-        gamma=0.9,
+        gamma=0.98,
         lam=0.95,
-        desired_kl=0.005,
+        desired_kl=0.01,
         max_grad_norm=1.0,
     )

@@ -27,9 +27,11 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import (
     OffsetCfg,
 )
 from isaaclab.sim.schemas.schemas_cfg import RigidBodyPropertiesCfg
-from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg  # noqa: F401  kept for fallback paths
 from isaaclab.sim.spawners.sensors.sensors_cfg import PinholeCameraCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 import isaac_so_arm101.tasks.pickplace.mdp as mdp
 from isaac_so_arm101.robots import SO_ARM101_CFG  # noqa: F401
@@ -96,14 +98,47 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
         # the actual goal is the (x, y) sampled in the robot frame.
         self.commands.bowl_pose.body_name = "gripper_link"
 
-        # 2 cm wooden block. We define the cube directly with CuboidCfg so
-        # the geometry matches the eval spec exactly. Mass ≈ 4.8 g
-        # (density ≈ 600 kg/m³ → 8e-6 m³ × 600 = 4.8e-3 kg).
+        # Make the goal-pose marker actually visible — default
+        # ``FRAME_MARKER_CFG`` is a 5 cm RGB tripod that disappears against
+        # the busy scene with multiple envs. Replace with a bright RED
+        # SPHERE_MARKER (radius 3 cm) at the bowl xyz so the place target
+        # is unmistakable in the viewport. Also shrink the current-pose
+        # frame marker (gripper-tracking) so it doesn't visually clutter
+        # near the goal.
+        from isaaclab.markers.config import SPHERE_MARKER_CFG, FRAME_MARKER_CFG
+
+        goal_marker = SPHERE_MARKER_CFG.copy()
+        goal_marker.prim_path = "/Visuals/Command/goal_pose"
+        goal_marker.markers["sphere"].radius = 0.03  # 3 cm — visible on table scale
+        goal_marker.markers["sphere"].visual_material.diffuse_color = (1.0, 0.0, 0.0)  # red
+        self.commands.bowl_pose.goal_pose_visualizer_cfg = goal_marker
+
+        cur_marker = FRAME_MARKER_CFG.copy()
+        cur_marker.prim_path = "/Visuals/Command/body_pose"
+        cur_marker.markers["frame"].scale = (0.04, 0.04, 0.04)
+        self.commands.bowl_pose.current_pose_visualizer_cfg = cur_marker
+
+        # 2 cm cube — switched from CuboidCfg primitive to NVIDIA's
+        # ``dex_cube_instanceable.usd`` (verbatim port from the upstream
+        # isaac_so_arm101 lift task) after run-19 diagnostic showed our
+        # primitive cube's hand-tuned physics_material wouldn't reliably
+        # grasp under random gripper exploration. The dex cube ships with
+        # NVIDIA-tuned mass/friction/collision shape that's known-good
+        # for binary-gripper grasping (used by Franka Lift, ManiSkill3
+        # PickCube, and the upstream SO-ARM101 lift task that converged
+        # on this same MDP class).
+        #
+        # Native dex_cube is ~5 cm; scale 0.4 → ~2 cm to match the eval
+        # spec (single 2×2×2 cm wooden cube). Upstream uses scale 0.5
+        # (~2.5 cm); we go slightly smaller. The instanceable USD scales
+        # proportionally on mass and collision via ``RigidBodyPropertiesCfg``
+        # so physics stays balanced.
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             init_state=RigidObjectCfg.InitialStateCfg(pos=[0.2, 0.0, 0.01], rot=[1, 0, 0, 0]),
-            spawn=sim_utils.CuboidCfg(
-                size=(0.02, 0.02, 0.02),
+            spawn=UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+                scale=(0.4, 0.4, 0.4),
                 rigid_props=RigidBodyPropertiesCfg(
                     solver_position_iteration_count=16,
                     solver_velocity_iteration_count=1,
@@ -112,22 +147,9 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
                     max_depenetration_velocity=5.0,
                     disable_gravity=False,
                 ),
-                mass_props=sim_utils.MassPropertiesCfg(mass=0.005),
-                collision_props=sim_utils.CollisionPropertiesCfg(),
-                # Default visual color (will be overwritten per-env by DR).
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.4, 0.2)),
-                physics_material=RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
-                    static_friction=0.8,
-                    dynamic_friction=0.6,
-                ),
                 # Semantic class label so the wrist camera's
                 # ``semantic_segmentation`` output produces a clean binary
                 # mask of the block (channel 4 of ``mdp.wrist_image``).
-                # The class string ``"block"`` is matched against
-                # ``cam.data.info["semantic_segmentation"]`` at obs time
-                # to find the right ID; see :func:`mdp.wrist_image`.
                 semantic_tags=[("class", "block")],
             ),
         )

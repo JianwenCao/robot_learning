@@ -315,16 +315,22 @@ class PickPlaceVisionActorCritic(ActorCritic):
         # giving sustained-grasp trajectories a fighting chance to appear in
         # rollouts. ``self.std`` is still a learnable nn.Parameter, so PPO
         # adapts the noise level from there as usual.
+        # Action noise — stock RSL-RL semantics (uniform σ across all dims).
+        # Earlier we had a per-dim override hardcoding σ_gripper to 0.1 / 0.2
+        # on the theory that the binary gripper action needed quieter
+        # exploration than the arm joints. Stock Isaac Lab Franka Lift PPO
+        # uses ``init_noise_std=1.0`` across all dims with the same
+        # ``BinaryJointPositionActionCfg`` gripper and converges in ~1500
+        # iters — proving the override was unnecessary (and possibly
+        # harmful, since it locked early exploration too narrow to
+        # discover sustained-close trajectories). Removing the override
+        # restores stock semantics; ``self.std`` is still a learnable
+        # Parameter so PPO adapts σ as usual.
         self.noise_std_type = noise_std_type
-        gripper_init_std = 0.1
         if noise_std_type == "scalar":
-            std_init = init_noise_std * torch.ones(num_actions)
-            std_init[-1] = gripper_init_std  # last dim = gripper (BinaryJointPositionAction)
-            self.std = nn.Parameter(std_init)
+            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif noise_std_type == "log":
-            std_init = init_noise_std * torch.ones(num_actions)
-            std_init[-1] = gripper_init_std
-            self.log_std = nn.Parameter(torch.log(std_init))
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         else:
             raise ValueError(f"Unknown noise_std_type {noise_std_type!r}")
 
