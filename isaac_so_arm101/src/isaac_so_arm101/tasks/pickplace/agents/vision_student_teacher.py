@@ -45,7 +45,7 @@ from torch.distributions import Normal
 # Reuse the spatial-softmax CNN already proven on this env. Same first-layer
 # shape (5-channel input), same output dim (128) — drop-in compatible with
 # the rest of our pipeline.
-from .vision_actor_critic import _SpatialSoftmaxCNN
+from .vision_actor_critic import DRQ_PAD_PIXELS, _SpatialSoftmaxCNN, _random_shift_pad
 
 DEFAULT_IMAGE_GROUP = "wrist_image"
 
@@ -210,6 +210,14 @@ class PickPlaceVisionStudentTeacher(StudentTeacher):
         if self.student_cnn is None:
             return state
         img = self._safe(obs[self.image_group_name])
+        # Apply the SAME DrQ pad-and-crop augmentation that Stage 3 vision PPO
+        # uses (vision_actor_critic._encode_actor). Without this, Stage 2
+        # distillation trains the CNN on un-shifted images and Stage 3 then
+        # starts feeding it shifted images → keypoint distribution shift at
+        # the BC→RL boundary, contributing extra advantage-gradient noise on
+        # top of the random-critic shock. See EVAL1_PLAN §7.2 intervention #1.
+        if self.training:
+            img = _random_shift_pad(img, DRQ_PAD_PIXELS)
         feat = self.student_cnn(img)
         return torch.cat([state, feat], dim=-1)
 

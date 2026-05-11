@@ -8,7 +8,7 @@ This guide is for the conda-based setup of [MuammerBay/isaac_so_arm101](https://
 conda activate so_arm
 export OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y
 
-list_envs                                              # list 8 SO-ARM tasks
+list_envs                                              # list 14 SO-ARM tasks
 zero_agent   --task Isaac-SO-ARM100-Reach-Play-v0      # send zero actions
 random_agent --task Isaac-SO-ARM100-Reach-Play-v0      # send random actions
 train        --task Isaac-SO-ARM100-Reach-v0 --headless
@@ -92,7 +92,7 @@ conda activate so_arm   # reactivate to pick them up
 list_envs
 ```
 
-Expect 10 tasks — Reach, Lift, and PickPlace, with the ARM100/ARM101 and training/Play variants applicable to each:
+Expect 14 tasks — Reach, Lift, and PickPlace, with the ARM100/ARM101 and training/Play variants applicable to each. The PickPlace family also has Teacher and Student variants for the three-stage warm-start pipeline (see §5.1 below and `EVAL1_PLAN.md` §7):
 
 | # | Task ID |
 |---|---|
@@ -102,12 +102,18 @@ Expect 10 tasks — Reach, Lift, and PickPlace, with the ARM100/ARM101 and train
 | 4 | `Isaac-SO-ARM101-Lift-Cube-Play-v0` |
 | 5 | `Isaac-SO-ARM101-PickPlace-Bowl-v0` |
 | 6 | `Isaac-SO-ARM101-PickPlace-Bowl-Play-v0` |
-| 7 | `Isaac-SO-ARM100-Reach-v0` |
-| 8 | `Isaac-SO-ARM100-Reach-Play-v0` |
-| 9 | `Isaac-SO-ARM101-Reach-v0` |
-| 10 | `Isaac-SO-ARM101-Reach-Play-v0` |
+| 7 | `Isaac-SO-ARM101-PickPlace-Bowl-Teacher-v0` |
+| 8 | `Isaac-SO-ARM101-PickPlace-Bowl-Teacher-Play-v0` |
+| 9 | `Isaac-SO-ARM101-PickPlace-Bowl-Student-v0` |
+| 10 | `Isaac-SO-ARM101-PickPlace-Bowl-Student-Play-v0` |
+| 11 | `Isaac-SO-ARM100-Reach-v0` |
+| 12 | `Isaac-SO-ARM100-Reach-Play-v0` |
+| 13 | `Isaac-SO-ARM101-Reach-v0` |
+| 14 | `Isaac-SO-ARM101-Reach-Play-v0` |
 
 `PickPlace-Bowl` is the SO-ARM101 single-object pick-and-place task added for Eval 1 of the project; see `EVAL1_PLAN.md` for design and `tasks/pickplace/` for the source. **It is vision-based** — a wrist-mounted `TiledCamera` is parented to `gripper_link` and ``wrist_rgb`` is a deployable obs group. Always pass `--enable_cameras` to `train`, `play`, `zero_agent`, `random_agent`, or any other entry point that instantiates this env; without the flag the camera fails to initialize and the env raises ``RuntimeError: A camera was spawned without the --enable_cameras flag`` on the first step.
+
+The `-Teacher-` and `-Student-` variants share the same env but route obs groups differently for the warm-start pipeline: **Teacher** runs state-only PPO (no image, CNN auto-disables) to produce a cheap state-based policy; **Student** runs short DAgger distillation (`DistillationRunner`, MSE loss) to warm-start the vision actor; the bare `-v0` form then resumes from the student checkpoint and trains vision PPO past the teacher's performance. See `EVAL1_PLAN.md` §7 for rationale and §5.1 below for commands.
 
 > ⚠️ **The upstream README task names are stale.** It writes `SO-ARM100-Reach-Play-v0`; the registered gym IDs are prefixed with `Isaac-`. Use the table above (or `list_envs`) as the source of truth — `--task SO-ARM100-Reach-Play-v0` will fail with a gym registration error.
 
@@ -144,6 +150,41 @@ tensorboard --logdir logs/rsl_rl
 ```
 
 (Earlier versions of this doc pointed at `isaac_so_arm101/logs/rsl_rl` — that path is wrong unless you `cd isaac_so_arm101` before launching `train`.)
+
+### 5.1. Three-stage training for `PickPlace-Bowl` (teacher warm-start)
+
+Cold-start vision PPO on this task is brittle; the recommended path is to warm-start the vision actor from a state-based teacher (design in `EVAL1_PLAN.md` §7). Three sequential runs, each a stock RSL-RL invocation:
+
+```bash
+# Stage 1 — state-only teacher PPO (CNN auto-disabled, converges cheaply)
+train --task Isaac-SO-ARM101-PickPlace-Bowl-Teacher-v0 \
+      --enable_cameras --headless
+
+# Stage 2 — short distillation (~200–500 iters, NOT to convergence)
+#   stop when release_from_scratch clears ~30–50 % in TB.
+#   The student CNN now sees the same DrQ ±4 px shift it will face in Stage 3
+#   (EVAL1_PLAN §7.2 intervention #1) — re-run Stage 2 if your existing
+#   distill checkpoint pre-dates this fix.
+train --task Isaac-SO-ARM101-PickPlace-Bowl-Student-v0 \
+      --enable_cameras --headless \
+      --load_run <teacher_run_dir> --checkpoint model_700.pt
+
+# Stage 3 — warm-started vision PPO with teacher-critic carry-over.
+#   --teacher_ckpt overlays the Stage-1 PPO critic onto the policy AFTER
+#   the distill warm-start has been applied to the actor. Without it, the
+#   fresh-random critic destroys the warm-started actor within ~50 iters via
+#   noisy advantage estimates (EVAL1_PLAN §7.2 interventions #2-#5).
+train --task Isaac-SO-ARM101-PickPlace-Bowl-v0 \
+      --enable_cameras --headless --resume \
+      --load_run <student_run_dir> --checkpoint model_<best>.pt \
+      --teacher_ckpt logs/rsl_rl/pickplace_bowl_teacher/<teacher_run_dir>/model_700.pt
+```
+
+Stage 2 needs the teacher PPO checkpoint; `StudentTeacher.load_state_dict()` detects PPO `actor.*` keys and routes them into `self.teacher`. Stage 3 needs both:
+- the distill checkpoint via `--load_run / --checkpoint`: `PickPlaceVisionActorCritic.load_state_dict()` detects distill keys (`student_cnn.*`, `student.*`) and routes them into `actor_cnn.*` / `actor.*`. **The loaded `std=0.1` is intentionally dropped**, restoring the cfg's `init_noise_std=0.5` for exploration.
+- the teacher checkpoint via `--teacher_ckpt`: train.py filters to `critic.*` keys and overlays them onto the policy. Teacher critic shape (`policy+critic → [256,128,64] → 1`) matches Stage 3 critic layer-for-layer — this is the Pinto asymmetric A-C handoff.
+
+Replace the iteration numbers with whatever your runs converged at — checkpoint names are `model_<iter>.pt`.
 
 ### 6. Evaluate a trained policy
 

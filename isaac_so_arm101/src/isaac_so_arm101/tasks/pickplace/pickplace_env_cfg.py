@@ -85,13 +85,25 @@ class PickPlaceBowlSceneCfg(InteractiveSceneCfg):
     wrist_cam: TiledCameraCfg = MISSING
 
     # Flat gray cuboid table matching eval color (#B8ADA9 → linear sRGB
-    # ≈ (0.722, 0.678, 0.663)). 1 m × 1 m × 2 cm thick; top of the table
-    # sits at z=0 so block init z=0.01 is "block on table".
+    # ≈ (0.722, 0.678, 0.663)). Top of the table sits at z=0 so block
+    # init z=0.01 is "block on table".
+    #
+    # Sim-to-real geometry match: on the real rig the SO-ARM101 base is
+    # clamped at the table edge, so the table extends ~0 cm behind the
+    # arm base (origin). Previously the table was 1 m square centered at
+    # x=0.2, putting 30 cm of table *behind* the base — which the deployed
+    # wrist-cam never sees on the real setup, creating a background
+    # distribution mismatch. New x-extent is 0.6 m: back edge at x=-0.05
+    # (5 cm clearance for the ~9 cm base footprint), front edge at x=0.55
+    # (≥25 cm beyond the max reach of 0.30, plenty of visual context).
+    # y unchanged at 1 m — the side bezels aren't a sim-to-real issue.
+    # Workspace dependencies (bowl ranges [0.15, 0.28] × ±0.12, block init
+    # x=0.20) are all comfortably inside the new table.
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
-        init_state=AssetBaseCfg.InitialStateCfg(pos=[0.2, 0.0, -0.01]),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=[0.25, 0.0, -0.01]),
         spawn=sim_utils.CuboidCfg(
-            size=(1.0, 1.0, 0.02),
+            size=(0.6, 1.0, 0.02),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.722, 0.678, 0.663),  # #B8ADA9
                 roughness=0.7,
@@ -483,16 +495,31 @@ class TerminationsCfg:
 
 @configclass
 class CurriculumCfg:
-    """Action/joint-vel penalty ramp — VERBATIM stock Franka Lift curriculum.
+    """Action/joint-vel penalty ramp + block-xy expand for Stage 3 warm-start.
 
-    Stock has exactly two curriculum terms: action_rate and joint_vel
-    ramps at 10 000 env-steps. We had additionally wired:
-      * ``log_metrics`` — per-bootstrap-status TB metrics. With bootstrap
-        removed, these collapse to the standard ``Episode_Reward/*``
-        scalars; redundant.
-      * ``block_range_expand`` — pre-grasp curriculum. Already a no-op
-        (initial=final). Stock has no analog.
-    Both removed for stage 1 to match stock exactly.
+    Stock Franka has exactly two curriculum terms (action_rate, joint_vel
+    ramps at 10 000 env-steps). We add ``block_range_expand`` back with a
+    **warm-start-adapted** schedule (NOT the original cold-start schedule):
+
+    * Warm-up: ±3 cm × ±3 cm for the first 5 000 env-steps (~150 PPO iters
+      at 2048 envs × 16 steps).
+    * Expand: linearly to the live full width (±7 cm × ±12 cm in
+      reset_block_position) over the next 30 000 env-steps (~900 iters).
+    * After ~35 000 env-steps the schedule is at its final width and the
+      curriculum is effectively a no-op.
+
+    Why: with the warm-started actor sitting in the imitation basin and a
+    freshly-initialized critic, exposing the policy to full block-xy
+    variance from iter 0 multiplies advantage-estimate variance and pushes
+    the actor out of the basin before the critic can catch up. A short
+    narrow-start period gives the critic a low-variance return distribution
+    to fit against; once it has caught up, the curriculum expands to full
+    width and PPO trains on the real task.
+
+    Cost on Stage 1 (teacher) is negligible — the schedule completes in
+    ~35 PPO iters out of 1500. On Stage 2 (distill) it's slightly
+    beneficial: the student first imitates the teacher on easy block
+    positions, then on hard ones. EVAL1_PLAN §7.2 intervention #4.
     """
 
     action_rate = CurrTerm(
@@ -503,6 +530,26 @@ class CurriculumCfg:
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 10000},
     )
+    # Stage-3-adapted block-xy expand. Ramps the reset_block_position event's
+    # pose_range from ±3 cm to the live full width (±7×±12). Live full-width
+    # is set in EventCfg.reset_block_position above; if you tighten that,
+    # tighten ``final_xy`` here to match.
+    block_range_expand = CurrTerm(
+        func=mdp.expand_block_xy_range,
+        params={
+            "initial_xy": (0.03, 0.03),
+            "final_xy":   (0.07, 0.12),
+            "warmup_steps":  5_000,
+            "expand_steps":  30_000,
+            "event_term_name": "reset_block_position",
+        },
+    )
+    # Binary task-success rate (% of ended episodes where release_in_bowl
+    # fired at any step). Updated as a side effect of ``release_in_bowl``;
+    # read here at reset_idx. Emits ``Curriculum/log_success/success_rate``
+    # and ``.../n_episodes_ended`` to TB. See
+    # :func:`mdp.rewards.log_success_metrics` for the measurement details.
+    log_success = CurrTerm(func=mdp.log_success_metrics, params={})
 
 
 # ---------------------------------------------------------------------------

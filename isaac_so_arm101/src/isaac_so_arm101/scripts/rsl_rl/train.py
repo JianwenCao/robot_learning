@@ -31,6 +31,22 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+# Stage-3 warm-start critic carry-over (EVAL1_PLAN §7.2 intervention #5).
+# When set, AFTER the distill checkpoint warm-starts the actor via
+# runner.load(--load_run), we overlay the Stage-1 teacher's ``critic.*`` keys
+# onto the policy. Teacher critic shape (policy+critic → [256,128,64] → 1)
+# matches Stage-3 critic shape layer-for-layer, so this is a clean
+# nn.Module.load_state_dict(filtered, strict=False) call. Without it, the
+# fresh-random critic destroys the warm-started actor within ~50 iters via
+# noisy advantage estimates.
+parser.add_argument(
+    "--teacher_ckpt",
+    type=str,
+    default=None,
+    help="Optional path to Stage-1 teacher PPO checkpoint (model_*.pt). When set, "
+         "overlays the teacher's critic.* keys onto the policy after the distill "
+         "warm-start has loaded the actor. Stage-3 vision PPO only.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -200,6 +216,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+
+    # Stage-3 critic warm-start (EVAL1_PLAN §7.2 intervention #5).
+    # Apply AFTER runner.load so the distill warm-start of the actor has
+    # already been applied — we overlay only critic.* keys without touching
+    # the actor. Skips silently if --teacher_ckpt is not provided.
+    if args_cli.teacher_ckpt is not None:
+        if not os.path.isfile(args_cli.teacher_ckpt):
+            raise FileNotFoundError(f"--teacher_ckpt path does not exist: {args_cli.teacher_ckpt}")
+        print(f"[INFO]: Loading teacher critic from: {args_cli.teacher_ckpt}")
+        teacher_data = torch.load(args_cli.teacher_ckpt, map_location=agent_cfg.device, weights_only=False)
+        # RSL-RL saves under "model_state_dict"; fall back gracefully if the
+        # checkpoint was written by a different convention.
+        if isinstance(teacher_data, dict) and "model_state_dict" in teacher_data:
+            teacher_sd = teacher_data["model_state_dict"]
+        else:
+            teacher_sd = teacher_data
+        critic_sd = {k: v for k, v in teacher_sd.items() if k.startswith("critic.")}
+        if not critic_sd:
+            raise RuntimeError(
+                f"--teacher_ckpt {args_cli.teacher_ckpt} contained no 'critic.*' keys; "
+                f"got top-level keys {list(teacher_sd.keys())[:8]}..."
+            )
+        # strict=False because we only ship critic.* keys; everything else
+        # (actor.*, actor_cnn.*, std, normalizers) is expected to be "missing"
+        # from this filtered overlay and stay at its post-distill-warm-start value.
+        #
+        # Bypass the custom ``PickPlaceVisionActorCritic.load_state_dict``
+        # (and the ``rsl_rl.modules.ActorCritic.load_state_dict`` it wraps) by
+        # calling ``nn.Module.load_state_dict`` directly. Both wrappers return
+        # ``bool`` (distill-vs-resume signal for the runner) rather than the
+        # standard ``(missing, unexpected)`` tuple, which would break the
+        # unpack below. ``nn.Module.load_state_dict`` gives the proper tuple
+        # and just copies tensors into matching parameter slots — exactly what
+        # the critic overlay needs.
+        policy = runner.alg.policy
+        missing, unexpected = torch.nn.Module.load_state_dict(policy, critic_sd, strict=False)
+        if unexpected:
+            raise RuntimeError(f"Teacher critic load: unexpected keys {unexpected}")
+        print(
+            f"[INFO]: Teacher critic loaded — overlaid {len(critic_sd)} critic.* keys "
+            f"(Pinto asymmetric A-C handoff). Actor / CNN / std unchanged."
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

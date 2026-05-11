@@ -449,3 +449,93 @@ class PickPlaceVisionActorCritic(ActorCritic):
             self.critic_obs_normalizer.update(
                 self._gather_state(obs, self.obs_groups["critic"])
             )
+
+    # ----------------------------------------------------------------------
+    # Warm-start from distillation checkpoint (EVAL1_PLAN §7 stage 3)
+    # ----------------------------------------------------------------------
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Load a normal PPO checkpoint **or** warm-start from a distillation one.
+
+        Distillation (stage 2) saves a :class:`PickPlaceVisionStudentTeacher`,
+        which has keys ``student_cnn.*`` / ``student.*`` / ``std`` /
+        ``teacher.*``. The vision A-C (this class) expects ``actor_cnn.*`` /
+        ``actor.*`` / ``std`` / ``critic.*``. Architectures match exactly:
+
+        * ``student_cnn`` ↔ ``actor_cnn`` — same ``_SpatialSoftmaxCNN``, same
+          5-channel input, same 128-D output.
+        * ``student`` ↔ ``actor`` — same MLP[256,128,64], same 153-D input
+          (state + image features), same 6-D output.
+        * ``std`` is **DROPPED** — the distill checkpoint stores ``std=0.1``
+          (BC regression init), too narrow for PPO exploration. We keep the
+          cfg's ``init_noise_std`` (currently 0.5) instead. The binary gripper
+          action at σ=0.1 is effectively deterministic, killing exploration
+          on the open/close decision; restoring σ=0.5 lets PPO probe out of
+          the imitation basin. See EVAL1_PLAN §7.2 intervention #2.
+        * ``teacher.*`` is dropped: it's the *policy* head of the state-only
+          teacher, not a value function, so it cannot meaningfully initialize
+          ``critic`` (different objective). The critic warm-start happens
+          OUT-OF-BAND in train.py via the ``--teacher_ckpt`` flag (§7.2
+          intervention #5), which loads ``critic.*`` keys directly from the
+          stage-1 teacher PPO checkpoint.
+
+        Returns ``False`` for distill warm-starts so
+        :meth:`OnPolicyRunner.load` skips optimizer-state loading and resets
+        the iteration counter — this is a fresh PPO run that happens to
+        start from warm weights, *not* a resume.
+        """
+        is_distill = any(
+            k.startswith("student_cnn.") or k.startswith("student.")
+            for k in state_dict
+        )
+        if not is_distill:
+            return super().load_state_dict(state_dict, strict=strict)
+
+        remapped = {}
+        for k, v in state_dict.items():
+            if k.startswith("student_cnn."):
+                remapped["actor_cnn." + k[len("student_cnn.") :]] = v
+            elif k.startswith("student."):
+                remapped["actor." + k[len("student.") :]] = v
+            elif k == "std":
+                # DROP — keep cfg's init_noise_std (0.5). The distill ckpt's
+                # std=0.1 is too narrow for PPO exploration; loading it here
+                # kills the binary gripper's open/close exploration and
+                # leaves PPO unable to probe out of the imitation basin.
+                # EVAL1_PLAN §7.2 intervention #2.
+                continue
+            elif k.startswith("teacher."):
+                # See docstring — teacher is a policy, not a value head.
+                continue
+            else:
+                # Pass through anything else (e.g. optional normalizers).
+                remapped[k] = v
+
+        # strict=False because the fresh ``critic.*`` keys and the deliberately-
+        # skipped ``std`` are expected to be missing from the remapped dict.
+        # Any *other* missing/unexpected key is a real mismatch and should
+        # fail loud.
+        missing, unexpected = nn.Module.load_state_dict(self, remapped, strict=False)
+        expected_missing = {
+            k for k in missing
+            if k == "std"  # intentionally kept at cfg's init_noise_std
+            or k.startswith("critic.")
+            or k.startswith("critic_cnn.")
+            or k.startswith("critic_obs_normalizer.")
+        }
+        real_missing = [k for k in missing if k not in expected_missing]
+        if real_missing or unexpected:
+            raise RuntimeError(
+                "Distill warm-start: unexpected key mismatch.\n"
+                f"  unexpected: {list(unexpected)}\n"
+                f"  missing (non-critic, non-std): {real_missing}"
+            )
+        std_val = float(self.std.detach().mean().item()) if hasattr(self, "std") else None
+        print(
+            f"[PickPlaceVisionActorCritic] Warm-started from distillation checkpoint: "
+            f"loaded {len(remapped)} keys into actor_cnn/actor; "
+            f"std kept at cfg init_noise_std={std_val}; "
+            f"critic initializes fresh ({sum(1 for k in expected_missing if k != 'std')} keys — "
+            f"load teacher critic via --teacher_ckpt to avoid the random-init advantage shock)."
+        )
+        return False  # not a resume — runner should skip optimizer load

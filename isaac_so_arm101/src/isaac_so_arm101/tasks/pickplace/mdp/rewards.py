@@ -390,7 +390,21 @@ def release_in_bowl(
     # episode lift latch — must have grasped + lifted at some prior step
     was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
 
-    return (in_xy & low & opened & settled & was_lifted).float()
+    indicator = (in_xy & low & opened & settled & was_lifted)
+
+    # Per-episode task-success latch (side effect, read by
+    # :func:`log_success_metrics` CurriculumTerm). OR-update: latch flips
+    # to True the first frame the success gate holds and stays True for
+    # the rest of the episode. Cleared inside the CurriculumTerm at
+    # reset_idx (see comment in log_success_metrics). Same gate as the
+    # ``task_success`` predicate in :mod:`mdp.terminations`, so the TB
+    # success_rate matches what a binary task_success termination would
+    # measure if we used one.
+    if not hasattr(env, "_task_success_latch"):
+        env._task_success_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    env._task_success_latch |= indicator
+
+    return indicator.float()
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +441,70 @@ def block_dropped(
 # reward step and the runner's read, so reward-side-effect writes never reach
 # TensorBoard. Curriculum-return-dict writes do.
 # ---------------------------------------------------------------------------
+
+
+def log_success_metrics(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None,
+) -> dict[str, float]:
+    """Per-episode binary task-success rate.
+
+    Wired as a :class:`CurriculumTermCfg`. Returns
+    ``{"success_rate": float, "n_episodes_ended": int}`` which Isaac Lab's
+    :class:`CurriculumManager` logs as
+    ``Curriculum/log_success/success_rate`` (and ``.../n_episodes_ended``).
+
+    **What this measures.** For each env that just ended an episode this
+    step (``env_ids`` is the resetting-envs index list — the
+    CurriculumManager only invokes terms at ``_reset_idx`` time), reads
+    the per-env ``env._task_success_latch`` flag. The latch is
+    True iff the :func:`release_in_bowl` indicator (in_xy ∧ low ∧
+    gripper_open ∧ settled ∧ was_lifted) fired at any step of that
+    episode — i.e. iff the policy actually placed the block in the bowl
+    and released. This is exactly the gate used by
+    :func:`mdp.terminations.task_success`, so the TB scalar matches the
+    binary-success rate a paper / report would quote.
+
+    Mean across the resetting envs = success rate for episodes that
+    ended this step. Across an iteration RSL-RL averages these
+    per-reset-step values for the TB log; with ~1024 envs and 250-step
+    episodes, ~4 envs reset per step on average so the moving estimate
+    smooths over ~100 episode outcomes per PPO iter.
+
+    **Latch maintenance.** Updated each step (idempotent OR-update) inside
+    :func:`release_in_bowl` as a side effect — the only reward term
+    that runs every step *and* knows the success indicator. Cleared
+    in-place by THIS function after reading, so successive episodes on
+    the same env start with a fresh latch. No separate ``mode="reset"``
+    event term is needed (curriculum.compute fires before reset events
+    in :meth:`ManagerBasedRLEnv._reset_idx`, so an event-time clear
+    would be redundant).
+
+    Returns an empty dict on the first call (before any reward step has
+    populated the latch) — Isaac Lab handles that gracefully.
+    """
+    latch = getattr(env, "_task_success_latch", None)
+    if latch is None:
+        return {}
+    if env_ids is None:
+        return {}
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return {}
+    elif len(env_ids) == 0:
+        return {}
+
+    outcomes = latch[env_ids].float()
+    success_rate = outcomes.mean().item()
+    n_ended = int(outcomes.numel())
+
+    # Clear latch for the ended envs so next episode starts fresh.
+    # Done here rather than in a reset event because curriculum.compute()
+    # runs BEFORE event_manager.apply(mode="reset") in _reset_idx — clearing
+    # at event time would be a no-op (we'd have already read+cleared).
+    latch[env_ids] = False
+
+    return {"success_rate": success_rate, "n_episodes_ended": float(n_ended)}
 
 
 def log_bootstrap_metrics(

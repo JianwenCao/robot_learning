@@ -125,7 +125,17 @@ class PickPlaceBowlPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # KL clamp, σ should now decay monotonically. We trade a bit of
         # exploration for stability — acceptable since the policy was
         # already roughly converged at iter 2400 (σ=2.15, reward ~38).
-        entropy_coef=0.003,
+        # ----------------------------------------------------------------
+        # 2026-05-11: bumped 0.003 → 0.006 for the stage-3 vision-PPO
+        # warm-start from the distill checkpoint (EVAL1_PLAN §7). The
+        # warm-started actor has a low-noise σ inherited from the
+        # distillation init (init_noise_std=0.1) and a peaky output
+        # distribution; without extra entropy pressure for the first
+        # ~500 iters it tends to collapse onto whatever sub-optimal mode
+        # the student imitator settled into instead of re-exploring under
+        # the true task reward. Plan says revert to 0.003 once stage-3
+        # PPO has expanded the policy beyond the imitation basin.
+        entropy_coef=0.006,
         # Bumped 5 → 8 to match ManiSkill3 PickCube; their convergence in
         # 25–40 M env-steps is partly attributable to taking more SGD
         # passes per rollout batch, and our per-iter sample count is
@@ -144,14 +154,16 @@ class PickPlaceBowlPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_mini_batches=16,
         learning_rate=1.0e-4,
         schedule="adaptive",
-        # Lowered 0.98 → 0.9 to match ManiSkill3 PickCube. Effective
-        # horizon ≈ 1/(1−γ) = 10 steps at γ=0.9 vs 50 steps at γ=0.98;
-        # the grasp event lives ~10–20 steps into the rollout from the
-        # reach phase, so a tighter discount actually sharpens credit
-        # assignment on the grasp transition rather than diluting it.
-        # Short-horizon manipulation tasks consistently benefit from
-        # γ ∈ [0.8, 0.95] in the literature; we sit at the upper edge.
-        gamma=0.9,
+        # Reverted 0.9 → 0.98 to match the Stage-1 teacher (teacher_ppo_cfg.py)
+        # and the reward shape. ManiSkill3's γ=0.9 justification (their PickCube
+        # reward is near-sparse) does NOT apply to us: our `release_in_bowl=30`
+        # is a long-horizon latch that pays every post-release step, and γ=0.9
+        # chops ~80% of that tail's value. More critically, the teacher's
+        # policy is a fixed point of a long-horizon (γ=0.98) Bellman equation —
+        # if Stage 3 PPO uses γ=0.9, the warm-started actor is being optimized
+        # against a different objective than the one it was distilled from.
+        # EVAL1_PLAN §7.2 intervention #3.
+        gamma=0.98,
         lam=0.95,
         # ``desired_kl`` halved from the lift-task default 0.01 → 0.005 after
         # observing action-noise σ blow up to 2.12 by iter 2100 of the
