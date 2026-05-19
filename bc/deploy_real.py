@@ -81,11 +81,21 @@ INTRINSICS_YAML = PROJECT_ROOT / "camera_intrinsics.yaml"
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 EE_LINK_NAME = "gripper_frame_link"     # URDF tip frame; see so_arm101.urdf
 
-# Defaults from SO_ARM101_CFG.init_state.joint_pos (radians).
+# URDF/init defaults from SO_ARM101_CFG.init_state.joint_pos (radians).
+# Used for ``joint_pos_rel = q - JOINT_DEFAULTS_RAD`` so the obs matches the
+# sim's ``mdp.joint_pos_rel`` (which subtracts the articulation's
+# default_joint_pos). Gripper element is 0.0 to mirror that subtraction base.
 JOINT_DEFAULTS_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, 0.0], dtype=np.float32)
 ARM_ACTION_SCALE = 0.5                  # JointPositionActionCfg.scale
 GRIPPER_OPEN_RAD = 0.5
 GRIPPER_CLOSE_RAD = 0.0
+# Pose to physically slew to at startup. Matches what the sim shows on
+# reset: arm joints at JOINT_DEFAULTS_RAD, gripper OPEN (0.5 rad). The
+# sim's BinaryJointPositionActionCfg + last_action=0 lands at gripper=0.5
+# after the first env tick, so joint_pos_rel[gripper] = 0.5 in the first
+# obs the policy ever saw at train time. Homing to gripper=0.0 (URDF init
+# value) would feed the policy joint_pos_rel[gripper]=0 at t=0 — OOD.
+HOME_POSE_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, GRIPPER_OPEN_RAD], dtype=np.float32)
 
 IMG_H, IMG_W = 72, 128
 FPS = 50                                # matches sim (decimation=2, sim.dt=0.01 → 50 Hz)
@@ -251,20 +261,22 @@ def _slew_limit(target_rad: np.ndarray, current_rad: np.ndarray,
 
 
 def _home_arm(driver: "LerobotSO101Driver", settle_s: float = 0.3) -> None:
-    """Rate-limited move from wherever the arm is to ``JOINT_DEFAULTS_RAD``.
+    """Rate-limited move from wherever the arm is to ``HOME_POSE_RAD``.
 
-    Ensures the first policy obs matches the sim reset state (joint_pos_rel
-    ≈ 0, joint_vel_rel ≈ 0, last_action = 0). Caps each step at
-    ``MAX_RAD_PER_STEP`` so the homing trajectory is itself sim-rate.
+    Targets the *effective* sim reset pose (arm at URDF zero, gripper OPEN
+    at 0.5 rad) so the first policy obs matches what training saw: arm
+    ``joint_pos_rel`` ≈ 0, gripper ``joint_pos_rel`` ≈ 0.5, ``joint_vel_rel``
+    ≈ 0, ``last_action`` = 0. Caps each step at ``MAX_RAD_PER_STEP`` so the
+    homing trajectory is itself sim-rate.
     """
     dt = 1.0 / FPS
     next_tick = time.time()
     while True:
         q_rad = _deg_to_rad(driver.read_proprio_deg())
-        err = JOINT_DEFAULTS_RAD - q_rad
+        err = HOME_POSE_RAD - q_rad
         if np.max(np.abs(err)) < MAX_RAD_PER_STEP * 0.5:
             break
-        step_target = _slew_limit(JOINT_DEFAULTS_RAD, q_rad)
+        step_target = _slew_limit(HOME_POSE_RAD, q_rad)
         driver.send_joint_targets_deg(_rad_to_deg(step_target))
         next_tick += dt
         sleep_for = next_tick - time.time()
