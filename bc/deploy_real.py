@@ -100,7 +100,7 @@ MAX_RAD_PER_STEP = SIM_VEL_LIMIT / FPS
 # to attenuate per-step encoder quantization noise.
 QDOT_EWMA_ALPHA = 0.3
 
-SERVO_PORT  = "/dev/tty.usbmodem5B140319261"
+SERVO_PORT  = "/dev/tty.usbmodem5B140335911"
 CAM_INDEX   = 0
 CAM_WIDTH   = 640
 CAM_HEIGHT  = 480
