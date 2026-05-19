@@ -32,8 +32,12 @@ logs/
 outputs/
 wandb/
 runs/
+run_logs/
 checkpoints/
 *.ckpt
+
+# Demonstration data (large, out-of-band)
+demonstrations/
 
 # Misc large/binary
 *.mp4

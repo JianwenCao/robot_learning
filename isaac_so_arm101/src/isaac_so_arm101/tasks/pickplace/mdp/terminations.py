@@ -35,6 +35,15 @@ def task_success(
     — if the success criterion drifts apart from the release reward, the
     policy may learn to dance around success without ever triggering it.
 
+    Now also ANDs in the two per-episode latches maintained by the reward
+    module so this predicate matches the tightened ``release_in_bowl``:
+
+    * ``env._was_grasped`` — lifted ≥ 0.07 m at some prior step (closes
+      drag-on-table exploit).
+    * ``env._was_over_bowl_above_rim`` — cube above rim height AND over
+      bowl xy at some prior step (closes lateral-slide-into-bowl exploit;
+      forces over-the-top descent for real-rig deploy safety).
+
     Note: ``SceneEntityCfg`` defaults aren't auto-resolved when used as
     function defaults (only when explicitly passed via ``params``), so we
     look up the gripper joint index dynamically each call.
@@ -56,7 +65,14 @@ def task_success(
 
     settled = torch.norm(obj.data.root_lin_vel_w, dim=1) < block_speed_threshold
 
-    return in_xy & low & opened & settled
+    was_lifted = getattr(env, "_was_grasped", None)
+    if was_lifted is None:
+        was_lifted = torch.zeros_like(in_xy, dtype=torch.bool)
+    was_over_high = getattr(env, "_was_over_bowl_above_rim", None)
+    if was_over_high is None:
+        was_over_high = torch.zeros_like(in_xy, dtype=torch.bool)
+
+    return in_xy & low & opened & settled & was_lifted & was_over_high
 
 
 def block_off_table(

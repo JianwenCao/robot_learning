@@ -168,9 +168,15 @@ def decay_p_grasped(
         frac = (step - warmup_steps) / max(decay_steps, 1)
         p = initial + (final - initial) * frac
 
-    term_cfg = env.event_manager.get_term_cfg(event_term_name)
-    term_cfg.params["p_grasped"] = float(p)
-    env.event_manager.set_term_cfg(event_term_name, term_cfg)
+    # Tolerate missing event term — happens in PLAY mode where bootstrap_grasped
+    # is intentionally not registered (we want the pure task at eval). Silently
+    # no-op the cfg write; the returned scalar still appears in TB.
+    try:
+        term_cfg = env.event_manager.get_term_cfg(event_term_name)
+        term_cfg.params["p_grasped"] = float(p)
+        env.event_manager.set_term_cfg(event_term_name, term_cfg)
+    except (ValueError, KeyError):
+        pass
     return {"p_grasped": float(p)}
 
 
@@ -244,6 +250,28 @@ def reset_was_grasped(
     (first reset, before any reward term has touched it).
     """
     flag = getattr(env, "_was_grasped", None)
+    if flag is None:
+        return
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+    elif len(env_ids) == 0:
+        return
+    flag[env_ids] = False
+
+
+def reset_was_over_bowl_above_rim(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+) -> None:
+    """Clear the per-episode over-bowl-above-rim latch maintained by
+    :func:`mdp.rewards._episode_over_bowl_high_mask`.
+
+    Same pattern as :func:`reset_was_grasped` — wired as a reset event so
+    the latch is fresh per episode. Idempotent: no-op if the latch buffer
+    hasn't been allocated yet.
+    """
+    flag = getattr(env, "_was_over_bowl_above_rim", None)
     if flag is None:
         return
     if isinstance(env_ids, torch.Tensor):

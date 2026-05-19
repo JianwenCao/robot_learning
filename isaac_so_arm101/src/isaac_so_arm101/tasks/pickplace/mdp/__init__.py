@@ -26,6 +26,7 @@ from .events import (  # noqa: F401
     randomize_camera_uniform,
     randomize_wrist_image_tint,
     reset_was_grasped,
+    reset_was_over_bowl_above_rim,
 )
 from .observations import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403

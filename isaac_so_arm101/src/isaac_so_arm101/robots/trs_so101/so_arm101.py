@@ -15,7 +15,10 @@ SO_ARM101_CFG = ArticulationCfg(
         fix_base=True,
         replace_cylinders_with_capsules=True,
         asset_path=f"{TEMPLATE_ASSETS_DATA_DIR}/urdf/so_arm101.urdf",
-        activate_contact_sensors=False, # set as false while waiting for capsule implementation
+        activate_contact_sensors=True,  # v7 (2026-05-15): enabled for ContactSensor-based is_grasping reward.
+                                        # Was False originally pending capsule conversion; replace_cylinders_with_capsules=True
+                                        # is already set above, and ContactSensor in Isaac Lab works on mesh colliders too
+                                        # (uses PhysX contact reports). If contact data is unreliable, revisit.
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=5.0,

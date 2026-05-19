@@ -82,3 +82,28 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# EVAL1_PLAN §9 alternative path — pretrained ResNet-18 backbone, cold-start
+# PPO (no teacher, no distillation). Separate env cfg (only the curriculum
+# schedule differs from the §7 path) and separate agent cfg (new actor-critic
+# class). Distinct task ID so log dirs don't collide with the §7 production
+# pipeline.
+gym.register(
+    id="Isaac-SO-ARM101-PickPlace-Bowl-Pretrained-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pretrained_env_cfg:SoArm101PickPlaceBowlPretrainedEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.pretrained_ppo_cfg:PickPlaceBowlPretrainedPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-PickPlace-Bowl-Pretrained-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pretrained_env_cfg:SoArm101PickPlaceBowlPretrainedEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.pretrained_ppo_cfg:PickPlaceBowlPretrainedPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)

@@ -10,7 +10,7 @@ scene prim — it is a 2-D goal sampled per episode by the command manager
 (``bowl_pose``). The block is a 2 cm cube whose initial xy is randomized
 within the workspace. Success is judged geometrically.
 
-See ``EVAL1_PLAN.md`` (project root) for the design rationale; this file
+See ``docs/EVAL1_PLAN.md`` (project root) for the design rationale; this file
 is the concrete realization of §3 of that document. The state-only Day-3
 milestone is done; this file is now the Day-4 vision configuration —
 ``wrist_cam`` is parented to ``gripper_link`` and ``wrist_rgb`` is the
@@ -39,6 +39,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors.camera.tiled_camera_cfg import TiledCameraCfg
+from isaaclab.sensors.contact_sensor.contact_sensor_cfg import ContactSensorCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import FrameTransformerCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg
 from isaaclab.utils import configclass
@@ -83,6 +84,32 @@ class PickPlaceBowlSceneCfg(InteractiveSceneCfg):
     # Wrist camera: TiledCamera (batched render) parented to gripper_link.
     # Intrinsics are baked from camera_intrinsics.yaml in joint_pos_env_cfg.
     wrist_cam: TiledCameraCfg = MISSING
+
+    # v7 (2026-05-15): contact sensors on both gripper jaws, filtered for the
+    # cube object. PhysX reports contact forces between the listed prims and
+    # the filter set. ``is_grasping_contact`` reward function reads
+    # ``env.scene[<name>].data.net_forces_w`` to derive a true physical
+    # contact signal (replaces v3–v6's kinematic ``closed_grasp_signal``
+    # proxy). Sim-only — the deployed policy never sees this data; it's
+    # used only in the reward function during training. Both jaws are
+    # monitored separately because a real grasp involves contact on BOTH
+    # the fixed jaw (``gripper_link``) and the moving jaw
+    # (``moving_jaw_so101_v1_link``); requiring contact on both filters out
+    # one-sided pushes that aren't true grasps.
+    gripper_contact_fixed = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/gripper_link",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+    )
+    gripper_contact_moving = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/moving_jaw_so101_v1_link",
+        update_period=0.0,
+        history_length=1,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+    )
 
     # Flat gray cuboid table matching eval color (#B8ADA9 → linear sRGB
     # ≈ (0.722, 0.678, 0.663)). Top of the table sits at z=0 so block
@@ -332,6 +359,13 @@ class EventCfg:
     # prior step in the same episode → drag-on-table exploit blocked).
     reset_lift_latch = EventTerm(func=mdp.reset_was_grasped, mode="reset")
 
+    # Clears the per-episode ``env._was_over_bowl_above_rim`` latch — the
+    # "approached from above the rim" precondition that
+    # ``place_in_bowl`` / ``release_in_bowl`` / ``task_success`` all gate
+    # on. Without this reset the latch sticks True after the first
+    # over-bowl-high pass, defeating the gate on subsequent episodes.
+    reset_rim_latch = EventTerm(func=mdp.reset_was_over_bowl_above_rim, mode="reset")
+
     reset_block_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
@@ -398,9 +432,15 @@ class RewardsCfg:
     # 0.04) matches the smaller cube and shorter lift travel.
     reaching_object = RewTerm(func=mdp.reach_block, params={"std": 0.05}, weight=1.0)
 
+    # ``minimal_height`` bumped 0.025 → 0.07 to match
+    # ``release_in_bowl``'s lift latch (which is gated on the real bowl's
+    # 5 cm rim — see release_in_bowl docstring). Aligning lift-bonus and
+    # release-latch thresholds means the policy gets continuous lift
+    # feedback exactly when it's clearing rim height, which is the height
+    # band the deployed trajectory needs anyway.
     lifting_object = RewTerm(
         func=mdp.grasp_event,
-        params={"minimal_height": 0.025},
+        params={"minimal_height": 0.07},
         weight=15.0,
     )
 
