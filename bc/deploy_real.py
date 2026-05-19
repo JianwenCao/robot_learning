@@ -35,9 +35,27 @@ Action pipeline (must match training):
 * Targets converted to degrees before sending — LeRobot's SO101 follower API
   takes Feetech servo positions in degrees.
 
-Control rate is 30 Hz to match the sim (episode_length_s=5.0 with 150 sim
-steps ≈ 30 Hz). The policy is queried *every* step (no chunking) because PPO
-is reactive and the image pipeline runs in <33 ms on CPU.
+Control rate is 50 Hz to match the sim (``decimation=2``, ``sim.dt=0.01`` →
+50 Hz, 250 steps over the 5 s episode). The policy is queried *every* step
+(no chunking) because PPO is reactive and the image pipeline runs in <20 ms
+on CPU.
+
+Sim-to-real execution gap
+-------------------------
+The sim arm uses ``ImplicitActuatorCfg(velocity_limit_sim=1.5 rad/s)`` plus a
+stiff PD, so each commanded position step is rate-limited and the joints
+physically cannot slew faster than 1.5 rad/s. The Feetech bus has no such
+cap by default — ``SO101Follower.send_action`` writes ``Goal_Position`` raw
+and the servo rushes to the new target at near-max speed. To make execution
+match what the policy was trained against:
+
+* host-side slew clamp ``MAX_RAD_PER_STEP = 1.5 / FPS`` on the commanded
+  target (mirrors sim's ``velocity_limit_sim``);
+* homing trajectory at startup so the first policy obs matches the sim
+  reset state (``JOINT_DEFAULTS_RAD``, ``last_action = 0``);
+* EWMA on the finite-difference joint velocity, since the sim's
+  ``joint_vel_rel`` is a clean PhysX read and the servo FD is encoder-quantized
+  + bus-jittered noise that lives outside the policy's training distribution.
 """
 from __future__ import annotations
 
@@ -70,8 +88,16 @@ GRIPPER_OPEN_RAD = 0.5
 GRIPPER_CLOSE_RAD = 0.0
 
 IMG_H, IMG_W = 72, 128
-FPS = 30
+FPS = 50                                # matches sim (decimation=2, sim.dt=0.01 → 50 Hz)
 MAX_STEPS = 5 * FPS                     # 5 s episode in sim
+# Per-step joint-target slew cap. Mirrors so_arm101.py ``velocity_limit_sim=1.5``
+# rad/s. Applied as ``|target - q| <= MAX_RAD_PER_STEP`` before the servo write.
+SIM_VEL_LIMIT = 1.5
+MAX_RAD_PER_STEP = SIM_VEL_LIMIT / FPS
+# EWMA factor for the finite-difference joint velocity. α=0.3 ≈ 5-sample
+# trailing average at 50 Hz — fast enough to track real motion, slow enough
+# to attenuate per-step encoder quantization noise.
+QDOT_EWMA_ALPHA = 0.3
 
 SERVO_PORT  = "/dev/tty.usbmodem5B140319261"
 CAM_INDEX   = 0
@@ -212,6 +238,43 @@ def _decode_action(action6: np.ndarray) -> np.ndarray:
     return np.concatenate([arm_target, [grip_target]]).astype(np.float32)
 
 
+def _slew_limit(target_rad: np.ndarray, current_rad: np.ndarray,
+                max_step: float = MAX_RAD_PER_STEP) -> np.ndarray:
+    """Clamp |target - current| ≤ max_step per joint.
+
+    Mirrors sim's actuator velocity cap (``velocity_limit_sim=1.5`` rad/s
+    over a 1/FPS dt) so a single servo write can't outrun what the policy
+    was trained to expect from one control tick.
+    """
+    delta = np.clip(target_rad - current_rad, -max_step, max_step)
+    return (current_rad + delta).astype(np.float32)
+
+
+def _home_arm(driver: "LerobotSO101Driver", settle_s: float = 0.3) -> None:
+    """Rate-limited move from wherever the arm is to ``JOINT_DEFAULTS_RAD``.
+
+    Ensures the first policy obs matches the sim reset state (joint_pos_rel
+    ≈ 0, joint_vel_rel ≈ 0, last_action = 0). Caps each step at
+    ``MAX_RAD_PER_STEP`` so the homing trajectory is itself sim-rate.
+    """
+    dt = 1.0 / FPS
+    next_tick = time.time()
+    while True:
+        q_rad = _deg_to_rad(driver.read_proprio_deg())
+        err = JOINT_DEFAULTS_RAD - q_rad
+        if np.max(np.abs(err)) < MAX_RAD_PER_STEP * 0.5:
+            break
+        step_target = _slew_limit(JOINT_DEFAULTS_RAD, q_rad)
+        driver.send_joint_targets_deg(_rad_to_deg(step_target))
+        next_tick += dt
+        sleep_for = next_tick - time.time()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:
+            next_tick = time.time()
+    time.sleep(settle_s)  # let the servos settle before reading proprio for the policy
+
+
 def _build_image(rgb_hwc, K, dist, hsv_low, hsv_high) -> np.ndarray:
     import cv2
     if K is not None and dist is not None:
@@ -264,19 +327,24 @@ def run(bowl_xy: np.ndarray, args) -> None:
     driver = LerobotSO101Driver()
     driver.connect()
     try:
+        print("[ppo] homing arm to URDF defaults …")
+        _home_arm(driver)
         q0_deg = driver.read_proprio_deg()
         q_rad_prev = _deg_to_rad(q0_deg)
+        qdot_filt = np.zeros(6, dtype=np.float32)
         last_action = np.zeros(6, dtype=np.float32)
         dt = 1.0 / FPS
         next_tick = time.time()
 
         for t in range(MAX_STEPS):
             q_rad = _deg_to_rad(driver.read_proprio_deg())
-            qdot_rad = (q_rad - q_rad_prev) / dt
+            qdot_raw = (q_rad - q_rad_prev) / dt
+            qdot_filt = (QDOT_EWMA_ALPHA * qdot_raw
+                         + (1.0 - QDOT_EWMA_ALPHA) * qdot_filt).astype(np.float32)
             q_rad_prev = q_rad
 
             ee_xy = fk.ee_xyz(q_rad)[:2]
-            state = _build_state(q_rad, qdot_rad, bowl_xy[:2], ee_xy, last_action)
+            state = _build_state(q_rad, qdot_filt, bowl_xy[:2], ee_xy, last_action)
 
             rgb = driver.capture_wrist_rgb_hwc()
             image = _build_image(
@@ -292,6 +360,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
             last_action = action.astype(np.float32)
 
             target_rad = _decode_action(action)
+            target_rad = _slew_limit(target_rad, q_rad)
             driver.send_joint_targets_deg(_rad_to_deg(target_rad))
 
             if (t + 1) % 30 == 0:
