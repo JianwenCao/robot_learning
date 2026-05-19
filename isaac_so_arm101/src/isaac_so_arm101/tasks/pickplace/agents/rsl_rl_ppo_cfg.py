@@ -76,7 +76,7 @@ class PickPlaceBowlPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "pickplace_bowl"
     empirical_normalization = False
 
-    # Asymmetric A-C wiring. ``wrist_image`` (5-channel RGB+depth+mask)
+    # Asymmetric A-C wiring. ``wrist_image`` (4-channel RGB+mask in v4)
     # goes to the actor only — the critic already has ground-truth
     # ``block_position`` etc. via the privileged ``critic`` group, so
     # feeding it the image is redundant compute. Removing it cuts ~1 CNN

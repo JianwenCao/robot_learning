@@ -28,13 +28,21 @@ branches in its ``__init__``). With ``obs_groups`` set to state-only
 groups, both ``actor_cnn`` and ``critic_cnn`` are ``None`` and the class
 behaves as a stock symmetric MLP actor-critic.
 
-The wrist camera is still rendered every step in the underlying env
-(it's wired into the scene by ``joint_pos_env_cfg.py``), but the obs
-group ``wrist_image`` is *not* in ``obs_groups`` here, so the rendered
-tensor is computed-and-discarded each step. ~2× wall-clock overhead vs
-a no-camera teacher env, but no new env cfg needed — keeps the change
-minimal and ensures the teacher's training distribution (DR, scene,
-rewards) matches the env the student will eventually run in.
+Two env cfgs are registered against this PPO cfg:
+
+* ``Isaac-SO-ARM101-PickPlace-Bowl-Teacher-v0`` uses the shared
+  ``SoArm101PickPlaceBowlEnvCfg`` — wrist camera is rendered every
+  step even though the obs group ``wrist_image`` isn't in
+  ``obs_groups`` here (computed-and-discarded). Requires
+  ``--enable_cameras``. Matches the student's training distribution
+  exactly.
+* ``Isaac-SO-ARM101-PickPlace-Bowl-Teacher-Fast-v0`` uses
+  ``SoArm101PickPlaceBowlTeacherFastEnvCfg`` — wrist camera and
+  ``wrist_image`` obs group both nulled. Skips the RTX render path
+  entirely (~2-3× faster wall-clock per iter, no
+  ``--enable_cameras`` flag required). The teacher's MDP is
+  identical to the student's because state-side obs / rewards / DR
+  are unchanged; only the unused image pipeline is removed.
 """
 
 import rsl_rl.runners.on_policy_runner as _on_policy_runner
@@ -82,15 +90,13 @@ class PickPlaceBowlTeacherPPORunnerCfg(RslRlOnPolicyRunnerCfg):
       stack when the image group isn't in ``obs_groups``.
     """
 
-    # Match stock Isaac Lab Franka Lift PPO config (rsl_rl_ppo_cfg.py at
-    # ``isaaclab_tasks/manager_based/manipulation/lift/config/franka/agents``).
-    # That config converges this same MDP class (state-based PPO on
-    # binary-gripper pick-and-place) reliably in ~1500 iters at 4096
-    # envs. We had drifted away from it across runs 11-15 with
-    # task-specific tweaks (γ=0.9 from ManiSkill, more mini-batches for
-    # GPU saturation, smaller init noise) — every drift compounded the
-    # divergence. This is a verbatim revert.
-    num_steps_per_env = 24
+    # Bumped 24 → 32 to grow the per-iter batch (more on-policy samples
+    # per learning update) at no wall-clock cost — collection time is
+    # PhysX/render-bound, so the +33 % rollout window adds < 1 s per
+    # iter while the learning step (8 % of iter time) sees a sharper
+    # gradient. Stock Franka Lift uses 24 with 4096 envs; we run 2048
+    # so the bump roughly equalizes total samples per iter.
+    num_steps_per_env = 32
     # Single-stage from-scratch training (no more two-stage). Stage 1's
     # "lift to z=0.10" objective baked the wrong wrist posture; stage 2
     # couldn't unlearn it cleanly. The new task design (latch-based

@@ -204,7 +204,10 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
             # ``colorize_semantic_segmentation=False`` keeps the seg
             # output as a single-channel int8 ID map (not RGB), which is
             # what the obs function reads.
-            data_types=["rgb", "distance_to_camera", "semantic_segmentation"],
+            # v4 dropped depth from ``mdp.wrist_image``; depth was still being
+            # rendered each step despite being unused. Removed from data_types
+            # to skip the depth pass (~15-20% render speedup).
+            data_types=["rgb", "semantic_segmentation"],
             colorize_semantic_segmentation=False,
             # ``semantic_filter="class:block"`` restricts the segmentation
             # output to only prims tagged ``("class", "block")`` — every
@@ -259,3 +262,43 @@ class SoArm101PickPlaceBowlEnvCfg_PLAY(SoArm101PickPlaceBowlEnvCfg):
         # fires (kept it on so the eval distribution matches training) but
         # the `corrupt=False` arg short-circuits the per-frame jitters.
         self.observations.wrist_image.wrist_image.params = {"corrupt": False}
+
+
+@configclass
+class SoArm101PickPlaceBowlTeacherFastEnvCfg(SoArm101PickPlaceBowlEnvCfg):
+    """Camera-free env cfg for the state-only teacher.
+
+    The default env cfg spawns a ``TiledCamera`` (RGB + semantic-seg) on
+    every env so the same scene works for the vision student. The teacher
+    never reads the wrist image — but PhysX + RTX still pay the full
+    rendering cost each step, dropping GPU util to ~30 % and capping
+    iter wall-clock at ~3.2 s.
+
+    This subclass nulls the camera spawn and the ``wrist_image`` obs
+    group entirely. Trade-off: the teacher's training env is no longer
+    *visually* identical to the student's. That's fine because the
+    teacher only consumes ``policy + critic`` ground-truth state — the
+    image-side DR is added back in Stage 2 distillation and Stage 3 PPO
+    where the student actually reads pixels.
+
+    No ``--enable_cameras`` needed at launch.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Null the wrist camera spawn. Manager skips entries set to None.
+        self.scene.wrist_cam = None
+        # Drop the wrist_image obs group too — its obs function would
+        # otherwise try to read sensors["wrist_cam"] each step.
+        self.observations.wrist_image = None
+
+
+@configclass
+class SoArm101PickPlaceBowlTeacherFastEnvCfg_PLAY(SoArm101PickPlaceBowlTeacherFastEnvCfg):
+    """Smaller variant of the camera-free teacher env, for visual eval."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False

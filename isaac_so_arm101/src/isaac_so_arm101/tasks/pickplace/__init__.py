@@ -57,6 +57,31 @@ gym.register(
     disable_env_checker=True,
 )
 
+# Camera-free teacher variant — skips RTX rendering entirely. Uses the
+# same teacher PPO cfg (state-only obs_groups) but a stripped env cfg
+# (no wrist_cam, no wrist_image obs). No --enable_cameras flag needed.
+# Faster wall-clock per iter than the standard Teacher-v0 because PhysX
+# isn't waiting on rendering of an obs the policy never reads.
+gym.register(
+    id="Isaac-SO-ARM101-PickPlace-Bowl-Teacher-Fast-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlTeacherFastEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:PickPlaceBowlTeacherPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-PickPlace-Bowl-Teacher-Fast-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlTeacherFastEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:PickPlaceBowlTeacherPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
 # Vision student — DAgger distillation from the state teacher (model_*.pt
 # in pickplace_bowl_teacher). Same env cfg as the teacher (we need both
 # state and image obs in the obs dict — the env already produces all of

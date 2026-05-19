@@ -296,14 +296,12 @@ class ObservationsCfg:
 
     @configclass
     class WristImageCfg(ObsGroup):
-        """5-channel wrist-camera image — ``(N, 5, H, W)``, **not** concatenated.
+        """4-channel wrist-camera image — ``(N, 4, H, W)``, **not** concatenated.
 
-        Channels: RGB (0–2) + clipped/normalized depth (3) + binary cube
-        mask (4). All in ``[0, 1]``. Sim and real-side deploy feed the
-        same shape into the same CNN; on real, channels 3 and 4 come from
-        Depth Anything 3 and HSV thresholding respectively. See
-        :func:`mdp.wrist_image` for per-step DR (brightness, noise, depth
-        scale jitter mimicking DA3 artifacts) and
+        Channels: RGB (0–2) + binary cube mask (3). All in ``[0, 1]``. Sim
+        and real-side deploy feed the same shape into the same CNN; on
+        real, channel 3 comes from HSV thresholding (``cv2.inRange``). See
+        :func:`mdp.wrist_image` for per-step DR (brightness, noise) and
         :func:`mdp.randomize_wrist_image_tint` for per-episode color tint
         (sampled at reset).
 

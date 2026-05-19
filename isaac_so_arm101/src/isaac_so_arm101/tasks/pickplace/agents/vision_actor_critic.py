@@ -41,11 +41,12 @@ from rsl_rl.networks import MLP, EmpiricalNormalization
 from torch.distributions import Normal
 
 # Default name of the image obs group. Kept in sync with
-# ``ObservationsCfg.WristImageCfg`` in :mod:`pickplace_env_cfg`. The image
-# is 5-channel ``(R, G, B, depth, mask)`` — see :func:`mdp.wrist_image`
-# for channel construction. The CNN's first conv takes ``in_channels``
-# from the input shape so the same class auto-adapts to 3- or 5-channel
-# inputs without code changes.
+# ``ObservationsCfg.WristImageCfg`` in :mod:`pickplace_env_cfg`. As of v4
+# the image is 4-channel ``(R, G, B, mask)`` — see :func:`mdp.wrist_image`
+# for channel construction. The CNN's first conv reads ``in_channels``
+# from the input shape so the same class adapts to 3-/4-/5-channel
+# inputs without code changes; if you load a 5-ch checkpoint into this
+# 4-ch model the conv1 keys won't match (expected — v4 retrains from scratch).
 DEFAULT_IMAGE_GROUP = "wrist_image"
 
 # Default pad amount for the DrQ-style random-shift augmentation. 4 pixels
@@ -180,6 +181,199 @@ class _SpatialSoftmaxCNN(nn.Module):
 # continues to work. The class name swap is intentional — anyone reading
 # ``self.actor_cnn = _SpatialSoftmaxCNN(...)`` sees the architecture.
 _ImpalaSmallCNN = _SpatialSoftmaxCNN
+
+
+class _ResNetSpatialSoftmaxCNN(nn.Module):
+    """Frozen ResNet-18 (ImageNet-pretrained) trunk + trainable 1×1 conv +
+    spatial-softmax head. Drop-in replacement for :class:`_SpatialSoftmaxCNN`
+    when sim2real robustness matters more than from-scratch fitting speed.
+
+    Shape contract: input ``(N, C, H, W)`` in ``[0, 1]``, output
+    ``(N, 2 * num_keypoints) = (N, out_dim)`` — identical to
+    :class:`_SpatialSoftmaxCNN` so the surrounding actor/critic MLPs are
+    unchanged.
+
+    Why this class exists (v4 design notes, see EVAL1_PLAN §7 fallback):
+
+    1. **ImageNet features are domain-general.** Real-world lighting and
+       color variation that the sim domain randomization can't perfectly
+       cover are inside ImageNet's pretraining distribution.
+    2. **Frozen trunk = stable PPO.** The most common visual-PPO failure
+       mode in this repo is encoder gradients fighting RL gradients. With
+       ``requires_grad=False`` on the trunk, only the 1×1 conv + spatial
+       softmax + downstream MLPs see PPO gradients.
+    3. **Spatial-softmax inductive bias kept.** ResNet features by
+       themselves are not localization-friendly; the 1×1 conv re-projects
+       to per-keypoint heatmaps and the soft-argmax extracts (x, y)
+       coords. Same Levine-2016 head as the from-scratch CNN.
+    4. **Channel inflation, not RGB-only.** v4 keeps the binary block mask
+       as channel 3. We inflate ResNet's ``conv1`` (3 → C input channels)
+       and init the mask-channel weights from the RGB-channel mean. This
+       avoids a separate mask CNN at the cost of a slight init mismatch
+       (binary input through a kernel trained on float RGB) — empirically
+       fine because the mask conv1 weights immediately adapt during the
+       brief distillation phase that comes before frozen-trunk PPO.
+
+    Note: when ``freeze=True`` we also force the trunk into ``.eval()``
+    mode so BatchNorm running stats don't drift under PPO's non-stationary
+    rollouts — see Wu & He, GroupNorm, ECCV 2018 for why BN under
+    distribution shift is a known landmine. (Frozen trunk side-steps the
+    issue without needing a BN→GN conversion.)
+    """
+
+    def __init__(
+        self,
+        in_shape: tuple[int, int, int],
+        out_dim: int = 128,
+        freeze: bool = True,
+        bc_v1_weights_path: str | None = None,
+    ):
+        super().__init__()
+        if out_dim % 2 != 0:
+            raise ValueError(f"out_dim={out_dim} must be even (2 coords per keypoint)")
+        num_keypoints = out_dim // 2
+        in_channels, in_h, in_w = in_shape
+
+        # Lazy import — torchvision is a heavy import and not all callers
+        # need it. The class is gated on a cfg flag so the existing
+        # from-scratch path doesn't pull torchvision in.
+        from torchvision import models as tvm
+
+        weights = tvm.ResNet18_Weights.IMAGENET1K_V1
+        backbone = tvm.resnet18(weights=weights)
+
+        # ---- conv1 inflation if in_channels != 3 ---------------------------
+        if in_channels != 3:
+            old_conv1 = backbone.conv1
+            new_conv1 = nn.Conv2d(
+                in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False,
+            )
+            with torch.no_grad():
+                # Copy first 3 channels (RGB) verbatim from ImageNet.
+                new_conv1.weight[:, :3] = old_conv1.weight
+                if in_channels > 3:
+                    # Init extra channels (e.g. mask) from RGB-mean — keeps
+                    # activation statistics roughly the same scale as the
+                    # ImageNet-trained channels would produce.
+                    rgb_mean = old_conv1.weight.mean(dim=1, keepdim=True)
+                    new_conv1.weight[:, 3:] = rgb_mean.expand(-1, in_channels - 3, -1, -1)
+            backbone.conv1 = new_conv1
+
+        # Truncate at layer3 — gives a richer spatial map than layer4
+        # (which is 3×4 at 72×128) without losing too much resolution.
+        self.trunk = nn.Sequential(
+            backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
+            backbone.layer1, backbone.layer2, backbone.layer3,
+        )
+
+        # Optionally overlay BC v1's encoder weights — torchvision's
+        # ResNet-18 children layout matches what bc/model.py saves under
+        # ``img_enc.backbone.*`` (also a ``nn.Sequential`` of the same
+        # children, minus avgpool/fc). Loaded with strict=False so missing
+        # keys (avgpool/fc) and extra keys (BC v1's ``proj``) are tolerated.
+        if bc_v1_weights_path is not None:
+            self._maybe_load_bc_v1(bc_v1_weights_path, expected_in_channels=in_channels)
+
+        # ---- ImageNet input normalization (for RGB channels only) ----------
+        # Channel 3+ (mask) is binary {0, 1}; we leave it untouched.
+        _imagenet_mean = torch.tensor([0.485, 0.456, 0.406, 0.0] + [0.0] * max(0, in_channels - 4))
+        _imagenet_std = torch.tensor([0.229, 0.224, 0.225, 1.0] + [1.0] * max(0, in_channels - 4))
+        self.register_buffer("_in_mean", _imagenet_mean[:in_channels].view(1, in_channels, 1, 1))
+        self.register_buffer("_in_std", _imagenet_std[:in_channels].view(1, in_channels, 1, 1))
+
+        # Freeze trunk (so PPO grads can't destabilize the encoder).
+        self.freeze = bool(freeze)
+        if self.freeze:
+            for p in self.trunk.parameters():
+                p.requires_grad = False
+            self.trunk.eval()
+
+        # ---- Probe spatial dims after trunk ---------------------------------
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, in_h, in_w)
+            feat = self.trunk(self._normalize_input(dummy))
+        trunk_c, feat_h, feat_w = int(feat.shape[1]), int(feat.shape[2]), int(feat.shape[3])
+
+        # 1×1 conv to num_keypoints channels — small, trainable.
+        self.head = nn.Conv2d(trunk_c, num_keypoints, kernel_size=1)
+
+        # Soft-argmax grid (same as _SpatialSoftmaxCNN).
+        ys, xs = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, feat_h),
+            torch.linspace(-1.0, 1.0, feat_w),
+            indexing="ij",
+        )
+        self.register_buffer("x_grid", xs.reshape(-1))
+        self.register_buffer("y_grid", ys.reshape(-1))
+
+        self.norm = nn.LayerNorm(out_dim)
+        self.num_keypoints = num_keypoints
+        self.out_dim = out_dim
+        self.feat_h = feat_h
+        self.feat_w = feat_w
+
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self._in_mean) / self._in_std
+
+    def _maybe_load_bc_v1(self, path: str, expected_in_channels: int) -> None:
+        """Best-effort overlay of BC v1's ResNet-18 weights onto this trunk."""
+        import os
+        if not os.path.isfile(path):
+            print(f"[ResNetEncoder] BC v1 ckpt not found at {path} — keeping ImageNet init.")
+            return
+        try:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"[ResNetEncoder] failed to load BC v1 ckpt: {e!r} — ImageNet init.")
+            return
+        sd = ck.get("model", ck)
+        # Extract keys matching ``img_enc.backbone.<idx>.*`` and rename to
+        # ``<idx>.*`` so they line up with our ``trunk`` Sequential indices.
+        backbone_prefix = "img_enc.backbone."
+        overlay = {}
+        for k, v in sd.items():
+            if k.startswith(backbone_prefix):
+                overlay[k[len(backbone_prefix):]] = v
+        if not overlay:
+            print("[ResNetEncoder] BC v1 ckpt has no img_enc.backbone.* keys — skipping.")
+            return
+        # If conv1 was inflated (channels > 3), the saved BC v1 conv1 is
+        # (64, 3, 7, 7) — strict load would fail. Pad it to current channels.
+        conv1_key = "0.weight"  # trunk[0] = conv1
+        if conv1_key in overlay:
+            w = overlay[conv1_key]
+            if w.shape[1] != expected_in_channels:
+                with torch.no_grad():
+                    new_w = torch.zeros(w.shape[0], expected_in_channels, w.shape[2], w.shape[3])
+                    new_w[:, :min(w.shape[1], expected_in_channels)] = w[:, :min(w.shape[1], expected_in_channels)]
+                    if expected_in_channels > w.shape[1]:
+                        new_w[:, w.shape[1]:] = w.mean(dim=1, keepdim=True)
+                    overlay[conv1_key] = new_w
+        missing, unexpected = self.trunk.load_state_dict(overlay, strict=False)
+        print(f"[ResNetEncoder] loaded BC v1 weights from {path}: "
+              f"{len(overlay)} keys overlaid, missing={len(missing)} unexpected={len(unexpected)}")
+
+    def train(self, mode: bool = True):  # noqa: D401
+        """Override so the frozen trunk stays in eval mode regardless."""
+        super().train(mode)
+        if self.freeze:
+            self.trunk.eval()
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._normalize_input(x)
+        if self.freeze:
+            with torch.no_grad():
+                feat = self.trunk(x)
+        else:
+            feat = self.trunk(x)
+        heat = self.head(feat)                                   # (N, K, H, W)
+        n, k, h, w = heat.shape
+        attn = torch.softmax(heat.view(n, k, h * w), dim=-1)
+        ex = (attn * self.x_grid).sum(dim=-1)                    # (N, K)
+        ey = (attn * self.y_grid).sum(dim=-1)
+        kp = torch.stack([ex, ey], dim=-1).reshape(n, 2 * k)
+        return self.norm(kp)
 
 
 class PickPlaceVisionActorCritic(ActorCritic):

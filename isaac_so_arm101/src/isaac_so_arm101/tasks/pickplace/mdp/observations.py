@@ -337,12 +337,88 @@ def _normalize_rgb(img: torch.Tensor) -> torch.Tensor:
     return img.permute(0, 3, 1, 2).contiguous()
 
 
+# ---------------------------------------------------------------------------
+# Color-space DR — value/saturation/hue jitter applied entirely in linear
+# RGB via known matrix decompositions. Cheaper than a true RGB↔HSV round-
+# trip and vectorizes cleanly over per-env hue angles, which matters for
+# the multi-cube tasks (Eval 2/3/Bonus B) where the policy must read color.
+# ---------------------------------------------------------------------------
+
+
+_SQRT3_INV = 1.0 / (3.0 ** 0.5)
+
+
+def apply_color_jitter(
+    rgb: torch.Tensor,
+    hue_shift_rad: torch.Tensor,
+    sat_scale: torch.Tensor,
+    val_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Apply per-env (hue, saturation, value) jitter to a batch of images.
+
+    All three tensors have shape ``(N,)`` — one value per environment.
+    The image tensor is ``(N, 3, H, W)`` in [0, 1]; the return shape is
+    the same, clamped to [0, 1].
+
+    Operations (in order):
+
+    * **Value**: per-channel multiply by ``val_scale`` — simulates global
+      exposure / dome-light intensity changes.
+    * **Saturation**: blend toward per-pixel gray ``mean(R,G,B)`` with
+      weight ``sat_scale``; ``sat_scale=1`` is identity, ``0`` is full
+      desaturation, ``>1`` boosts.
+    * **Hue**: rotate the RGB vector around the (1,1,1) luminance axis
+      by ``hue_shift_rad``. This is the standard photographers' hue
+      shift — it preserves luminance and produces a true cyclical
+      hue rotation (no need to detour through HSV).
+
+    Hue rotation matrix M(θ):
+
+        diag = cos(θ) + (1-cos(θ))/3
+        off1 = (1-cos(θ))/3 - sin(θ)/√3
+        off2 = (1-cos(θ))/3 + sin(θ)/√3
+        M = [[diag, off1, off2],
+             [off2, diag, off1],
+             [off1, off2, diag]]
+
+    See https://beesbuzz.biz/code/16-hsv-color-transforms for the
+    derivation; the off-diagonal asymmetry encodes a rotation around
+    the gray axis rather than an axis-aligned permutation.
+    """
+    N, C, H, W = rgb.shape
+    device = rgb.device
+
+    # Value scale.
+    rgb = rgb * val_scale.view(N, 1, 1, 1)
+
+    # Saturation scale (gray-blend).
+    gray = rgb.mean(dim=1, keepdim=True)  # (N, 1, H, W)
+    rgb = gray + sat_scale.view(N, 1, 1, 1) * (rgb - gray)
+
+    # Hue rotation — build per-env 3×3 matrices via bmm.
+    cos_h = torch.cos(hue_shift_rad)            # (N,)
+    sin_h = torch.sin(hue_shift_rad)
+    one_third = 1.0 / 3.0
+    diag = cos_h + (1.0 - cos_h) * one_third
+    off1 = (1.0 - cos_h) * one_third - sin_h * _SQRT3_INV
+    off2 = (1.0 - cos_h) * one_third + sin_h * _SQRT3_INV
+    M = torch.empty((N, 3, 3), device=device, dtype=rgb.dtype)
+    M[:, 0, 0] = diag; M[:, 0, 1] = off1; M[:, 0, 2] = off2
+    M[:, 1, 0] = off2; M[:, 1, 1] = diag; M[:, 1, 2] = off1
+    M[:, 2, 0] = off1; M[:, 2, 1] = off2; M[:, 2, 2] = diag
+
+    flat = rgb.view(N, C, H * W)
+    rotated = torch.bmm(M, flat).view(N, C, H, W)
+    return rotated.clamp_(0.0, 1.0)
+
+
 def wrist_rgb(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
 ) -> torch.Tensor:
-    """Legacy 3-channel RGB obs. Kept for backward compat — the live env
-    uses :func:`wrist_image` (5 channels: RGB + depth + mask).
+    """3-channel RGB obs. The pickplace env uses :func:`wrist_image`
+    (RGB + mask); :mod:`tasks.clutterpickplace` and downstream Evals
+    reuse this for the RGB-only variant.
     """
     cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
     return _normalize_rgb(cam.data.output["rgb"])
@@ -351,38 +427,26 @@ def wrist_rgb(
 def wrist_image(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
-    depth_clip_m: float = 0.5,
     corrupt: bool = True,
     rgb_brightness_jitter: float = 0.15,
     rgb_noise_std: float = 5.0 / 255.0,
-    depth_scale_jitter: float = 0.05,
-    depth_noise_std: float = 0.01,
 ) -> torch.Tensor:
-    """5-channel wrist-camera observation: ``[R, G, B, depth, mask]``.
+    """4-channel wrist-camera observation: ``[R, G, B, mask]``.
 
-    Returns ``(N, 5, H, W)`` floats in ``[0, 1]``. Sim and real-side deploy
-    feed the same shape into the same CNN; on the real side, channels 3
-    and 4 come from Depth Anything 3 and HSV-thresholding respectively
-    (see ``DEPLOY.md`` and ``EVAL1_PLAN.md`` §8).
+    Returns ``(N, 4, H, W)`` floats in ``[0, 1]``. RGB + mask is sufficient
+    for block localisation on this flat-table task.
 
     Channels:
 
     * 0–2 RGB — TiledCamera ``rgb`` output. Optional per-step brightness
       jitter (``±rgb_brightness_jitter``) and additive Gaussian noise
       (σ=``rgb_noise_std``) when ``corrupt=True``.
-    * 3 Depth — TiledCamera ``distance_to_camera`` clipped to
-      ``[0, depth_clip_m]`` then divided by ``depth_clip_m`` so the
-      channel sits in ``[0, 1]``. With ``corrupt=True`` we add a per-env
-      multiplicative scale jitter (``±depth_scale_jitter``) and additive
-      Gaussian noise (σ=``depth_noise_std``) to *mimic the artifacts a
-      monocular metric depth model (DA3) produces on the real side*.
-      Without this, the policy locks onto sim's perfect geometric depth
-      and fails to transfer (the very gap §8 of EVAL1_PLAN warns about).
-    * 4 Mask — binary cube mask from ``semantic_segmentation``. Any
+    * 3 Mask — binary cube mask from ``semantic_segmentation``. Any
       pixel labelled with the ``("class", "block")`` tag is 1.0; the
       rest is 0.0. On real, replicate via
-      ``cv2.inRange(hsv, low, high)`` calibrated once on a wood-tone
-      block on the gray table.
+      ``cv2.inRange(hsv, low, high)`` calibrated once on the actual
+      block colour against the gray table (#B8ADA9). For Eval 2/3,
+      threshold for the *target* colour per rollout.
 
     ``corrupt`` is gated by a param the play config can override
     (``params={"corrupt": False}``) so visual-DR doesn't pollute eval.
@@ -408,23 +472,6 @@ def wrist_image(
         rgb = (rgb * scale).clamp_(0.0, 1.0)
     if corrupt and rgb_noise_std > 0.0:
         rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
-
-    # ---- Depth -------------------------------------------------------------
-    # ``distance_to_camera`` is (N, H, W, 1) in metres. Inf/NaN at sky/far →
-    # treat as far-clip value, then clip to the workspace range.
-    depth = out["distance_to_camera"].float()
-    if depth.dim() == 4 and depth.shape[-1] == 1:
-        depth = depth.squeeze(-1)
-    depth = torch.nan_to_num(depth, nan=depth_clip_m, posinf=depth_clip_m, neginf=0.0)
-    depth = depth.clamp_(0.0, depth_clip_m) / depth_clip_m  # (N, H, W) in [0, 1]
-    if corrupt:
-        if depth_scale_jitter > 0.0:
-            n = depth.shape[0]
-            scale = 1.0 + (torch.rand(n, 1, 1, device=depth.device) * 2 - 1) * depth_scale_jitter
-            depth = (depth * scale).clamp_(0.0, 1.0)
-        if depth_noise_std > 0.0:
-            depth = (depth + torch.randn_like(depth) * depth_noise_std).clamp_(0.0, 1.0)
-    depth = depth.unsqueeze(1)  # (N, 1, H, W)
 
     # ---- Semantic mask -----------------------------------------------------
     # ``semantic_segmentation`` with ``colorize_semantic_segmentation=False``
@@ -462,4 +509,4 @@ def wrist_image(
         # this one frame; the next step will see the cached ID.
         mask = torch.zeros(seg.shape[0], 1, *seg.shape[1:], device=seg.device, dtype=torch.float32)
 
-    return torch.cat([rgb, depth, mask], dim=1)  # (N, 5, H, W)
+    return torch.cat([rgb, mask], dim=1)  # (N, 4, H, W)

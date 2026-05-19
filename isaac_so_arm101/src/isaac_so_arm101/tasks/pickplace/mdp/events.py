@@ -24,6 +24,7 @@ that pose. The ordering is determined by the order in
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -280,6 +281,56 @@ def reset_was_over_bowl_above_rim(
     elif len(env_ids) == 0:
         return
     flag[env_ids] = False
+
+
+def randomize_wrist_hsv_dr(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    hue_shift_deg_range: tuple[float, float] = (-20.0, 20.0),
+    sat_scale_range: tuple[float, float] = (0.65, 1.35),
+    val_scale_range: tuple[float, float] = (0.55, 1.45),
+) -> None:
+    """Per-episode (hue, saturation, value) sample for color-aware DR.
+
+    Stores ``env._wrist_hsv_dr`` of shape ``(num_envs, 3)``: each row is
+    ``(hue_shift_rad, sat_scale, val_scale)`` constant across the episode.
+    :func:`apply_color_jitter` in obs functions reads this buffer.
+
+    Defaults cover the realistic envelope for indoor lighting + USB
+    camera WB drift:
+
+    * **±20° hue** — typical webcam WB error under warm-vs-cool ambient
+      light. Wider than ±15° to extend the training distribution past the
+      "average" lab condition.
+    * **0.65–1.35 saturation** — handles "washed-out" exposures + the
+      tendency of cheap USB cams to oversaturate reds/blues.
+    * **0.55–1.45 value** — wide enough to cover dim → bright lab
+      conditions without an actual light-intensity DR (the dome light is
+      a global prim and not straightforward to per-env randomize).
+
+    Constant within an episode, re-sampled at reset — matching how true
+    lighting/WB conditions persist across a real-robot rollout.
+    """
+    if not hasattr(env, "_wrist_hsv_dr"):
+        # Default = identity transform (hue=0, sat=1, val=1).
+        env._wrist_hsv_dr = torch.tensor([0.0, 1.0, 1.0], device=env.device).repeat(env.num_envs, 1)
+
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+    elif len(env_ids) == 0:
+        return
+
+    n = len(env_ids) if not isinstance(env_ids, torch.Tensor) else env_ids.numel()
+    lo_h, hi_h = hue_shift_deg_range
+    lo_s, hi_s = sat_scale_range
+    lo_v, hi_v = val_scale_range
+    deg_to_rad = math.pi / 180.0
+    new = torch.empty((n, 3), device=env.device)
+    new[:, 0] = (lo_h + (hi_h - lo_h) * torch.rand(n, device=env.device)) * deg_to_rad
+    new[:, 1] = lo_s + (hi_s - lo_s) * torch.rand(n, device=env.device)
+    new[:, 2] = lo_v + (hi_v - lo_v) * torch.rand(n, device=env.device)
+    env._wrist_hsv_dr[env_ids] = new
 
 
 def randomize_wrist_image_tint(
