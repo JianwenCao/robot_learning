@@ -58,7 +58,12 @@ match what the policy was trained against:
   target (mirrors sim's ``velocity_limit_sim``);
 * EWMA on the finite-difference joint velocity, since the sim's
   ``joint_vel_rel`` is a clean PhysX read and the servo FD is encoder-quantized
-  + bus-jittered noise that lives outside the policy's training distribution.
+  + bus-jittered noise that lives outside the policy's training distribution;
+* pre-rollout slow-slew to the sim reset pose ``(0, 0, 0, 1.57, 0, gripper=open)``
+  using the same ``MAX_RAD_PER_STEP`` cap, so the t=0 obs has ``joint_pos_rel ≈ 0``
+  (matches the sim reset distribution; otherwise the slew cap silently clips the
+  policy's early actions while the arm catches up from whatever pose it sat in).
+  Homing has a timeout — on miss we warn and proceed rather than block the rollout.
 """
 from __future__ import annotations
 
@@ -92,6 +97,14 @@ JOINT_DEFAULTS_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, 0.0], dtype=np.float32)
 ARM_ACTION_SCALE = 0.5                  # JointPositionActionCfg.scale
 GRIPPER_OPEN_RAD = 0.5
 GRIPPER_CLOSE_RAD = 0.0
+
+# Pre-rollout homing target. Arm joints match the sim reset pose
+# (``SO_ARM101_CFG.init_state.joint_pos`` overridden in ``joint_pos_env_cfg.py``
+# with ``gripper=0.5``). Slew is rate-limited by ``MAX_RAD_PER_STEP``, same as
+# the policy loop, so no jerk relative to what the policy expects.
+HOME_POSE_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, GRIPPER_OPEN_RAD], dtype=np.float32)
+HOME_TOLERANCE_RAD = 0.03               # ~1.7° — wider than Feetech deadband
+HOMING_TIMEOUT_S = 6.0                  # 1.5 rad/s cap → ~1 s per rad; 6 s covers worst-case start
 
 IMG_H, IMG_W = 72, 128
 FPS = 50                                # matches sim (decimation=2, sim.dt=0.01 → 50 Hz)
@@ -287,6 +300,42 @@ def _slew_limit(target_rad: np.ndarray, current_rad: np.ndarray,
     return (current_rad + delta).astype(np.float32)
 
 
+def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
+                  tol: float = HOME_TOLERANCE_RAD,
+                  timeout_s: float = HOMING_TIMEOUT_S,
+                  fps: int = FPS,
+                  max_step: float = MAX_RAD_PER_STEP) -> np.ndarray:
+    """Drive the arm toward ``target_rad`` using the policy-loop slew cap.
+
+    Returns the last observed joint pose (rad). On timeout, prints a warning
+    and returns the residual pose so the caller can proceed — a sticky joint
+    or off-by-a-lot start pose shouldn't block the rollout.
+    """
+    dt = 1.0 / fps
+    t_start = time.time()
+    deadline = t_start + timeout_s
+    q = _deg_to_rad(driver.read_proprio_deg())
+    next_tick = time.time()
+    while time.time() < deadline:
+        residual = q - target_rad
+        if float(np.max(np.abs(residual))) < tol:
+            print(f"[ppo] homed in {time.time() - t_start:.2f}s "
+                  f"(residual={residual.round(3)} rad)")
+            return q
+        step = _slew_limit(target_rad, q, max_step=max_step)
+        driver.send_joint_targets_deg(_rad_to_deg(step))
+        next_tick += dt
+        sleep_for = next_tick - time.time()
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:
+            next_tick = time.time()
+        q = _deg_to_rad(driver.read_proprio_deg())
+    print(f"[ppo] WARNING: homing timed out after {timeout_s:.1f}s — "
+          f"residual={(q - target_rad).round(3)} rad. Starting rollout anyway.")
+    return q
+
+
 def _build_image(rgb_hwc, K, dist, hsv_low, hsv_high) -> np.ndarray:
     import cv2
     if K is not None and dist is not None:
@@ -340,10 +389,14 @@ def run(bowl_xy: np.ndarray, args) -> None:
     driver.connect()
     try:
         q0_deg = driver.read_proprio_deg()
-        q_rad_prev = _deg_to_rad(q0_deg)
+        print(f"[ppo] pre-home pose: q_deg={q0_deg.round(2)}")
+        if not args.no_confirm:
+            input("[ppo] arm will slow-slew to home (shoulder=0, wrist=90°, gripper=open). "
+                  "Clear the workspace. Press <enter> to home, ctrl-C to abort … ")
+        q_rad_prev = _slew_to_home(driver)
         ee_xyz_now = fk.ee_xyz(q_rad_prev)
-        print(f"[ppo] start pose: q_deg={q0_deg.round(2)}  ee_xyz={ee_xyz_now.round(3)}  "
-              f"(sim home ≈ (0.247, 0.000, 0.063))")
+        print(f"[ppo] homed: q_deg={_rad_to_deg(q_rad_prev).round(2)}  "
+              f"ee_xyz={ee_xyz_now.round(3)} (sim home ≈ (0.247, 0.000, 0.063))")
         if not args.no_confirm:
             input("[ppo] place block within x∈(0.13,0.28), y∈(-0.12,0.12). "
                   "Press <enter> to start rollout, ctrl-C to abort … ")
