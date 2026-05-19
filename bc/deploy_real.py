@@ -21,9 +21,14 @@ Observation pipeline (must match what training saw):
 * image (4, 72, 128) — RGB + binary block mask in ``[0, 1]``.
     * RGB from the wrist USB cam, undistorted with ``camera_intrinsics.yaml``,
       resized to 128×72.
-    * Mask via HSV ``cv2.inRange`` against the wood-tone block on the gray
-      table. Defaults are a reasonable starting bound; override with
-      ``--hsv-low`` / ``--hsv-high`` after one-shot calibration.
+    * Mask via HSV ``cv2.inRange``. For Task 1 the target cube can be any
+      color (red / orange / yellow / green / blue / purple), so the default
+      bound is a **saturation gate** (H ∈ [0, 180], S ≥ ~90) that fires on
+      any colored object and rejects the near-white table. The largest
+      connected component is then kept, mimicking the single-block semantic
+      mask the sim policy was trained with and dropping distractors like
+      cables or a tool handle in the corner. Override per-scene with
+      ``--hsv-low`` / ``--hsv-high`` if lighting shifts a lot.
 
 Action pipeline (must match training):
 
@@ -110,10 +115,12 @@ CAM_WIDTH   = 1280
 CAM_HEIGHT  = 720
 DEVICE      = "cpu"
 
-# HSV thresholds for the wood-tone block on a gray table. These get you in the
-# ballpark; calibrate once on a captured frame and pass --hsv-low / --hsv-high.
-HSV_LOW_DEFAULT  = (5, 60, 50)
-HSV_HIGH_DEFAULT = (30, 255, 220)
+# Color-agnostic mask for Task 1: any high-saturation cube on a near-white
+# table. H is wide-open (0..180), S>=90 rejects the table/cables/bowl, V>=40
+# rejects deep shadow. Tune via --hsv-low / --hsv-high if your lighting is
+# unusually dim/bright.
+HSV_LOW_DEFAULT  = (0,   90,  40)
+HSV_HIGH_DEFAULT = (180, 255, 255)
 
 
 # ============================================================== forward kine
@@ -148,11 +155,36 @@ class FK:
         return np.asarray(T.pos, dtype=np.float32)
 
 
-def _hsv_mask(rgb_hwc_uint8: np.ndarray, low: tuple, high: tuple) -> np.ndarray:
+def _hsv_mask(rgb_hwc_uint8: np.ndarray, low: tuple, high: tuple,
+              keep_largest: bool = True, min_area: int = 6) -> np.ndarray:
+    """Binary mask of colored objects on a near-white table.
+
+    The default HSV bound is a saturation gate, so this fires on any
+    high-S hue (red/orange/yellow/green/blue/purple — all Task 1 cubes).
+    ``keep_largest=True`` then collapses the result to a single
+    connected component (the dominant cube cluster), so distractors like
+    a tool handle in the corner do not bleed into the channel the policy
+    was trained to read as "the block".
+    """
     import cv2
     hsv = cv2.cvtColor(rgb_hwc_uint8, cv2.COLOR_RGB2HSV)
     m = cv2.inRange(hsv, np.array(low, dtype=np.uint8), np.array(high, dtype=np.uint8))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    if keep_largest:
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            (m > 0).astype(np.uint8), connectivity=8
+        )
+        if n > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]          # skip background (label 0)
+            best = int(np.argmax(areas)) + 1
+            if stats[best, cv2.CC_STAT_AREA] >= min_area:
+                m = ((labels == best).astype(np.uint8)) * 255
+            else:
+                m = np.zeros_like(m)
+        else:
+            m = np.zeros_like(m)
+
     return (m.astype(np.float32) / 255.0)                            # H × W in [0, 1]
 
 
