@@ -331,6 +331,16 @@ def run(bowl_xy: np.ndarray, args) -> None:
         _home_arm(driver)
         q0_deg = driver.read_proprio_deg()
         q_rad_prev = _deg_to_rad(q0_deg)
+        # Calibration sanity-check: at URDF zero [0,0,0,1.57,0] the FK ee_xyz
+        # should be ≈ (0.247, 0, 0.063). A large mismatch means the Feetech
+        # calibration zero ≠ URDF zero, and the policy will see a stale
+        # ``joint_pos_rel=0`` while the wrist cam looks somewhere unexpected.
+        ee_xyz_now = fk.ee_xyz(q_rad_prev)
+        print(f"[ppo] at home: q_deg={q0_deg.round(2)}  ee_xyz={ee_xyz_now.round(3)}  "
+              f"(sim home ≈ (0.247, 0.000, 0.063))")
+        if not args.no_confirm:
+            input("[ppo] place block within x∈(0.13,0.28), y∈(-0.12,0.12). "
+                  "Press <enter> to start rollout, ctrl-C to abort … ")
         qdot_filt = np.zeros(6, dtype=np.float32)
         last_action = np.zeros(6, dtype=np.float32)
         dt = 1.0 / FPS
@@ -397,6 +407,8 @@ def main() -> int:
                    help=f"HSV lower bound for block mask, default {HSV_LOW_DEFAULT}")
     p.add_argument("--hsv-high", type=_parse_hsv, default=HSV_HIGH_DEFAULT,
                    help=f"HSV upper bound for block mask, default {HSV_HIGH_DEFAULT}")
+    p.add_argument("--no-confirm", action="store_true",
+                   help="Skip the post-home <enter> prompt and start immediately.")
     args = p.parse_args()
 
     x, y = (float(s) for s in args.bowl_xy.split(","))
