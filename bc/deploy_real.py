@@ -51,8 +51,6 @@ match what the policy was trained against:
 
 * host-side slew clamp ``MAX_RAD_PER_STEP = 1.5 / FPS`` on the commanded
   target (mirrors sim's ``velocity_limit_sim``);
-* homing trajectory at startup so the first policy obs matches the sim
-  reset state (``JOINT_DEFAULTS_RAD``, ``last_action = 0``);
 * EWMA on the finite-difference joint velocity, since the sim's
   ``joint_vel_rel`` is a clean PhysX read and the servo FD is encoder-quantized
   + bus-jittered noise that lives outside the policy's training distribution.
@@ -89,13 +87,6 @@ JOINT_DEFAULTS_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, 0.0], dtype=np.float32)
 ARM_ACTION_SCALE = 0.5                  # JointPositionActionCfg.scale
 GRIPPER_OPEN_RAD = 0.5
 GRIPPER_CLOSE_RAD = 0.0
-# Pose to physically slew to at startup. Matches what the sim shows on
-# reset: arm joints at JOINT_DEFAULTS_RAD, gripper OPEN (0.5 rad). The
-# sim's BinaryJointPositionActionCfg + last_action=0 lands at gripper=0.5
-# after the first env tick, so joint_pos_rel[gripper] = 0.5 in the first
-# obs the policy ever saw at train time. Homing to gripper=0.0 (URDF init
-# value) would feed the policy joint_pos_rel[gripper]=0 at t=0 — OOD.
-HOME_POSE_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, GRIPPER_OPEN_RAD], dtype=np.float32)
 
 IMG_H, IMG_W = 72, 128
 FPS = 50                                # matches sim (decimation=2, sim.dt=0.01 → 50 Hz)
@@ -260,33 +251,6 @@ def _slew_limit(target_rad: np.ndarray, current_rad: np.ndarray,
     return (current_rad + delta).astype(np.float32)
 
 
-def _home_arm(driver: "LerobotSO101Driver", settle_s: float = 0.3) -> None:
-    """Rate-limited move from wherever the arm is to ``HOME_POSE_RAD``.
-
-    Targets the *effective* sim reset pose (arm at URDF zero, gripper OPEN
-    at 0.5 rad) so the first policy obs matches what training saw: arm
-    ``joint_pos_rel`` ≈ 0, gripper ``joint_pos_rel`` ≈ 0.5, ``joint_vel_rel``
-    ≈ 0, ``last_action`` = 0. Caps each step at ``MAX_RAD_PER_STEP`` so the
-    homing trajectory is itself sim-rate.
-    """
-    dt = 1.0 / FPS
-    next_tick = time.time()
-    while True:
-        q_rad = _deg_to_rad(driver.read_proprio_deg())
-        err = HOME_POSE_RAD - q_rad
-        if np.max(np.abs(err)) < MAX_RAD_PER_STEP * 0.5:
-            break
-        step_target = _slew_limit(HOME_POSE_RAD, q_rad)
-        driver.send_joint_targets_deg(_rad_to_deg(step_target))
-        next_tick += dt
-        sleep_for = next_tick - time.time()
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-        else:
-            next_tick = time.time()
-    time.sleep(settle_s)  # let the servos settle before reading proprio for the policy
-
-
 def _build_image(rgb_hwc, K, dist, hsv_low, hsv_high) -> np.ndarray:
     import cv2
     if K is not None and dist is not None:
@@ -339,16 +303,10 @@ def run(bowl_xy: np.ndarray, args) -> None:
     driver = LerobotSO101Driver()
     driver.connect()
     try:
-        print("[ppo] homing arm to URDF defaults …")
-        _home_arm(driver)
         q0_deg = driver.read_proprio_deg()
         q_rad_prev = _deg_to_rad(q0_deg)
-        # Calibration sanity-check: at URDF zero [0,0,0,1.57,0] the FK ee_xyz
-        # should be ≈ (0.247, 0, 0.063). A large mismatch means the Feetech
-        # calibration zero ≠ URDF zero, and the policy will see a stale
-        # ``joint_pos_rel=0`` while the wrist cam looks somewhere unexpected.
         ee_xyz_now = fk.ee_xyz(q_rad_prev)
-        print(f"[ppo] at home: q_deg={q0_deg.round(2)}  ee_xyz={ee_xyz_now.round(3)}  "
+        print(f"[ppo] start pose: q_deg={q0_deg.round(2)}  ee_xyz={ee_xyz_now.round(3)}  "
               f"(sim home ≈ (0.247, 0.000, 0.063))")
         if not args.no_confirm:
             input("[ppo] place block within x∈(0.13,0.28), y∈(-0.12,0.12). "
@@ -420,7 +378,7 @@ def main() -> int:
     p.add_argument("--hsv-high", type=_parse_hsv, default=HSV_HIGH_DEFAULT,
                    help=f"HSV upper bound for block mask, default {HSV_HIGH_DEFAULT}")
     p.add_argument("--no-confirm", action="store_true",
-                   help="Skip the post-home <enter> prompt and start immediately.")
+                   help="Skip the pre-rollout <enter> prompt and start immediately.")
     args = p.parse_args()
 
     x, y = (float(s) for s in args.bowl_xy.split(","))
