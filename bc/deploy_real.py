@@ -101,9 +101,13 @@ MAX_RAD_PER_STEP = SIM_VEL_LIMIT / FPS
 QDOT_EWMA_ALPHA = 0.3
 
 SERVO_PORT  = "/dev/tty.usbmodem5B140335911"
+# Capture at the calibration resolution (camera_intrinsics.yaml is 1280×720).
+# Required for cv2.undistort to be valid — K/dist are in 1280×720 pixel units,
+# and 1280×720 is 16:9, matching the sim render aspect (128×72) so the downsize
+# to (IMG_W, IMG_H) is a clean ×10 with no FOV squashing.
 CAM_INDEX   = 0
-CAM_WIDTH   = 640
-CAM_HEIGHT  = 480
+CAM_WIDTH   = 1280
+CAM_HEIGHT  = 720
 DEVICE      = "cpu"
 
 # HSV thresholds for the wood-tone block on a gray table. These get you in the
