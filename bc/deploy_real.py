@@ -73,7 +73,7 @@ IMG_H, IMG_W = 72, 128
 FPS = 30
 MAX_STEPS = 5 * FPS                     # 5 s episode in sim
 
-SERVO_PORT  = "/dev/ttyACM0"
+SERVO_PORT  = "/dev/tty.usbmodem5B140319261"
 CAM_INDEX   = 0
 CAM_WIDTH   = 640
 CAM_HEIGHT  = 480

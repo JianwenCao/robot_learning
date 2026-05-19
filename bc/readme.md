@@ -37,12 +37,11 @@ gdown "https://drive.google.com/uc?id=1ixXvEX-JmKj9aODik-4Mw9UqJ0yKi_cp" -O bc/r
 
 ```bash
 conda activate so_arm
-python -m bc.deploy_real --bowl-xy 0.20,-0.05 --dry-run
+python -m bc.deploy_real --bowl-xy 0.30,0.0 --dry-run
 ```
 
 ## Step 5 — real-arm rollout
 
 ```bash
-python -m bc.deploy_real --bowl-xy 0.20,-0.05
-python -m bc.deploy_real --bowl-xy 0.18,0.06
+python -m bc.deploy_real --bowl-xy 0.30,0.0
 ```
