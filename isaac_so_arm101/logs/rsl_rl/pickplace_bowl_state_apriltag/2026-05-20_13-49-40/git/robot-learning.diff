@@ -1,0 +1,120 @@
+--- git status ---
+On branch jianwen
+Your branch is up to date with 'origin/jianwen'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   docs/EVAL1_PLAN.md
+	modified:   isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/mdp/rewards.py
+	modified:   isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/pickplace_env_cfg.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	eval1.pt
+	eval2.pt
+	exported/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/docs/EVAL1_PLAN.md b/docs/EVAL1_PLAN.md
+index 398915f..87932e6 100644
+--- a/docs/EVAL1_PLAN.md
++++ b/docs/EVAL1_PLAN.md
+@@ -47,7 +47,7 @@ AprilTag spec: 36h11 family, edge ≥ 14 mm (fits a 20 mm cube face with a 3 mm
+ 
+ ## 4. Reward, curriculum, network
+ 
+-Reward (`mdp/rewards.py`): `reaching_object` 1.0, `lifting_object` 15.0, `object_goal_tracking` 16.0 (+ fine-grained 5.0 at `std=0.05`), **`release_in_bowl` 30.0** gated on lift latch (cube z ≥ 0.07 m) AND over-bowl-above-rim latch (cube z ≥ 0.08 m, within 6 cm of bowl xy), with release firing once z < `BOWL_RIM_Z` (= 0.06 m) ∧ gripper open ∧ settled. Anti-hover / anti-smash shaping is deliberately small relative to release: `gripper_open_above_bowl_lure` +3 pays only when the cube is currently over the bowl and still above release height, while `still_grasped_above_bowl_penalty` −2 applies when a lifted cube is near the bowl but the gripper is still commanded closed. This makes the local optimum over the target "open and let the cube fall" rather than "keep clamping and push the cube down to the target." `action_rate` / `joint_vel` −1e-4 → −1e-2 ramp at 10 k env-steps. No `task_success` termination.
++Reward (`mdp/rewards.py`): `reaching_object` 1.0, `lifting_object` 15.0, `object_goal_tracking` 16.0 (+ fine-grained 5.0 at `std=0.05`), `ee_release_pose_over_bowl` 6.0, and **`release_in_bowl` 30.0** gated on lift latch (cube z ≥ 0.07 m) AND over-bowl-above-rim latch (cube z ≥ 0.08 m, within 6 cm of bowl xy), with release firing once z < `BOWL_RIM_Z` (= 0.06 m) ∧ gripper open ∧ settled. `ee_release_pose_over_bowl` pays after lift and continues after release, preferring the end-effector high over the target xy; the cube is free to fall, and `release_in_bowl` is what rewards the cube landing low at the target. Anti-hover / anti-smash shaping is deliberately small relative to release: `gripper_open_above_bowl_lure` +3 pays only when the cube is currently over the bowl and still above release height, while `still_grasped_above_bowl_penalty` −2 applies when a lifted cube is near the bowl but the gripper is still commanded closed. This makes the local optimum over the target "open and let the cube fall" rather than "keep clamping and push the cube down to the target." `action_rate` / `joint_vel` −1e-4 → −1e-2 ramp at 10 k env-steps. No `task_success` termination.
+ 
+ Curriculum (`CurriculumCfg`): `reset_block_position` ±10 × ±15 cm at `(0.20, 0)`; bowl rejection-sampled in the same band; `log_success` TB metric.
+ 
+diff --git a/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/mdp/rewards.py b/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/mdp/rewards.py
+index 7b80c67..6abc38a 100644
+--- a/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/mdp/rewards.py
++++ b/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/mdp/rewards.py
+@@ -588,6 +588,50 @@ def transport_to_bowl(
+     return was_lifted.float() * (1.0 - torch.tanh(distance / std))
+ 
+ 
++def ee_release_pose_over_bowl(
++    env: ManagerBasedRLEnv,
++    ee_height: float = 0.14,
++    xy_std: float = 0.06,
++    z_std: float = 0.04,
++    r_safe: float = 0.06,
++    bowl_height: float = 0.06,
++    minimal_height: float = 0.07,
++    command_name: str = "bowl_pose",
++    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
++    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
++) -> torch.Tensor:
++    """Small release-pose reward for keeping the EE high over the target
++    after the cube has been lifted.
++
++    This intentionally uses the EE pose, not cube height. The desired
++    behavior is "hold the gripper above the target xy, open, let the cube
++    fall"; the cube itself must be free to descend. Existing
++    ``release_in_bowl`` is still the reward that pays for the cube landing
++    low inside the bowl footprint.
++
++    * lift latch must have fired (cube was lifted ≥ ``minimal_height``),
++    * EE xy should be near bowl xy,
++    * EE z should stay at/above ``ee_height``.
++
++    This intentionally keeps paying after release. On the real setup we do
++    not want the EE to descend with the cube or crash into the table/bowl;
++    the correct post-release behavior is to leave the gripper high while
++    the cube falls and settles.
++    """
++    del r_safe, bowl_height  # kept in the signature for config compatibility
++    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
++    ee_w = ee_frame.data.target_pos_w[..., 0, :]
++    bowl_w = _bowl_xy_w(env, command_name)
++
++    was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
++
++    ee_xy_dist = torch.norm(ee_w[:, :2] - bowl_w, dim=1)
++    xy_factor = torch.exp(-(ee_xy_dist * ee_xy_dist) / (xy_std * xy_std))
++    z_shortfall = (ee_height - ee_w[:, 2]).clamp(min=0.0)
++    z_factor = torch.exp(-(z_shortfall * z_shortfall) / (z_std * z_std))
++    return was_lifted.float() * xy_factor * z_factor
++
++
+ # ---------------------------------------------------------------------------
+ # Stage 4 — place (block over bowl AND low)
+ # ---------------------------------------------------------------------------
+diff --git a/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/pickplace_env_cfg.py b/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/pickplace_env_cfg.py
+index a32dd85..675eb22 100644
+--- a/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/pickplace_env_cfg.py
++++ b/isaac_so_arm101/src/isaac_so_arm101/tasks/pickplace/pickplace_env_cfg.py
+@@ -497,6 +497,26 @@ class RewardsCfg:
+         weight=5.0,
+     )
+ 
++    # Release-pose shaping: after lift, keep the end-effector high over the
++    # target xy, including after the cube is released. This decouples the
++    # gripper pose from cube motion: the EE should stay above the target and
++    # release, while release_in_bowl rewards the cube falling low into the
++    # footprint. Keeping this active post-release protects the table/bowl
++    # from a descending gripper.
++    ee_release_pose_over_bowl = RewTerm(
++        func=mdp.ee_release_pose_over_bowl,
++        params={
++            "ee_height": 0.08,
++            "xy_std": 0.06,
++            "z_std": 0.04,
++            "r_safe": 0.06,
++            "bowl_height": 0.06,
++            "minimal_height": 0.07,
++            "command_name": "bowl_pose",
++        },
++        weight=20,
++    )
++
+     # Stage-2 fine-tune (release into bowl). Re-added at moderate weight
+     # after stage-1 teacher converged with mean reward ≈ 118
+     # (lift saturated 12.4, transport 9.8, fine-grained 0.9). The

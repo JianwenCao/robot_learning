@@ -497,6 +497,26 @@ class RewardsCfg:
         weight=5.0,
     )
 
+    # Release-pose shaping: after lift, keep the end-effector high over the
+    # target xy, including after the cube is released. This decouples the
+    # gripper pose from cube motion: the EE should stay above the target and
+    # release, while release_in_bowl rewards the cube falling low into the
+    # footprint. Keeping this active post-release protects the table/bowl
+    # from a descending gripper.
+    ee_release_pose_over_bowl = RewTerm(
+        func=mdp.ee_release_pose_over_bowl,
+        params={
+            "ee_height": 0.08,
+            "xy_std": 0.06,
+            "z_std": 0.04,
+            "r_safe": 0.06,
+            "bowl_height": 0.06,
+            "minimal_height": 0.07,
+            "command_name": "bowl_pose",
+        },
+        weight=20,
+    )
+
     # Stage-2 fine-tune (release into bowl). Re-added at moderate weight
     # after stage-1 teacher converged with mean reward ≈ 118
     # (lift saturated 12.4, transport 9.8, fine-grained 0.9). The

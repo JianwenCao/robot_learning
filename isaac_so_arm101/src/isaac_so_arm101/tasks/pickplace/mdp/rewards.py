@@ -588,6 +588,50 @@ def transport_to_bowl(
     return was_lifted.float() * (1.0 - torch.tanh(distance / std))
 
 
+def ee_release_pose_over_bowl(
+    env: ManagerBasedRLEnv,
+    ee_height: float = 0.14,
+    xy_std: float = 0.06,
+    z_std: float = 0.04,
+    r_safe: float = 0.06,
+    bowl_height: float = 0.06,
+    minimal_height: float = 0.07,
+    command_name: str = "bowl_pose",
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+) -> torch.Tensor:
+    """Small release-pose reward for keeping the EE high over the target
+    after the cube has been lifted.
+
+    This intentionally uses the EE pose, not cube height. The desired
+    behavior is "hold the gripper above the target xy, open, let the cube
+    fall"; the cube itself must be free to descend. Existing
+    ``release_in_bowl`` is still the reward that pays for the cube landing
+    low inside the bowl footprint.
+
+    * lift latch must have fired (cube was lifted ≥ ``minimal_height``),
+    * EE xy should be near bowl xy,
+    * EE z should stay at/above ``ee_height``.
+
+    This intentionally keeps paying after release. On the real setup we do
+    not want the EE to descend with the cube or crash into the table/bowl;
+    the correct post-release behavior is to leave the gripper high while
+    the cube falls and settles.
+    """
+    del r_safe, bowl_height  # kept in the signature for config compatibility
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    bowl_w = _bowl_xy_w(env, command_name)
+
+    was_lifted = _episode_lifted_mask(env, object_cfg, minimal_height)
+
+    ee_xy_dist = torch.norm(ee_w[:, :2] - bowl_w, dim=1)
+    xy_factor = torch.exp(-(ee_xy_dist * ee_xy_dist) / (xy_std * xy_std))
+    z_shortfall = (ee_height - ee_w[:, 2]).clamp(min=0.0)
+    z_factor = torch.exp(-(z_shortfall * z_shortfall) / (z_std * z_std))
+    return was_lifted.float() * xy_factor * z_factor
+
+
 # ---------------------------------------------------------------------------
 # Stage 4 — place (block over bowl AND low)
 # ---------------------------------------------------------------------------
