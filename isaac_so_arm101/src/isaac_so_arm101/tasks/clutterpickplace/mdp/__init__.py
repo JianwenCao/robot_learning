@@ -70,6 +70,7 @@ from .rewards import (  # noqa: F401
     log_target_success_metrics,
     reach_target_block,
     release_target_in_bowl,
+    target_ee_release_pose_over_bowl,
     target_grasp_event,
     target_gripper_open_above_bowl_lure,
     target_in_bowl,

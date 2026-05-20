@@ -7,16 +7,15 @@
 
 Single-stage from-scratch PPO on the camera-free env
 :class:`SoArm101ClutterPickPlaceStateAprilTagEnvCfg`. The actor sees the
-deployable ``policy`` group (proprio + bowl_xy + per-cube noisy xy +
-visibility flags) AND the ``goal`` group (target color one-hot). The
-critic additionally sees the full privileged ``critic`` group
-(GT target/distractor positions, ee→target, target_is_grasped). See
-``docs/STATE_APRILTAG_PLAN.md`` §6/§7 for the deploy-side mirror.
+deployable target-only ``policy`` group (proprio + bowl_xy + target-cube
+noisy xy), matching Eval-1's 27-D actor input. The critic additionally sees
+the target color goal and full privileged ``critic`` group (GT
+target/distractor positions, ee→target, target_is_grasped).
 
 Reuses :class:`PickPlaceVisionActorCritic` — that class auto-disables the
 CNN when ``wrist_image`` isn't in ``obs_groups``, so this cfg yields a
-plain MLP actor-critic with FiLM-free goal conditioning (goal one-hot
-just concatenates into the state vector like every other proprio term).
+plain MLP actor-critic. Goal one-hot is critic-only in the state-AprilTag
+path; the deploy actor is color-blind and keyed externally by AprilTag ID.
 """
 
 import rsl_rl.runners.on_policy_runner as _on_policy_runner
@@ -48,10 +47,9 @@ _register_class()
 class ClutterPickPlaceStateAprilTagPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO config for the Eval-2 state-only + AprilTag-noise path.
 
-    Hyperparameters mirror :class:`ClutterPickPlaceTeacherPPORunnerCfg`
-    (same MDP shape, just a wider obs vector: +12 for cube positions,
-    +6 for visibility flags). Same per-dim init noise + std cap to keep
-    the binary gripper decisive while the arm explores.
+    Hyperparameters mirror Eval-1's state-AprilTag runner. The actor obs
+    shape is intentionally identical (27-D target-only stream); the critic
+    is wider because it receives privileged target/distractor state.
     """
 
     num_steps_per_env = 32

@@ -423,6 +423,24 @@ class RewardsCfg:
         weight=5.0,
     )
 
+    # Target-keyed port of Eval-1's release-pose shaping. After the target
+    # has been lifted, keep the end-effector high over the bowl xy,
+    # including after release. The target cube is free to fall; release_in_bowl
+    # is the term that rewards it landing low inside the footprint.
+    ee_release_pose_over_bowl = RewTerm(
+        func=mdp.target_ee_release_pose_over_bowl,
+        params={
+            "ee_height": 0.08,
+            "xy_std": 0.06,
+            "z_std": 0.04,
+            "r_safe": 0.06,
+            "bowl_height": 0.06,
+            "minimal_height": 0.07,
+            "command_name": "bowl_pose",
+        },
+        weight=10.0,
+    )
+
     release_in_bowl = RewTerm(func=mdp.release_target_in_bowl, weight=30.0)
 
     # Anti-hover lures — target-keyed port of Eval-1's 2026-05-20 fix.
@@ -438,7 +456,7 @@ class RewardsCfg:
         func=mdp.target_gripper_open_above_bowl_lure, weight=3.0,
     )
     still_grasped_above_bowl_penalty = RewTerm(
-        func=mdp.target_still_grasped_above_bowl_penalty, weight=-1.0,
+        func=mdp.target_still_grasped_above_bowl_penalty, weight=-2.0,
     )
 
     # Distractor-aware shaping (Eval-2 specific).
@@ -503,26 +521,17 @@ class CurriculumCfg:
     from the start to learn target-color discrimination.
     """
 
-    # Curriculum num_steps walked 10000 → 30000 → 15000.
-    #   v1 (10k): ramp completed iter 200-400 just as reach (+0.16) emerged;
-    #     full-weight action penalty (-0.20) exceeded reach → "stay still"
-    #     attractor.
-    #   v2 (30k): pushed ramp to ~iter 900. In v3 with desired_kl=0.005,
-    #     policy still couldn't escape "stay still" and stalled at iter
-    #     770 with lift=0.05, release=0.0.
-    #   v3 (15k, current): with desired_kl relaxed back to 0.01 (see
-    #     state_apriltag_ppo_cfg.py) PPO has the gradient bandwidth to
-    #     escape stay-still even under earlier action penalty. 15k splits
-    #     the difference (full ramp at ~iter 460 vs Eval-1's iter 150);
-    #     gives reach time to lock in but doesn't let action energy
-    #     drift unchecked through the whole run.
+    # Match Eval-1's action smoothness schedule exactly. The earlier Eval-2
+    # target (-1e-2 over 15k steps) let high-energy fling / smash strategies
+    # survive even after release success reached ~85%; Eval-1's working
+    # recipe uses the stronger -1e-1 target over 10k steps.
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 15000},
+        params={"term_name": "action_rate", "weight": -1e-1, "num_steps": 10000},
     )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 15000},
+        params={"term_name": "joint_vel", "weight": -1e-1, "num_steps": 10000},
     )
     # Ramp wrong_block_in_bowl 0 → -5 over 20k env-steps. See RewardsCfg
     # docstring for the rationale (early -5 was poisoning exploration).

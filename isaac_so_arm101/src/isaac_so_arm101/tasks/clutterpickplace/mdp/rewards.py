@@ -166,6 +166,40 @@ def target_transport_to_bowl(
     return was_lifted.float() * (1.0 - torch.tanh(distance / std))
 
 
+def target_ee_release_pose_over_bowl(
+    env: "ManagerBasedRLEnv",
+    ee_height: float = 0.14,
+    xy_std: float = 0.06,
+    z_std: float = 0.04,
+    r_safe: float = 0.06,
+    bowl_height: float = 0.06,
+    minimal_height: float = 0.07,
+    command_name: str = "bowl_pose",
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """Release-pose reward: keep the EE high over the bowl after lifting
+    the target cube.
+
+    This intentionally constrains the end-effector, not the cube. The cube
+    must be free to fall after opening the gripper; :func:`release_target_in_bowl`
+    rewards the target cube landing low inside the bowl footprint. This term
+    keeps paying after release so the gripper learns to stay high and avoid
+    crashing into the table / bowl.
+    """
+    del r_safe, bowl_height  # kept in signature for parity with Eval-1 cfg
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    bowl_w = _bowl_xy_w(env, command_name)
+
+    was_lifted = _target_lifted_mask(env, minimal_height, cube_prefix)
+    ee_xy_dist = torch.norm(ee_w[:, :2] - bowl_w, dim=1)
+    xy_factor = torch.exp(-(ee_xy_dist * ee_xy_dist) / (xy_std * xy_std))
+    z_shortfall = (ee_height - ee_w[:, 2]).clamp(min=0.0)
+    z_factor = torch.exp(-(z_shortfall * z_shortfall) / (z_std * z_std))
+    return was_lifted.float() * xy_factor * z_factor
+
+
 # ---------------------------------------------------------------------------
 # Place (binary: target inside bowl footprint AND below rim, gated on both
 # per-episode latches).
@@ -276,19 +310,28 @@ def target_gripper_open_above_bowl_lure(
     command_name: str = "bowl_pose",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
-    """+1/step when the target's over-bowl-above-rim latch is set AND policy commands gripper open.
+    """+1/step when the target is currently over the bowl at release height
+    and the policy commands gripper open.
 
-    Target-aware mirror of :func:`pickplace.mdp.rewards.gripper_open_above_bowl_lure`.
-    Gated on :func:`_target_over_bowl_high_mask` so the lure can only be
-    farmed after the policy has actually transported the target above the
-    rim — opening the gripper at home doesn't pay.
+    Target-aware mirror of Eval-1's current-geometry lure. The old latch-only
+    gate paid for opening after the target had already been pushed down into
+    the bowl footprint. This version rewards opening while the target is
+    still high over the bowl.
     """
-    was_over_high = _target_over_bowl_high_mask(
+    target_w = _target_pos_w(env, cube_prefix)
+    bowl_w = _bowl_xy_w(env, command_name)
+    # Keep the latch fresh for release/success metrics, but use current
+    # geometry as this reward's gate.
+    _target_over_bowl_high_mask(
         env, r_safe=r_safe, rim_clearance=rim_clearance,
         command_name=command_name, cube_prefix=cube_prefix,
     )
+    currently_over_release_height = (
+        (torch.norm(target_w[:, :2] - bowl_w, dim=1) < r_safe)
+        & (target_w[:, 2] > rim_clearance)
+    )
     gripper_open_cmd = env.action_manager.action[:, 5] > 0.0
-    return (was_over_high & gripper_open_cmd).float()
+    return (currently_over_release_height & gripper_open_cmd).float()
 
 
 def target_still_grasped_above_bowl_penalty(
@@ -299,21 +342,25 @@ def target_still_grasped_above_bowl_penalty(
     command_name: str = "bowl_pose",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
-    """+1/step (negative-weight in cfg) while hovering the target above the bowl.
+    """+1/step (negative-weight in cfg) while a lifted target is near the bowl
+    and the gripper is still commanded closed.
 
     Target-aware mirror of :func:`pickplace.mdp.rewards.still_grasped_above_bowl_penalty`.
     Three conditions:
       * episode target-lift latch (target was lifted ≥ ``minimal_height``),
-      * target *currently* above ``rim_clearance`` AND within ``r_safe`` of bowl xy,
+      * target currently within ``r_safe`` of bowl xy,
       * gripper command ≤ 0 (closed).
+
+    Penalizing closed-gripper target-near-bowl states catches both high hover
+    and the low "press/drag into target then open" shortcut.
     """
+    del rim_clearance
     target_w = _target_pos_w(env, cube_prefix)
     bowl_w = _bowl_xy_w(env, command_name)
     was_lifted = _target_lifted_mask(env, minimal_height, cube_prefix)
-    currently_above_rim = target_w[:, 2] > rim_clearance
     currently_near_bowl = torch.norm(target_w[:, :2] - bowl_w, dim=1) < r_safe
     gripper_closed_cmd = env.action_manager.action[:, 5] <= 0.0
-    return (was_lifted & currently_above_rim & currently_near_bowl & gripper_closed_cmd).float()
+    return (was_lifted & currently_near_bowl & gripper_closed_cmd).float()
 
 
 # ---------------------------------------------------------------------------

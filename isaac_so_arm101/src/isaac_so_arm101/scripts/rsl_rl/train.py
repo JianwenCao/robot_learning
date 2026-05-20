@@ -31,6 +31,13 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--actor-only",
+    action="store_true",
+    default=False,
+    help="Warm-start only actor.* and std from --checkpoint, leaving critic/optimizer fresh. "
+         "Use for cross-task transfer when policy obs matches but critic obs differs.",
+)
 # Stage-3 warm-start critic carry-over (EVAL1_PLAN §7.2 intervention #5).
 # When set, AFTER the distill checkpoint warm-starts the actor via
 # runner.load(--load_run), we overlay the Stage-1 teacher's ``critic.*`` keys
@@ -184,7 +191,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = multi_agent_to_single_agent(env)
 
     # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if args_cli.actor_only:
+        if args_cli.checkpoint is None:
+            raise ValueError("--actor-only requires --checkpoint")
+        if os.path.isfile(args_cli.checkpoint):
+            resume_path = os.path.abspath(args_cli.checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
@@ -212,7 +226,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    if args_cli.actor_only:
+        print(f"[INFO]: Actor-only warm-start from: {resume_path}")
+        data = torch.load(resume_path, map_location=agent_cfg.device, weights_only=False)
+        state_dict = data["model_state_dict"] if isinstance(data, dict) and "model_state_dict" in data else data
+        actor_state_dict = {
+            key: value for key, value in state_dict.items()
+            if key.startswith("actor") or key == "std"
+        }
+        if not actor_state_dict:
+            raise RuntimeError(f"--actor-only found no actor.* or std keys in checkpoint: {resume_path}")
+        result = torch.nn.Module.load_state_dict(runner.alg.policy, actor_state_dict, strict=False)
+        missing = getattr(result, "missing_keys", result[0])
+        unexpected = getattr(result, "unexpected_keys", result[1])
+        if unexpected:
+            raise RuntimeError(f"--actor-only load had unexpected keys: {unexpected}")
+        n_actor = sum(1 for key in actor_state_dict if key.startswith("actor"))
+        n_critic_missing = sum(1 for key in missing if key.startswith("critic"))
+        print(
+            f"[INFO]: Actor-only warm-start loaded {len(actor_state_dict)} keys "
+            f"({n_actor} actor.*, std={'std' in actor_state_dict}); "
+            f"left {n_critic_missing} critic.* keys fresh."
+        )
+    elif agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
