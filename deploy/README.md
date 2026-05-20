@@ -105,7 +105,15 @@ python -m deploy.verify_apriltag_chain --tag-id 99 --tag-size 0.030   # calibrat
 
 ## Step 6 — checkpoint
 
-Download a known-good state-only + AprilTag PPO checkpoint to `deploy/runs/model.pt`:
+Each eval task has its **own** state-only + AprilTag PPO checkpoint — they are *not* interchangeable. The Drive link below is the **Eval-1 only** checkpoint:
+
+| Eval | Checkpoint | Notes |
+|---|---|---|
+| Eval-1 (single red cube) | `deploy/runs/model.pt` (Drive link below) | This step |
+| Eval-2 (target cube + distractor) | own retrained model | Train via `Isaac-SO-ARM101-ClutterPickPlace-Bowl-StateAprilTag-v0`; pass with `--ckpt path/to/eval2.pt` |
+| Eval-3 (3 sub-goals, 4-cube cluster) | **reuses the Eval-2 model** | Same weights drive all 3 sub-goals — only the AprilTag `target_id` changes between them (see [`docs/EVAL3_PLAN.md`](../docs/EVAL3_PLAN.md)) |
+
+Download the Eval-1 checkpoint to `deploy/runs/model.pt`:
 
 ```bash
 pip install --quiet gdown
@@ -141,19 +149,25 @@ If the policy fails in sim (cube knocked away, no grasp, oscillation around the 
 
 Tag ↔ colour: `0`=red, `1`=blue, `2`=yellow, `3`=green, `4`=purple, `5`=orange.
 
+Each task loads a different checkpoint (see Step 6) — pass it with `--ckpt`. Default search (`deploy/runs/state_apriltag_model.pt` → `deploy/runs/model.pt`) is the **Eval-1** checkpoint only.
+
 ```bash
 conda activate so_arm
 
-# Eval-1 (red cube; --target-color red is the default)
+# Eval-1 (red cube; --target-color red is the default).
+# Default ckpt search picks up deploy/runs/model.pt from Step 6.
 python -m deploy.deploy_real --bowl-xy 0.30,0.0
 
-# Eval-2 (--target-color picks the cube colour)
-python -m deploy.deploy_real --bowl-xy 0.22,0.0 --target-color blue
+# Eval-2 — own retrained model; pass --ckpt explicitly.
+python -m deploy.deploy_real --bowl-xy 0.22,0.0 --target-color blue \
+    --ckpt deploy/runs/eval2_model.pt
 
-# Eval-3 (three sub-goals, shared bowl). Defaults: manual release-detect
-# between sub-goals, homing on between sub-goals. Add --no-confirm to
-# skip the manual prompts; add --no-home-between-subgoals for speed.
-python -m deploy.deploy_real --bowl-xy 0.22,0.0 --colors red,blue,yellow
+# Eval-3 (three sub-goals, shared bowl) — reuses the Eval-2 checkpoint.
+# Defaults: manual release-detect between sub-goals, homing on between
+# sub-goals. Add --no-confirm to skip the manual prompts; add
+# --no-home-between-subgoals for speed.
+python -m deploy.deploy_real --bowl-xy 0.22,0.0 --colors red,blue,yellow \
+    --ckpt deploy/runs/eval2_model.pt
 ```
 
 ## How AprilTag is wired into the closed loop
