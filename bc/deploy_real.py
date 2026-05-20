@@ -361,10 +361,25 @@ def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
     while time.time() < deadline:
         residual = q - target_rad
         if float(np.max(np.abs(residual))) < tol:
+            per_joint = dict(zip(JOINT_NAMES, residual.round(3).tolist()))
             print(f"[ppo] homed in {time.time() - t_start:.2f}s "
-                  f"(residual={residual.round(3)} rad)")
+                  f"(per-joint residual={per_joint})")
             return q
         step = _slew_limit(target_rad, q, max_step=max_step)
+        # Bypass the slew cap on the gripper jaw during homing. The jaw has
+        # gear backlash + spring preload, so a 0.03 sim_rad (~6 % pct)
+        # commanded position error never builds enough Feetech-PID torque
+        # to overcome static friction — the servo doesn't move, ``q[5]``
+        # stays put, and the next loop commands the same near-current
+        # target, leaving the jaw stuck. Sending the full home target
+        # ``target_rad[5]`` (≈ pct 100 for "open") gives the PID a large
+        # error to drive against, and the jaw reaches home in one or two
+        # servo response cycles. The slew cap is still enforced during the
+        # rollout, where it matches the sim gripper's
+        # ``velocity_limit_sim=1.5`` rad/s — but homing is a one-time
+        # pre-rollout setup, not an in-distribution policy step, so
+        # matching sim's transition rate isn't required here.
+        step[5] = target_rad[5]
         driver.send_joint_targets_sim_rad(step)
         next_tick += dt
         sleep_for = next_tick - time.time()
@@ -373,8 +388,9 @@ def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
         else:
             next_tick = time.time()
         q = driver.read_proprio_sim_rad()
+    per_joint = dict(zip(JOINT_NAMES, (q - target_rad).round(3).tolist()))
     print(f"[ppo] WARNING: homing timed out after {timeout_s:.1f}s — "
-          f"residual={(q - target_rad).round(3)} rad. Starting rollout anyway.")
+          f"per-joint residual={per_joint}. Starting rollout anyway.")
     return q
 
 
