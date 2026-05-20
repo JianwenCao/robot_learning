@@ -37,8 +37,11 @@ Action pipeline (must match training):
   (matches ``JointPositionActionCfg(scale=0.5, use_default_offset=True)``).
 * Gripper (1 joint): ``0.5`` if ``action[5] > 0`` else ``0.0`` (matches
   ``BinaryJointPositionActionCfg(open=0.5, close=0.0)``).
-* Targets converted to degrees before sending — LeRobot's SO101 follower API
-  takes Feetech servo positions in degrees.
+* Per-motor unit conversion lives in ``LerobotSO101Driver``: the five arm
+  motors are in ``MotorNormMode.DEGREES`` (so rad ↔ deg) and the gripper
+  is in ``MotorNormMode.RANGE_0_100`` (so the sim's [0, 0.5] rad maps
+  linearly to [0, 100] %). Writing sim-rad straight to the bus would put
+  the gripper at 0.5 % open (≈ fully closed) on every "open" command.
 
 Control rate is 50 Hz to match the sim (``decimation=2``, ``sim.dt=0.01`` →
 50 Hz, 250 steps over the 5 s episode). The policy is queried *every* step
@@ -87,16 +90,34 @@ INTRINSICS_YAML = PROJECT_ROOT / "camera_intrinsics.yaml"
 
 # Joint order must match LeRobot's SO101 follower obs / action keys.
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-EE_LINK_NAME = "gripper_frame_link"     # URDF tip frame; see so_arm101.urdf
+# FK end link. We use ``gripper_link`` (not ``gripper_frame_link``) so the
+# real ``ee_xyz`` matches the sim ``ee_frame`` exactly — sim's
+# ``FrameTransformer`` is ``gripper_link + offset(0.01, 0, -0.09)`` in the
+# link's local frame, while ``gripper_frame_link`` adds a different URDF
+# offset (-0.0079, ~0, -0.0981) plus a 180° y-rotation. The position
+# discrepancy is ~1.8 cm in x — small but shifts ``ee_proj_xy`` and
+# ``ee_to_bowl_xy`` out of the trained state distribution.
+EE_LINK_NAME = "gripper_link"
+EE_LOCAL_OFFSET = np.array([0.01, 0.0, -0.09], dtype=np.float64)
 
-# URDF/init defaults from SO_ARM101_CFG.init_state.joint_pos (radians).
-# Used for ``joint_pos_rel = q - JOINT_DEFAULTS_RAD`` so the obs matches the
-# sim's ``mdp.joint_pos_rel`` (which subtracts the articulation's
-# default_joint_pos). Gripper element is 0.0 to mirror that subtraction base.
-JOINT_DEFAULTS_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, 0.0], dtype=np.float32)
+# Joint defaults the sim's ``joint_pos_rel`` subtracts. Sim's articulation
+# default_joint_pos (set in ``joint_pos_env_cfg.py``) is
+# (0, 0, 0, 1.57, 0, 0.5) — gripper home is OPEN at 0.5 rad. Keep this in
+# lockstep with that override; otherwise ``joint_pos_rel[5]`` is off by 0.5
+# every step.
+JOINT_DEFAULTS_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, 0.5], dtype=np.float32)
 ARM_ACTION_SCALE = 0.5                  # JointPositionActionCfg.scale
-GRIPPER_OPEN_RAD = 0.5
-GRIPPER_CLOSE_RAD = 0.0
+GRIPPER_OPEN_RAD = 0.5                  # sim "open" gripper joint position
+GRIPPER_CLOSE_RAD = 0.0                 # sim "closed" gripper joint position
+# Gripper unit conversion. LeRobot's ``SO101Follower`` puts the gripper
+# motor in ``MotorNormMode.RANGE_0_100`` (not DEGREES like the arm). So
+# ``obs["gripper.pos"] ∈ [0, 100]`` and goal-position writes to
+# ``gripper.pos`` are interpreted as % of the calibrated range. We map
+# [0, 100] linearly to the sim's [0, GRIPPER_OPEN_RAD] joint range so the
+# observation and the action both arrive in the sim's units (which is the
+# distribution the policy was trained on). 100 % open → 0.5 sim_rad, 0 %
+# → 0 sim_rad.
+GRIPPER_PCT_PER_SIM_RAD = 100.0 / GRIPPER_OPEN_RAD
 
 # Pre-rollout homing target. Arm joints match the sim reset pose
 # (``SO_ARM101_CFG.init_state.joint_pos`` overridden in ``joint_pos_env_cfg.py``
@@ -153,19 +174,18 @@ class FK:
         self._joint_names = self.chain.get_joint_parameter_names()  # 5 arm joints
 
     def ee_xyz(self, joint_pos_rad: np.ndarray) -> np.ndarray:
-        """Compute ee xyz in the robot base frame.
+        """Compute ee xyz in the robot base frame, matching sim's ee_frame.
 
-        Args:
-            joint_pos_rad: ``(6,)`` joint positions in radians, in JOINT_NAMES
-                order. Only the first 5 (arm) are used for FK; gripper is skipped.
+        kinpy gives us ``T = base → gripper_link``; we then apply the same
+        local offset ``EE_LOCAL_OFFSET`` that the sim's
+        ``FrameTransformer`` uses, rotated by the link's orientation, so
+        the result equals the sim's ``ee_w`` to floating-point.
         """
-        # kinpy returns the chain joints in URDF order. We must reorder our
-        # 6-vector to whatever kinpy enumerated. JOINT_NAMES[:5] are the arm
-        # joints; build a name → value map and pull in chain order.
         arm_vals = {n: float(v) for n, v in zip(JOINT_NAMES[:5], joint_pos_rad[:5])}
         th = [arm_vals[n] for n in self._joint_names]
         T = self.chain.forward_kinematics(th)
-        return np.asarray(T.pos, dtype=np.float32)
+        ee = np.asarray(T.pos, dtype=np.float64) + T.rot_mat @ EE_LOCAL_OFFSET
+        return ee.astype(np.float32)
 
 
 def _hsv_mask(rgb_hwc_uint8: np.ndarray, low: tuple, high: tuple,
@@ -248,9 +268,22 @@ class LerobotSO101Driver:
         if self._robot is not None:
             self._robot.disconnect()
 
-    def read_proprio_deg(self) -> np.ndarray:
+    def read_proprio_sim_rad(self) -> np.ndarray:
+        """Read all 6 joint positions and return them in the sim's units.
+
+        Arm joints (0..4) are configured as ``MotorNormMode.DEGREES`` on
+        the bus, so ``obs["{n}.pos"]`` returns degrees → convert to rad.
+        The gripper (5) is configured as ``MotorNormMode.RANGE_0_100``,
+        so ``obs["gripper.pos"] ∈ [0, 100]`` (% of the calibrated range)
+        → linearly mapped to the sim's [0, GRIPPER_OPEN_RAD] range so the
+        observation matches what the policy saw in training.
+        """
         obs = self._robot.get_observation()
-        return np.array([float(obs[f"{n}.pos"]) for n in JOINT_NAMES], dtype=np.float32)
+        out = np.empty(6, dtype=np.float32)
+        for i, n in enumerate(JOINT_NAMES[:5]):
+            out[i] = float(obs[f"{n}.pos"]) * (np.pi / 180.0)
+        out[5] = float(obs["gripper.pos"]) / GRIPPER_PCT_PER_SIM_RAD
+        return out
 
     def capture_wrist_rgb_hwc(self) -> np.ndarray:
         ok, bgr = self._cap.read()
@@ -259,14 +292,23 @@ class LerobotSO101Driver:
         rgb = self._cv2.cvtColor(bgr, self._cv2.COLOR_BGR2RGB)
         return rgb                                                   # original res; we resize later
 
-    def send_joint_targets_deg(self, target_deg: np.ndarray) -> None:
-        self._robot.send_action(
-            {f"{n}.pos": float(v) for n, v in zip(JOINT_NAMES, target_deg)}
-        )
+    def send_joint_targets_sim_rad(self, target_sim_rad: np.ndarray) -> None:
+        """Send a 6-D joint target in sim units to the bus.
+
+        Inverse of :meth:`read_proprio_sim_rad`: arm rad → deg, gripper
+        sim_rad → pct. Without this conversion, sending ``gripper=0.5``
+        (sim "open") writes ``0.5`` to the RANGE_0_100 motor — i.e.
+        0.5 % open ≈ fully closed.
+        """
+        cmd: dict[str, float] = {}
+        for i, n in enumerate(JOINT_NAMES[:5]):
+            cmd[f"{n}.pos"] = float(target_sim_rad[i]) * (180.0 / np.pi)
+        pct = float(np.clip(target_sim_rad[5] * GRIPPER_PCT_PER_SIM_RAD, 0.0, 100.0))
+        cmd["gripper.pos"] = pct
+        self._robot.send_action(cmd)
 
 
 # ============================================================== control loop
-def _deg_to_rad(x): return x * (np.pi / 180.0)
 def _rad_to_deg(x): return x * (180.0 / np.pi)
 
 
@@ -314,7 +356,7 @@ def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
     dt = 1.0 / fps
     t_start = time.time()
     deadline = t_start + timeout_s
-    q = _deg_to_rad(driver.read_proprio_deg())
+    q = driver.read_proprio_sim_rad()
     next_tick = time.time()
     while time.time() < deadline:
         residual = q - target_rad
@@ -323,17 +365,74 @@ def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
                   f"(residual={residual.round(3)} rad)")
             return q
         step = _slew_limit(target_rad, q, max_step=max_step)
-        driver.send_joint_targets_deg(_rad_to_deg(step))
+        driver.send_joint_targets_sim_rad(step)
         next_tick += dt
         sleep_for = next_tick - time.time()
         if sleep_for > 0:
             time.sleep(sleep_for)
         else:
             next_tick = time.time()
-        q = _deg_to_rad(driver.read_proprio_deg())
+        q = driver.read_proprio_sim_rad()
     print(f"[ppo] WARNING: homing timed out after {timeout_s:.1f}s — "
           f"residual={(q - target_rad).round(3)} rad. Starting rollout anyway.")
     return q
+
+
+# ============================================================== debug dump
+def _open_debug_dir(args, bowl_xy: np.ndarray, ckpt_path: Path) -> Path | None:
+    """Create the per-run debug dump directory and write a small meta.json.
+
+    Returns the directory (so :func:`_debug_dump_step` knows where to
+    write), or ``None`` if ``--debug-dump`` was not passed.
+    """
+    if not getattr(args, "debug_dump", False):
+        return None
+    import json
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    out = PROJECT_ROOT / "bc" / "runs" / "deploy" / "debug" / stamp
+    out.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "ckpt": str(ckpt_path),
+        "bowl_xy": [float(bowl_xy[0]), float(bowl_xy[1])],
+        "hsv_low": list(args.hsv_low),
+        "hsv_high": list(args.hsv_high),
+        "joint_defaults_rad": JOINT_DEFAULTS_RAD.tolist(),
+        "fps": FPS,
+        "max_steps": MAX_STEPS,
+    }
+    with open(out / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[ppo] --debug-dump active: writing to {out}")
+    return out
+
+
+def _debug_dump_step(out: Path, t: int, image: np.ndarray, state: np.ndarray,
+                      action: np.ndarray, q_rad: np.ndarray, ee_xy: np.ndarray,
+                      target_rad: np.ndarray) -> None:
+    """Save one step's RGB+mask image + a JSONL row for the rest.
+
+    The image is the **exact** ``(4, 72, 128)`` tensor the policy receives,
+    laid out side-by-side as a 72×(128+128) PNG: RGB on the left, mask on
+    the right (binary mask broadcast to 3 channels). State/action/q/ee
+    land in ``log.jsonl`` so they can be diffed against a sim-side
+    rollout numerically.
+    """
+    import cv2, json
+    rgb_u8 = (image[:3].transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+    mask_u8 = (image[3:4].repeat(3, axis=0).transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+    composite = np.concatenate([rgb_u8, mask_u8], axis=1)
+    bgr = cv2.cvtColor(composite, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(out / f"step_{t:04d}.png"), bgr)
+    row = {
+        "t": int(t),
+        "state": state.tolist(),
+        "action": action.tolist(),
+        "q_sim_rad": q_rad.tolist(),
+        "ee_xy": ee_xy.tolist(),
+        "target_sim_rad": target_rad.tolist(),
+    }
+    with open(out / "log.jsonl", "a") as f:
+        f.write(json.dumps(row) + "\n")
 
 
 def _build_image(rgb_hwc, K, dist, hsv_low, hsv_high) -> np.ndarray:
@@ -385,17 +484,20 @@ def run(bowl_xy: np.ndarray, args) -> None:
         print(f"[ppo] dry-run image shape = {image.shape}  action mean = {a.round(3)}")
         return
 
+    dump_dir = _open_debug_dir(args, bowl_xy, ckpt_path)
+
     driver = LerobotSO101Driver()
     driver.connect()
     try:
-        q0_deg = driver.read_proprio_deg()
-        print(f"[ppo] pre-home pose: q_deg={q0_deg.round(2)}")
+        q0 = driver.read_proprio_sim_rad()
+        print(f"[ppo] pre-home pose: q_sim_rad={q0.round(3)} "
+              f"(arm_deg={_rad_to_deg(q0[:5]).round(2)}, gripper_pct≈{q0[5]*GRIPPER_PCT_PER_SIM_RAD:.1f})")
         if not args.no_confirm:
             input("[ppo] arm will slow-slew to home (shoulder=0, wrist=90°, gripper=open). "
                   "Clear the workspace. Press <enter> to home, ctrl-C to abort … ")
         q_rad_prev = _slew_to_home(driver)
         ee_xyz_now = fk.ee_xyz(q_rad_prev)
-        print(f"[ppo] homed: q_deg={_rad_to_deg(q_rad_prev).round(2)}  "
+        print(f"[ppo] homed: q_sim_rad={q_rad_prev.round(3)}  "
               f"ee_xyz={ee_xyz_now.round(3)} (sim home ≈ (0.247, 0.000, 0.063))")
         if not args.no_confirm:
             input("[ppo] place block within x∈(0.13,0.28), y∈(-0.12,0.12). "
@@ -406,7 +508,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
         next_tick = time.time()
 
         for t in range(MAX_STEPS):
-            q_rad = _deg_to_rad(driver.read_proprio_deg())
+            q_rad = driver.read_proprio_sim_rad()
             qdot_raw = (q_rad - q_rad_prev) / dt
             qdot_filt = (QDOT_EWMA_ALPHA * qdot_raw
                          + (1.0 - QDOT_EWMA_ALPHA) * qdot_filt).astype(np.float32)
@@ -430,7 +532,10 @@ def run(bowl_xy: np.ndarray, args) -> None:
 
             target_rad = _decode_action(action)
             target_rad = _slew_limit(target_rad, q_rad)
-            driver.send_joint_targets_deg(_rad_to_deg(target_rad))
+            driver.send_joint_targets_sim_rad(target_rad)
+
+            if dump_dir is not None:
+                _debug_dump_step(dump_dir, t, image, state, action, q_rad, ee_xy, target_rad)
 
             if (t + 1) % 30 == 0:
                 print(
@@ -446,6 +551,8 @@ def run(bowl_xy: np.ndarray, args) -> None:
                 next_tick = time.time()
     finally:
         driver.disconnect()
+        if dump_dir is not None:
+            print(f"[ppo] debug dump written to {dump_dir}")
 
 
 # ============================================================== entry
@@ -468,6 +575,10 @@ def main() -> int:
                    help=f"HSV upper bound for block mask, default {HSV_HIGH_DEFAULT}")
     p.add_argument("--no-confirm", action="store_true",
                    help="Skip the pre-rollout <enter> prompt and start immediately.")
+    p.add_argument("--debug-dump", action="store_true",
+                   help="Save the wrist image (rgb+mask) and a state/action JSONL "
+                        "per step under bc/runs/deploy/debug/<timestamp>/, so the "
+                        "real rollout can be diffed against a sim play render.")
     args = p.parse_args()
 
     x, y = (float(s) for s in args.bowl_xy.split(","))
