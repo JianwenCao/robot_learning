@@ -25,6 +25,7 @@ from .events import (  # noqa: F401
     init_block_in_gripper,
     randomize_camera_uniform,
     randomize_wrist_image_tint,
+    reset_cube_pos_bias,
     reset_was_grasped,
     reset_was_over_bowl_above_rim,
 )

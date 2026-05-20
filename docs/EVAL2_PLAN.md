@@ -1,247 +1,145 @@
-# Eval 2 — Targeted Pick-and-Place in 2-Cube Clutter
+# Eval 2 — Targeted Pick-and-Place in 2-Cube Clutter (State-Only + AprilTag)
 
-Color-conditioned PPO on SO-ARM101 → zero-shot real-arm deploy. Task: `Isaac-SO-ARM101-ClutterPickPlace-v0`. Same three-stage pipeline as Eval 1 (state teacher → vision distill → vision PPO + teacher critic), re-keyed to the *target* cube and with a goal-conditioned color one-hot. **No teleop is used in Stage 1** — the teacher is pure PPO on privileged state in sim. Teleop is an optional Stage-2 DAgger seed only.
+Color-conditioned PPO on SO-ARM101 → zero-shot real-arm deploy. Task: `Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0`. **Single-stage, camera-free PPO** on privileged state plus a noisy `target_cube_pos_xy` observation filled at deploy by AprilTag pose. No CNN, no FiLM, no Florence-2, no distill.
 
-## 1. MDP
+Assumes the foundational AprilTag plan from [`EVAL1_PLAN.md`](./EVAL1_PLAN.md) — tag family, calibration, sim noise model, detector protocol, training shape are inherited. This doc covers only the Eval-2 deltas: per-cube tags, target ID selection, distractor handling.
+
+---
+
+## 1. What you print
+
+| Item | Quantity | Family | Printed size | Notes |
+|---|---|---|---|---|
+| Cube tags | 1 per cube, up to 6 | `tagStandard41h12` | 15 mm | IDs `0..5`, lookup `{0:red, 1:blue, 2:yellow, 3:green, 4:purple, 5:orange}` |
+| Calibration tag | already printed for Eval 1 | — | 30 mm | Shared across all evals |
+
+For Eval 2 only **2 of the 6** tagged cubes are on the table per rollout, but the policy is colour-agnostic at the obs level — the perception layer just hands it `target_cube_pos_xy`, and the AprilTag detector selects which physical cube is the "target" via `set_target_id(int)`.
+
+## 2. What changes vs Eval 1
+
+| Component | Eval 1 (state + AprilTag) | Eval 2 (state + AprilTag) | Reuse |
+|---|---|---|---|
+| Hand-eye calibration | `deploy/hand_eye.yaml` | same file | **verbatim** |
+| Sim noise model (§6 of Eval 1) | per-axis Gaussian + per-ep bias + pre/post-grasp dropout | same | **verbatim** |
+| `cube_pos_xy_noisy` obs term | single cube | **`target_cube_pos_xy_noisy`** — reads `env._target_cube_idx` to select which cube the noisy xy describes | new but mechanically identical |
+| Policy obs schema | 27-D (= 25 + `cube_pos_xy`) | **27-D** — `target_cube_pos_xy` replaces `cube_pos_xy`; **no `target_color_onehot`** (the AprilTag picks the right cube; the policy doesn't need to know its colour) | almost verbatim |
+| Critic obs | + `block_position`, `is_grasped`, etc. | + `target_block_position`, `distractor_block_position`, `target_is_grasped` (privileged, real cube poses; see §5) | extended |
+| Detector | `AprilTagDetector(set_target_id=0)` static | **`set_target_id(id_for(target_color))` once per rollout** | extension |
+| Network | MLP `[256, 128, 64]` ELU | same | **verbatim** |
+| Training shape | single-stage PPO, ~1–2 h | single-stage PPO, ~2–3 h (more cubes, more dynamics variability) | **verbatim** |
+| Vision pipeline (CNN, FiLM, Florence, distill) | gone | gone | **deleted** |
+
+Net: the actor MLP input dim is **unchanged** between Eval 1 and Eval 2 (the AprilTag detector handles target identity outside the policy). The only deltas are the sim placement event, the critic obs widening for the distractor, the reward additions for the wrong-cube failure mode, and a one-line `set_target_id` call in the deploy outer loop.
+
+This is the key payoff of switching to state+AprilTag for Eval 2: we don't need colour-conditioning in the policy at all. There's no FiLM head, no `target_color_onehot`, no per-colour CNN keypoint allocation problem. The detector picks the right cube; the policy just grasps "the cube whose xy is in my obs."
+
+## 3. MDP
 
 | Item | Value |
 |---|---|
 | Control | 50 Hz (decimation 2, sim 100 Hz) |
-| Episode | 5.0 s = 250 steps (same as Eval 1) |
-| Action | 5 arm joints (absolute around home, `scale=0.5`) + 1 binary gripper (`open=0.5`, `close=0.0`) — verbatim from Eval 1 |
-| Workspace | bowl: `x ∈ [0.15, 0.28] m`, `y ∈ [−0.12, 0.12] m`; cluster center: `x ∈ [0.15, 0.22]`, `y ∈ [−0.10, 0.10]` |
+| Episode | 5.0 s = 250 steps |
+| Action | 5 arm joints (`scale=0.5`) + 1 binary gripper — verbatim from Eval 1 |
+| Workspace | bowl: `x ∈ [0.15, 0.28]`, `y ∈ [−0.12, 0.12]`; cluster center: `x ∈ [0.15, 0.22]`, `y ∈ [−0.10, 0.10]` |
 | Home `q` | `(0, 0, 0, 1.5708, 0, 0)`, gripper open |
-| Terminations | `time_out`, `block_off_table_any` (any of the six cubes off-table) |
-| Table | `0.6 × 1.0 × 0.02 m` at `(0.25, 0, −0.01)`; top `z=0` |
+| Terminations | `time_out`, `block_off_table_any` |
+| Table | `0.6 × 1.0 × 0.02 m` at `(0.25, 0, −0.01)`; top `z = 0` |
 
-**Scene composition.** Six 2 cm `CuboidCfg` primitives, one per palette color: **blue, yellow, purple, orange, green, red**. The Eval-1 NVIDIA `dex_cube` USD can't be re-tinted per env, so cubes are primitives with `PreviewSurfaceCfg` colors baked in. Friction is tuned (`static=dynamic=1.0`, `mass=0.020 kg`) to replicate the dex_cube's grippability under the binary gripper.
+**Scene composition.** Six 2 cm `CuboidCfg` cubes baked with the six palette colours. Per reset, `TargetColorCommand` samples (i) two distinct colours from the palette as the *active pair* and (ii) one of those two as the *target*. `place_clutter_blocks` places the active pair adjacent (`half_separation = 0.0105 m` → 2.1 cm center-to-center, 1 mm spawn gap closing to contact under gravity, pair axis θ ∈ U[0, 2π)); the other four cubes are parked at `HIDDEN_PARK_XY` off-table. Bowl is rejection-sampled vs the active pair (`ClusterBowlPoseCommandCfg`, `≥ 0.15 m` from each active cube; unchanged from the vision-era plan).
 
-**Active-pair sampling.** Per reset, `TargetColorCommand` samples (i) two distinct colors from the palette as the *active pair* and (ii) one of those two as the *target*. The active pair is placed adjacent in the workspace by `place_clutter_blocks`; the other four cubes are teleported to `HIDDEN_PARK_XY` slots off-table where the wrist camera can't see them. **Cubes are attached (no margin)** — `half_separation=0.0105 m`, i.e. cube centers 2.1 cm apart, leaving a 1 mm face-to-face gap at spawn that closes to true contact under gravity within a sim step. The 1 mm exists only to avoid PhysX initial-interpenetration artifacts; the real-eval setup places the two blocks touching, so we match that. Pair axis `θ ∈ U[0, 2π)` so orientation is fully randomized.
+**Why we still randomize colour at the sim level even though the policy doesn't see it.** The privileged critic still uses `target_block_position` vs `distractor_block_position`, and the `place_clutter_blocks` event must know which of the two active cubes is "target" so it can wire up the right reward gates. Colour is the bookkeeping handle; the policy itself is colour-blind.
 
-**Bowl.** 2-D goal from `ClusterBowlPoseCommandCfg` — **no scene prim**, **rejection sampling against the active cube pair**. Generalizes Eval 1's `BowlPoseCommand` (single-asset rejection) to the two-cube case: reads `env._active_cube_indices` written by `place_clutter_blocks`, then resamples bowl xy up to 16× until `‖bowl_xy − cube_xy‖ ≥ 0.15 m` for *both* active cubes in robot frame. Same `(x, y)` frame at deploy. (Without rejection, ~5–10 % of resets land the bowl on top of the cluster, giving the policy free "block already in bowl" reward signal.)
-
-## 2. Observations (asymmetric A-C)
-
-`ObservationsCfg` defines three groups; runner cfgs select per stage (§7).
-
-| Group | Fields | Shape |
-|---|---|---|
-| `policy` (deployable) | `joint_pos_rel`, `joint_vel_rel`, `gripper_state`, `bowl_xy`, `ee_proj_xy`, `ee_to_bowl_xy`, **`target_color_onehot`** (6-D), `last_action` | 1-D |
-| `critic` (privileged) | `policy` + `target_block_position`, `distractor_block_position`, `target_block_to_bowl_xy`, `target_gripper_to_block`, `target_is_grasped` | 1-D |
-| `wrist_image` | **RGB + target_mask** (per-color instance mask, target-keyed) | `(N, 4, 72, 128)` |
-
-Wrist `TiledCamera`: same mount and intrinsics as Eval 1 — parented to `gripper_link` at `pos=(-0.001, 0.1, -0.04)`, ros quat `(-0.404379, -0.912179, -0.0451242, 0.0486914)`. Renders `["rgb", "semantic_segmentation"]` (`colorize_semantic_segmentation=False`). Each cube carries a unique `class:cube_<color>` tag; `mdp.wrist_rgb_mask_dr` filters the seg image to the *target* cube per env (via `env._target_cube_idx`) and concatenates that binary mask as the 4th channel. The class-id lookup happens once on first render and is cached on the camera object. At deploy the same mask comes from **Florence-2** prompted by the target color (`f"{color_name} cube"`) — empirical HSV thresholding proved brittle at the cube's working distance (no mask when far + lighting drift). The mask channel is corrupted in sim to match Florence-2's noise profile (small-area dropout, morphology, full dropout, wrong-color swap) — see §5.
-
-When `wrist_image` is absent from `obs_groups` (Stage 1 teacher), the CNN auto-disables → pure MLP A-C.
-
-## 3. Network — `ClutterPickPlaceVisionActorCritic`
-
-Same architecture as Eval 1's `pretrained-backbone PPO path` (commit `903ef6b`): **frozen ImageNet ResNet-18 trunk → trainable 1×1 conv → Levine-style spatial-softmax head → 128-D keypoints**. We reuse `_ResNetSpatialSoftmaxCNN` from `tasks/pickplace/agents/vision_actor_critic.py` verbatim with `in_channels=4` (RGB + target_mask). The class auto-inflates `conv1` to 4 input channels at construction — RGB filters keep the ImageNet weights; the mask channel is initialized to the RGB-channel mean so the trunk's activation statistics are preserved. `img_in_shape` is derived from the observation manager's `wrist_image` group shape, so the channel switch is picked up automatically; no agent-cfg change is required.
-
-```
-wrist_image (3×72×128) ──[ResNet-18 trunk (frozen, ImageNet)]── (128, 9, 16) feat
-                       ──[1×1 conv → 64 ch]── per-channel softmax → soft-argmax (x,y) → 128-D kpts ─┐
-state (policy, incl. target_color_onehot) ──────────── concat ── MLP[256,128,64] ── μ (σ scalar Param)
-critic state (policy+critic) ─────────────────── MLP[256,128,64] ── V(s)
-```
-
-**Truncation choice — `layer2`, not `layer3`.** Current `_ResNetSpatialSoftmaxCNN` truncates at `layer3`, which for our 72×128 input gives `(256, 4, 8)` — 32 spatial cells, each covering ~18×16 input pixels. A 2 cm cube at the wrist-cam working distance projects to ~12–18 pixels (≈ 1 cell), so soft-argmax precision is ~1.5 cm physical — same order as the cube edge. For Eval 2 we **switch the trunk to end at `layer2`** → output `(128, 9, 16)` = 144 cells, ~3 mm precision, and the 1×1 conv input dim drops from 256 → 128 (cheaper). Layer3 features were tuned for ImageNet's 224×224; at 72×128 they're over-downsampled. One-line change in `_ResNetSpatialSoftmaxCNN.__init__` (drop `backbone.layer3` from the trunk Sequential).
-
-DrQ ±4 px replicate-pad-and-crop training-only, in `_encode_actor` (Stage 3) AND `ClutterPickPlaceVisionStudentTeacher._encode_student` (Stage 2).
-
-### 3.1 Goal conditioning — FiLM at the trainable head
-
-The naïve approach — concat the target_color one-hot to the *MLP* input only, after the CNN — leaves the CNN blind to the goal. The CNN produces 64 unlabeled "blob center" keypoints, and the MLP has to implicitly learn a 6-way gated indexing ("if target=red, attend to keypoint 17"). Learnable from PPO gradient, but brittle and slow.
-
-Instead we condition the CNN itself via **FiLM** (Perez et al., AAAI 2018), injected at the only trainable image-path layer — the 1×1 conv head:
+## 4. Observations
 
 ```python
-gamma, beta = self.film_mlp(target_color_onehot)   # MLP[6 → 256], output split → two (N, 256)
-feat = self.trunk(rgb)                              # frozen, (N, 256, 9, 16)
-feat = gamma[..., None, None] * feat + beta[..., None, None]
-heat = self.head(feat)                              # trainable 1×1 conv to 64 ch
-# spatial-softmax as before → 128-D kpts
+# Both groups; runner cfg uses obs_groups = {"policy": ["policy"], "critic": ["policy", "critic"]}.
 ```
 
-Effect: each of the 64 keypoint channels becomes *color-conditional*. The same physical keypoint can lock onto "red blob center" when target=red and "yellow blob center" when target=yellow, instead of allocating one keypoint per color in a static unsupervised partition. Cost is ~3 k extra params (one tiny MLP) — negligible against the 64-ch 1×1 conv.
+| Group | Fields | Notes |
+|---|---|---|
+| `policy` (deployable) | `joint_pos_rel`, `joint_vel_rel`, `gripper_state`, `bowl_xy`, `ee_proj_xy`, `ee_to_bowl_xy`, **`target_cube_pos_xy_noisy`** (2), `last_action` | 27-D, no `target_color_onehot` |
+| `critic` (privileged) | `policy` + `target_block_position` (3), `distractor_block_position` (3), `target_block_to_bowl_xy` (2), `target_gripper_to_block` (3), `target_is_grasped` (1) | extends Eval 1 critic with one distractor pose |
 
-The one-hot **also** flows into the actor MLP as a normal state input — belt-and-suspenders. The MLP can still use it for non-visual decisions (e.g., bowl approach angle differs by target's relative bowl distance).
+The distractor pose is in the critic so the value function understands the "wrong-cube" failure mode; the policy only sees the (noisy) target xy. The AprilTag detector at deploy holds the equivalent semantics — when you call `set_target_id(2)`, the detector returns the pose of tag-ID-2 even if tag-ID-3 is also visible.
 
-Why FiLM at the head, not early concat or unfrozen-conv1:
+`target_cube_pos_xy_noisy` shares the §6-of-Eval-1 noise model verbatim: 2 mm Gaussian + ±5 mm per-ep bias + Bernoulli 10 % pre-grasp dropout + post-grasp deterministic hold via `is_grasped`. The hold-on-grasp condition is keyed on the *target* `is_grasped` flag, not any cube — the distractor being occluded by the gripper doesn't matter because we never read its xy from the obs side.
 
-- Early concat (tile 6-D one-hot → 9-channel input) requires `conv1` to learn to use the new modality, which means unfreezing conv1 — and the binary `{0,1}` one-hot channels have wrong scale vs ImageNet-RGB. Loses the "frozen trunk = stable PPO" property.
-- FiLM is the standard goal-conditioning recipe in language-conditioned manipulation (CLIPort) and goal-conditioned RL — well-validated for exactly this categorical-goal-over-image setup.
+## 5. Reward
 
-If FiLM plateaus in Stage 3 (e.g., < 60 % target-correct after 1500 iters), switch to §8's HSV mask channel — modular perception bypasses the CNN's color-grounding step entirely.
-
-**Why frozen ResNet-18 + spatial-softmax head (not from-scratch small CNN).** Four reasons inherited from the Eval-1 class docstring:
-
-1. **ImageNet features are domain-general.** Real-world lighting and color variation that sim DR can't perfectly cover are inside ImageNet's pretraining distribution. Critical for Eval 2 because color discrimination is now load-bearing.
-2. **Frozen trunk = stable PPO.** The most common visual-PPO failure mode in this repo is encoder gradients fighting RL gradients. With `requires_grad=False` on the trunk, only the 1×1 conv + spatial softmax + downstream MLPs see PPO gradients. Also keeps BatchNorm running stats from drifting under PPO's non-stationary rollouts (Wu & He, GroupNorm ECCV 2018).
-3. **Spatial-softmax inductive bias kept.** ResNet features by themselves are not localization-friendly; the 1×1 conv re-projects to per-keypoint heatmaps and the soft-argmax extracts (x, y) coords. So we get ImageNet color/texture features **and** the Levine-2016 keypoint geometry head — not ResNet → flatten → MLP.
-**Wiring note.** As of writing, `PickPlaceVisionActorCritic.__init__` still hardcodes `_ImpalaSmallCNN` at the two `self.actor_cnn` / `self.critic_cnn` instantiation sites (lines ~456 / 460). For Eval 2 we add a `cnn_class: str = "resnet"` cfg arg to `ClutterPickPlaceVisionActorCriticCfg` and dispatch to `_ResNetSpatialSoftmaxCNN` when set. Same gap exists for Eval 1's pretrained-backbone runs — fixing it in one place benefits both.
-
-**GPU budget note.** ResNet-18 layer1–layer2 is ~700 k params (down from ~11 M at layer3). Frozen → no gradient memory, but activation tensors through 64-ch (layer1) and 128-ch (layer2) feature maps at the rollout batch are still real. With `num_envs=1024` and rollout `num_steps=16`, that's 16 384 images per forward pass — ResNet activations at the larger spatial resolution will pressure VRAM more than Eval 1's 50 k-param CNN. Plan to drop to 768 envs if OOM; only fall back to a smaller backbone if 768 still doesn't fit.
-
-## 4. Reward (`mdp/rewards.py`)
+Same skeleton as Eval 1, plus two clutter-specific terms (`mdp/rewards.py`):
 
 | Term | Weight | Trigger |
 |---|---|---|
-| `reaching_object` (reach_target_block) | 1.0 | `1 − tanh(‖ee − target_block‖ / 0.05)` |
-| `lifting_object` (target_grasp_event) | 15.0 | `𝟙[target_block_z > 0.07]` |
-| `object_goal_tracking` (target_transport_to_bowl) | 16.0 | `(1 − tanh(‖target − goal‖ / 0.30)) · 𝟙[target_z > 0.025]` |
-| `object_goal_tracking_fine_grained` | 5.0 | same at `std=0.05` |
-| `release_in_bowl` (release_target_in_bowl) | 30.0 | target block near bowl ∧ `z<0.06` ∧ gripper open ∧ settled, gated on lift latch + over-bowl-above-rim latch (same recipe as Eval 1) |
+| `reaching_object` | 1.0 | `1 − tanh(‖ee − target_block‖ / 0.05)` |
+| `lifting_object` | 15.0 | `𝟙[target_block_z > 0.07]` |
+| `object_goal_tracking` (+ fine-grained) | 16.0 + 5.0 | as Eval 1 |
+| `release_in_bowl` | 30.0 | target near bowl ∧ `z < 0.06` ∧ gripper open ∧ settled, gated on lift + over-bowl-above-rim latches |
 | **`distractor_disturb`** | **−0.5** | continuous penalty proportional to distractor linear speed once `> 0.05 m/s` |
-| **`wrong_block_in_bowl`** | **−20.0** | distractor cube settled in bowl (heavy enough that net reward of misplacement < net reward of correct placement at `release=+30`) |
-| `action_rate`, `joint_vel` | −1e-4 → −1e-2 | ramp at 10 k env-steps |
+| **`wrong_block_in_bowl`** | **−20.0** | distractor cube settled in bowl |
+| `action_rate`, `joint_vel` | −1e-4 → −1e-2 | 10 k env-step ramp |
 
-Two per-episode latches (cleared by `reset_target_latches`):
+Sizing: `wrong_block_in_bowl = −20` is intentionally smaller than `release_in_bowl = +30` so that a correct final placement (even after disturbing the distractor en route) still wins net — the spec encourages distractor interaction when it helps. `distractor_disturb = −0.5` keeps the policy from gratuitous sweeping but doesn't hard-block contact.
 
-- **Lift latch 0.07 m** — `target_block_z > 0.07` ⇒ cube_bottom clears the real bowl's 5 cm rim.
-- **Over-bowl-above-rim latch 0.08 m** — forces above-rim approach; closes the sim/real rim gap.
+γ = 0.98 load-bearing for the same reason as Eval 1 (long dense tail; 250-step episode, release fires deep).
 
-No `task_success` termination — same logic as Eval 1: success termination would let "hover the right cube" beat "release and stay". `release_target_in_bowl=30` pays every post-release step until time-out. `γ=0.98` remains load-bearing (long dense tail).
+## 6. Curriculum & DR
 
-**Distractor-disturb sizing rationale.** The wrong-block penalty of −20 is comparable to but smaller than the +30 release reward, so a *correct* final placement (even after disturbing the distractor en route) still wins net. This is intentional — adjacency means a clean grasp sometimes requires light contact with the distractor, and Eval 3's spec explicitly encourages non-target interaction. Hard-blocking distractor motion would inject a structural local optimum (hover-without-grasping).
-
-**No contact sensors.** Eval 1 used a `ContactSensor` filtered to the dex_cube prim path. Here the "target" varies per episode, so the filter prim paths would have to be patched at reset; we drop the contact reward and rely on the kinematic lift latch (`target_block_z > 0.07`) instead — that recipe worked for Eval 1's vision teacher.
-
-## 5. Curriculum & DR (`mdp/events.py`, `CurriculumCfg`)
-
-Both stages:
-- `place_clutter_blocks`: cluster center in `(0.15, 0.22) × (−0.10, 0.10)`, **`half_separation=0.0105` (fixed; cubes attached, 1 mm spawn gap closing to contact under gravity)**, pair axis `θ ∈ U[0, 2π)`.
+- `place_clutter_blocks`: cluster center in `(0.15, 0.22) × (−0.10, 0.10)`, fixed `half_separation = 0.0105 m`, pair axis θ ∈ U[0, 2π).
 - `reset_target_latches`: clears per-episode lift / over-bowl latches.
-- Action-rate / joint-vel penalty ramp −1e-4 → −1e-2 at 10 k env-steps.
-- `log_target_success_metrics` TB metric (target-correct success rate + wrong-block placement rate).
+- `reset_cube_pos_bias`: per-episode U[−5, +5] mm bias on `target_cube_pos_xy_noisy` (§6 of Eval 1).
+- Action-rate / joint-vel penalty ramp at 10 k env-steps.
+- `log_target_success_metrics` TB metric (target-correct success + wrong-block placement rate).
 
-DR (in env cfg — applies on every reset, including Stage 1 teacher; teacher just doesn't read the image so the wasted compute is one CPU/GPU write of a few floats per env per reset):
-- `randomize_wrist_image_tint`: per-channel **linear scale `U(0.55, 1.45)`** + **brightness shift `U(−0.20, +0.20)`**. Much wider than Eval 1's ±15 %; widened because color discrimination is now load-bearing.
-- `randomize_wrist_hsv_dr`: **hue rotation `±20°`** in linear RGB, saturation scale `U(0.65, 1.35)`, value scale `U(0.55, 1.45)`. **This is the sim2real-critical DR term for color-conditioned tasks** — hue rotation simulates white-balance / colored-ambient drift that linear tint can't model. Without HSV jitter, the policy memorizes the sim renderer's exact color rendition and fails on any USB-cam white-balance offset.
+**No image DR**, no HSV jitter, no mask corruption, no DrQ. Camera-free training.
 
-Stage 3 adds (training-only, in the model):
-- DrQ ±4 px (in CNN, see §3).
+**No xy expand or separation curriculum** (same as the Eval-2 vision plan): cluster band is already tight and cubes are always attached. If Stage-1 stalls, the fallback is a *separation* curriculum (`half_separation` 0.025 → 0.0105 over 20 k env-steps), one-line change in `events.py`.
 
-Per-step mask-channel DR (in `mdp.wrist_rgb_mask_dr`, gated by the obs `corrupt=True` param; Play cfgs disable):
+## 7. Network & PPO
 
-| Failure mode at deploy | DR term | Default |
-|---|---|---|
-| Florence loses cube when small/far in frame | Small-area dropout — zero the mask when total mask pixels `< mask_min_pixel_area` | 8 px |
-| Edge-pixel jitter on Florence output | Per-env erode/dilate with radius uniform in `[-R, R]` | `R = 2 px` |
-| Florence occasional total miss | Per-env Bernoulli full-frame mask dropout | `p = 0.10` |
-| Florence misclassifies under bad WB → wrong cube masked | Per-env Bernoulli swap to distractor's instance mask | `p = 0.03` |
+Pure MLP actor-critic, identical class to Eval 1's state-only path. RSL-RL `ActorCritic`, `[256, 128, 64]` ELU, σ scalar Param.
 
-The wrong-color-swap term is the load-bearing one for multi-cube robustness: without it, a single Florence misfire that masks the distractor is a catastrophic single-step failure; with it, recovery is in-distribution.
+| | State PPO (`state_apriltag_ppo_cfg.py`) |
+|---|---|
+| `num_envs` | 2048 (halved from 4096 — 6 cubes per env makes physics ~3-4× heavier) |
+| `num_steps_per_env` | 32 |
+| `max_iterations` | 2000 (vs Eval 1's 1500; extra cube dynamics need more samples even without colour discrimination) |
+| `init_noise_std` | 1.0 |
+| `entropy_coef` | 0.006 |
+| `epochs / mini-batches` | 5 / 4 |
+| `learning_rate / desired_kl` | 1e-4 / 0.01 |
+| `γ / λ / clip / max_grad_norm` | 0.98 / 0.95 / 0.2 / 1.0 |
+| `experiment_name` | `clutterpickplace_state_apriltag` |
+| `obs_groups` | `{"policy": ["policy"], "critic": ["policy", "critic"]}` |
 
-**No xy expand or separation curriculum.** Eval 1 used `expand_block_xy_range` (±3 cm → ±7×±12 cm). For Eval 2 the cluster band is already tight (≤ 7 cm × ≤ 20 cm) and cubes are always attached (no margin to schedule). If Stage 1 fails to converge on the attached case, the fallback is a *separation* curriculum: start `half_separation=0.025` (4 cm face-gap, Eval-1-like difficulty) for the first 5 k env-steps and ramp down to `0.0105` over the next 20 k. One-line change in `events.py` to make `half_separation` curriculum-driven.
+Wall-clock: ~2–3 h to ≥ 75 % sim success (estimate; tighten after first run).
 
-Deferred to deploy (not in sim DR yet): cube/table material DR, HDRI background, motion blur / JPEG, distractors beyond the active pair.
-
-## 6. PPO config
-
-Same skeleton as Eval 1 — small deltas to account for color discrimination needing more samples.
-
-| | Stage 1 teacher (`teacher_ppo_cfg.py`) | Stage 3 vision PPO (`rsl_rl_ppo_cfg.py`) |
-|---|---|---|
-| `num_envs` | **2048** (`_multicube_sim.DEFAULT_TRAIN_NUM_ENVS`; halved from Eval 1's 4096 because 6 cubes/env makes physics ~3–4× heavier) | 1024 (image rollouts; drop to 768 if OOM with ResNet trunk) |
-| `num_steps_per_env` | 32 (matches Eval 1 teacher) | 16 |
-| `max_iterations` | 1500 (matches Eval 1 — env-step budget ~98 M, same as Eval 1) | 2500 (vs Eval 1's 2000; color discrimination needs more samples) |
-| `init_noise_std` | 1.0 | 0.5 (forced; distill saves 0.1) |
-| hidden dims | `[256, 128, 64]` ELU | `[256, 128, 64]` ELU + spatial-softmax CNN |
-| `entropy_coef` | 0.006 | 0.006 → 0.003 (after ~700 iters; later than Eval 1 because target-color exploration matters longer) |
-| epochs / mini-batches | 5 / 4 | 8 / 16 |
-| `learning_rate` / `desired_kl` | 1e-4 / 0.01 | 1e-4 / 0.005 |
-| `gamma / lam / clip / max_grad_norm` | 0.98 / 0.95 / 0.2 / 1.0 | same |
-
-```python
-# Stage 1: symmetric on privileged state (includes target_color_onehot)
-obs_groups = {"policy": ["policy", "critic"], "critic": ["policy", "critic"]}
-# Stage 2 (distill_cfg.py): vision student, state teacher
-obs_groups = {"policy": ["policy", "wrist_image"], "teacher": ["policy", "critic"]}
-# Stage 3: vision actor, privileged critic (no image to critic)
-obs_groups = {"policy": ["policy", "wrist_image"], "critic": ["policy", "critic"]}
-```
-
-Stage-1 critic and Stage-3 critic take identical inputs → teacher critic loads layer-for-layer via `load_state_dict(strict=False)`. The state schema is wider than Eval 1 (one-hot adds 6 dims, distractor pose adds 3 dims), so Eval-1 teacher checkpoints **do not** transfer; the Eval 2 teacher is trained from scratch.
-
-## 7. Three-stage pipeline
-
-- **Stage 1 — state teacher.** Task `…-ClutterPickPlace-Teacher-v0` (to register). MLP A-C on `policy + critic`. Pure PPO on privileged state in sim. **No teleop, no demos** — the teacher has direct access to the target block pose via `target_block_position`, and the color one-hot is in the state, so the MDP is fully learnable from PPO on the dense reward stack. Saves `actor.*` + `critic.*`.
-- **Stage 2 — short distill.** Task `…-ClutterPickPlace-Student-v0` (to register). RSL-RL `DistillationRunner`, MSE, on-policy DAgger. `ClutterPickPlaceVisionStudentTeacher` regresses teacher actions on `policy + wrist_image`. **Not to convergence** — 200–500 iters, stop when target-correct success ~30–50 %. Optional: seed the DAgger buffer with teleop trajectories of grasping each color in adjacent-cluster scenes (spec encourages teleop "for training efficiency"; useful precisely because Stage 2 is the modality bridge and demos cheapen the color-grounding warm-up). **Strictly optional** — pipeline works without it.
-- **Stage 3 — vision PPO from warm-start.** Task `…-ClutterPickPlace-v0` (registered). `ClutterPickPlaceVisionActorCritic.load_state_dict` routes distill `student_cnn.* / student.*` → `actor_cnn.* / actor.*`. Trains on §4 reward to convergence with `--teacher_ckpt` critic overlay.
-
-### 7.1 Five Stage-3 interventions (inherited from Eval 1)
-
-| # | Fix | Location | Solves |
-|---|---|---|---|
-| 1 | DrQ in `_encode_student` | `vision_student_teacher.py` | Distribution shift at Stage 2→3 boundary |
-| 2 | Drop loaded `std`; reinit from `init_noise_std=0.5` | `vision_actor_critic.load_state_dict` distill branch | Distill's `std=0.1` too narrow for binary gripper + color exploration |
-| 3 | `gamma=0.98` (match teacher) | `rsl_rl_ppo_cfg.py` | `release_target_in_bowl=30` needs long horizon |
-| 4 | Wider wrist-tint DR (`scale 0.7–1.3`) | `EventCfg.randomize_wrist_tint` | Color discrimination must be lighting-invariant |
-| 5 | **`--teacher_ckpt` overlays teacher `critic.*` after distill warm-start** | `scripts/rsl_rl/train.py` | Random critic produces O(magnitude)-noisy advantages → degrades actor in ~50 iters |
-
-#5 is the asymmetric-AC handoff (Pinto 2018): teacher critic anchors V; PPO's value regression moves V_teacher → V_student over ~100–500 iters. Same load-bearing piece as Eval 1.
-
-### 7.2 Workflow
+## 8. Deploy
 
 ```bash
-# Stage 1 (no teleop, no warm-start — train from scratch)
-train --task Isaac-SO-ARM101-ClutterPickPlace-Teacher-v0 --headless --enable_cameras
-
-# Stage 2 (NOT to convergence; teleop seed optional)
-train --task Isaac-SO-ARM101-ClutterPickPlace-Student-v0 --headless --enable_cameras \
-      --load_run <teacher_run> --checkpoint model_<best>.pt
-
-# Stage 3
-train --task Isaac-SO-ARM101-ClutterPickPlace-v0 --resume --headless --enable_cameras \
-      --num_envs 1024 \
-      --load_run <distill_run> --checkpoint model_<best>.pt \
-      --teacher_ckpt logs/rsl_rl/clutterpickplace_teacher/<teacher_run>/model_<best>.pt
+# Per-rollout: pick a target colour, look up its tag ID, set it on the detector.
+python -m deploy.deploy_real \
+    --mode eval2 \
+    --target-color red \
+    --bowl-xy 0.22,0.0 \
+    --target-id-map "0=red,1=blue,2=yellow,3=green,4=purple,5=orange"
 ```
 
-`--enable_cameras` mandatory on all stages — env scene cfg spawns `TiledCamera` even for the teacher (camera prim instantiation requires the flag; output discarded when `wrist_image` is absent from `obs_groups`). Same symlink dance for `--load_run` as in Eval 1 `RUNNING.md` §5.1.
+Per-step data flow (delta from Eval 1 §9):
+1. `AprilTagDetector.set_target_id(id_for(target_color))` is called **once at outer-loop start**, not per step.
+2. `pose(rgb, T_base_ee) → ((x, y), valid)` returns only the pose of the requested tag, even if other tags are in frame.
+3. Everything else identical to Eval 1.
 
-## 8. Visual modality — RGB + target instance mask
+`deploy_real.py` is the single state-only deploy entry point — same script serves Eval 1 / Eval 2 / Eval 3. `--mode eval2` exposes the `--target-color` knob that maps through `--target-id-map` to a `set_target_id` call. The old `PPOActorClutter` (ResNet+FiLM) and `deploy_real_clutter.py` have been removed; `PPOActorState` serves all three eval tasks.
 
-`(N, 4, 72, 128)`:
+## 9. Risks and notes
 
-| Ch | Sim | Real |
-|---|---|---|
-| 0–2 | TiledCamera `rgb` → `/255`, per-episode tint + HSV DR | USB cam → `cv2.undistort` → resize → `/255` |
-| 3 | Per-color instance mask (`semantic_segmentation` filtered to `class:cube_<target>`), corrupted to mimic Florence-2 | Florence-2 prompted with `f"{target_color} cube"` (via `deploy/cube_detector.py`'s `Detector` protocol) |
-
-**Why mask channel.** HSV thresholding at the cube's working distance was empirically too brittle (no mask when the cube is far in frame, lighting-induced false positives on bowl/table). Florence-2 with a color prompt is robust to those failure modes; the cost is per-frame inference latency (~2–5 s on CPU at deploy), which is mitigated by running detection on a background thread at ~0.3–0.5 Hz while the policy runs at 25 Hz. The target_color one-hot still flows into the actor state + CNN FiLM head (§3.1) so that when the mask channel is zero (detector miss or distance-gated dropout) the policy can still operate from RGB alone — belt-and-suspenders, not redundant.
-
-**Why this beats "FiLM-only colour grounding under DR."** The FiLM-only path forces PPO to learn the colour discrimination from sparse RL gradient under lighting DR — measured Stage-3 budget ~2500 iters. With the mask channel the visual problem collapses to "go to the white pixels" (same shape as Eval 1), at the cost of training Stage 2/3 against Florence-quality mask quality rather than GT. The §5 mask DR is what closes that gap.
-
-If a particular colour pair plateaus despite the mask channel (Florence misclassifies under deploy lighting), the next escalation is a learned color-classifier head on the policy CNN; not implemented by default.
-
-## 9. Why we don't use teleop in Stage 1
-
-Eval 2's spec says "expert data collected from teleoperation is encouraged to use for training efficiency." This is about **vision** efficiency, not state-MDP efficiency. The Stage 1 teacher sees the full target pose, distractor pose, and target one-hot in its observation — there is no perception bottleneck to bridge with demos, and PPO on the §4 reward stack is the right tool. Teleop demos are only useful where the input modality is hard to map to actions (i.e., Stage 2's image-to-action regression), which is why the Eval-1 §7 distill is also the natural place to inject them here.
-
-The flip side: if Stage 1 fails to converge (e.g., the color-conditioned grasp doesn't emerge from PPO alone), the diagnosis is reward shape or curriculum, **not** demo deficit. Adding teleop to Stage 1 would mask the real problem.
-
-## 10. Implementation status
-
-All wiring TODOs (items 1–5) are implemented as of the latest commit:
-
-1. ✅ **CNN dispatch** — `PickPlaceVisionActorCritic.__init__` now accepts `cnn_class: str = "small"` and `cnn_kwargs: dict | None = None`. `"small"` (default) preserves Eval-1 behavior; `"resnet"` instantiates `_ResNetSpatialSoftmaxCNN(**cnn_kwargs)`.
-2. ✅ **ResNet truncation** — `_ResNetSpatialSoftmaxCNN.__init__` accepts `truncate_at: str = "layer3"`; passing `"layer2"` drops `backbone.layer3` and yields a `(128, 9, 16)` feature map at 72×128 input.
-3. ✅ **FiLM head** — `_ResNetSpatialSoftmaxCNN.__init__` accepts `film_cond_dim: int = 0`; when > 0, a small `film_mlp` (cond → 64 → 2C) modulates the trunk output before the 1×1 conv. γ-init=1 / β-init=0 means identity at init. `forward()` takes an optional `film_cond` kwarg (None → no modulation).
-4. ✅ **Task registrations** — `tasks/clutterpickplace/__init__.py` registers `…-v0`, `…-Play-v0`, `…-Teacher-v0`, `…-Teacher-Play-v0`, `…-Teacher-Fast-v0`, `…-Teacher-Fast-Play-v0`, `…-Student-v0`, `…-Student-Play-v0`. All carry `rsl_rl_cfg_entry_point`.
-5. ✅ **Agent module** — `tasks/clutterpickplace/agents/` contains `teacher_ppo_cfg.py`, `rsl_rl_ppo_cfg.py`, `distill_cfg.py`, `vision_actor_critic.py` (subclass), `vision_student_teacher.py` (subclass). Subclasses read the `goal` obs group and pass its one-hot to the CNN's FiLM head.
-6. ⏳ **`reset_scene_to_default` ordering** — verification step. Run the `Teacher-Fast-Play-v0` zero-agent rollout to confirm cubes stay at the `place_clutter_blocks` xy and don't snap back to CuboidCfg `init_state.pos` after the event.
-
-The `ObservationsCfg` was restructured: `target_color` moved out of `policy`/`critic` into a separate `goal` group, so the vision A-C can route it to FiLM without slicing-by-position.
+- **Two visible tags vs one.** `pupil-apriltags` localizes each tag independently; cross-tag interference is not a failure mode at our tag sizes. The detection rate may drop slightly when two tags overlap in the wrist-cam frame (one partially covers the other), but the §6-of-Eval-1 dropout DR (Bernoulli p = 0.10 pre-grasp) covers this.
+- **No colour-grounding problem at all.** This is the simplification compared to the old vision plan — the FiLM head, the wrong-colour-swap mask DR, the HSV deploy-time prompting — all gone. If the detector knows which tag-ID it should return, the colour discrimination problem doesn't exist.
+- **Distractor pose isn't filled at deploy.** The policy doesn't see it (it's critic-only at train), so deploy doesn't need to detect the distractor. If you ever want to read the distractor pose at deploy for diagnostics or scheduler logic, the same `AprilTagDetector` can be queried with a second tag ID — but it's not on the policy hot path.
+- **No `target_color_onehot` in obs** means Eval-2 checkpoints **cannot** be evaluated against an arbitrary colour at deploy without re-keying the detector. That's a feature: the policy is colour-blind because the detector has already picked the right cube; if you want a different cube, change the `set_target_id` call, not the policy input.
 
 ## References
 
-- **Code:** `tasks/clutterpickplace/{clutterpickplace_env_cfg,joint_pos_env_cfg}.py`, `mdp/{observations,rewards,events,terminations,commands}.py`, agents (to add): `{vision_actor_critic,vision_student_teacher,rsl_rl_ppo_cfg,teacher_ppo_cfg,distill_cfg}.py`. Eval-1 plan: [`EVAL1_PLAN.md`](./EVAL1_PLAN.md).
-- **Pinto et al.**, *Asymmetric Actor Critic*, RSS 2018. <https://arxiv.org/abs/1710.06542>
-- **Levine et al.**, *End-to-End Visuomotor Policies*, JMLR 2016 — spatial softmax.
-- **Kostrikov et al.**, *DrQ*, ICLR 2021. <https://arxiv.org/abs/2004.13649>
-- **Zhou et al.**, *Versatile and Generalizable Manipulation via Goal-Conditioned RL with Grounded Object Detection*, 2025. <https://arxiv.org/abs/2507.10814> — goal-conditioned RL with explicit target representation (we use a color one-hot in their place).
-- **Danielczuk et al.**, *Visuomotor Mechanical Search*, ICRA 2021. <https://arxiv.org/abs/2008.06073> — teacher-guided RL for retrieving a known target from clutter; closest published analog.
+- Foundation: [`EVAL1_PLAN.md`](./EVAL1_PLAN.md) — calibration, detector, sim noise model.
+- Code: `tasks/clutterpickplace/{clutterpickplace_env_cfg,joint_pos_env_cfg}.py`, `mdp/{events,observations,rewards,terminations,commands}.py`, `agents/state_apriltag_ppo_cfg.py`. Real-robot deploy: `deploy/{deploy_real.py,cube_detector.py}`.
 - **RSL-RL**, Schwarke et al., 2025. <https://github.com/leggedrobotics/rsl_rl>
-- **LeIsaac**, <https://github.com/LightwheelAI/leisaac> — wrist camera mount.

@@ -9,16 +9,19 @@ Scene shape mirrors Eval-2/3 (six color cubes, gray table, robot, wrist
 cam). Per-episode event :func:`mdp.sample_active_set` randomizes:
 
 * how many cubes are in the workspace (3 or 4),
-* their arrangement (vertical stack vs flat cluster), and
-* which palette colors fill the active slots.
+* their arrangement (one of 11 families — stacks, flat clusters,
+  pyramids, mixed; see ``mdp.events.ARRANGEMENT_SPECS``),
+* which palette colors fill the active slots,
+* yaw of the whole arrangement.
 
-No bowl. No goal-color command. The policy is conditioned only on
-``n_active_onehot`` (2-D) + ``arrangement_onehot`` (2-D) so it can adapt
-its strategy to the initial config — different motions are needed to
-take down a 4-block tower vs to scatter a 3-block flat cluster.
+The bowl is **not a scene prim** — exposed as a 2-D xy via
+:class:`mdp.SingulationBowlPoseCommand` so the chained P2 (Eval-3
+pick-and-place policy) has the same ``bowl_xy`` state slot it expects
+after handoff. P1 keeps cubes out of the bowl xy via the
+``bowl_avoidance`` reward.
 
-Episode length: 10 s (twice Eval-1's per-pick budget; singulation
-typically requires multiple cube manipulations).
+Episode length: 12 s — Eval-1's per-pick budget is ~3 s; 4-stack /
+3-1 pyramid disassembly needs 3 sequential grasps + headroom.
 """
 
 from dataclasses import MISSING
@@ -32,6 +35,7 @@ from isaaclab.assets import (
     RigidObjectCfg,
 )
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.envs.mdp.commands.commands_cfg import UniformPoseCommandCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -90,8 +94,26 @@ class SingulationSceneCfg(InteractiveSceneCfg):
 
 @configclass
 class CommandsCfg:
-    """No commands — singulation has no per-step goal vector."""
-    pass
+    """Single bowl-xy goal — same schema P2 reads after the singulation
+    handoff. Bowl is not a scene prim (no visual asset), only a 2-D xy
+    in robot frame, rejection-sampled ≥ 15 cm from the cluster centre."""
+
+    bowl_pose = mdp.SingulationBowlPoseCommandCfg(
+        asset_name="robot",
+        body_name=MISSING,  # filled by joint_pos_env_cfg
+        resampling_time_range=(12.0, 12.0),
+        debug_vis=True,
+        min_distance=0.15,
+        max_attempts=16,
+        ranges=UniformPoseCommandCfg.Ranges(
+            pos_x=(0.18, 0.30),
+            pos_y=(-0.15, 0.15),
+            pos_z=(0.0, 0.0),
+            roll=(0.0, 0.0),
+            pitch=(0.0, 0.0),
+            yaw=(0.0, 0.0),
+        ),
+    )
 
 
 @configclass
@@ -108,6 +130,7 @@ class ObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         gripper_state = ObsTerm(func=mdp.gripper_state)
         ee_proj_xy = ObsTerm(func=mdp.ee_proj_xy)
+        bowl_xy = ObsTerm(func=mdp.bowl_xy, params={"command_name": "bowl_pose"})
         n_active = ObsTerm(func=mdp.n_active_onehot)
         arrangement = ObsTerm(func=mdp.arrangement_onehot)
         last_action = ObsTerm(func=mdp.last_action)
@@ -122,10 +145,14 @@ class ObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         gripper_state = ObsTerm(func=mdp.gripper_state)
         ee_proj_xy = ObsTerm(func=mdp.ee_proj_xy)
+        bowl_xy = ObsTerm(func=mdp.bowl_xy, params={"command_name": "bowl_pose"})
         n_active = ObsTerm(func=mdp.n_active_onehot)
         arrangement = ObsTerm(func=mdp.arrangement_onehot)
         active_mask = ObsTerm(func=mdp.active_block_mask)
         all_cube_positions = ObsTerm(func=mdp.all_cube_positions_robot_frame)
+        min_pairwise_xy = ObsTerm(func=mdp.min_pairwise_xy_active)
+        mean_pairwise_xy = ObsTerm(func=mdp.mean_pairwise_xy_active)
+        n_off_table = ObsTerm(func=mdp.n_cubes_off_table)
         last_action = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -134,7 +161,7 @@ class ObservationsCfg:
 
     @configclass
     class WristImageCfg(ObsGroup):
-        wrist_image = ObsTerm(func=mdp.wrist_rgb_dr, params={"corrupt": True})
+        wrist_image = ObsTerm(func=mdp.wrist_rgb_union_mask_dr, params={"corrupt": True})
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -153,16 +180,27 @@ class EventCfg:
         func=mdp.sample_active_set,
         mode="reset",
         params={
-            "n_active_choices": (3, 4),
-            "stacked_prob": 0.5,
+            # arrangement_weights=None → uses DEFAULT_ARRANGEMENT_WEIGHTS
+            # from events.py (stacks 0.25 / clusters 0.40 / pyramids 0.20
+            # / mixed 0.15).
+            "arrangement_weights": None,
             "cube_size": 0.02,
             "table_z": 0.01,
-            "stack_lateral_jitter": 0.003,
-            "cluster_inter_spacing": 0.023,
-            "cluster_position_jitter": 0.002,
+            "stack_lateral_jitter": 0.005,
+            "cluster_inter_spacing": 0.021,
+            "cluster_position_jitter": 0.003,
+            "mixed_gap": 0.07,
             "center_x": (0.16, 0.22),
             "center_y": (-0.08, 0.08),
             "cube_prefix": "cube_",
+        },
+    )
+    randomize_cube_physics = EventTerm(
+        func=mdp.randomize_cube_physics,
+        mode="reset",
+        params={
+            "mass_range": (0.016, 0.024),
+            "friction_range": (0.7, 1.3),
         },
     )
     randomize_wrist_tint = EventTerm(
@@ -188,12 +226,19 @@ class EventCfg:
 class RewardsCfg:
     """Singulation reward stack.
 
+    Dense:
     * ``min_pairwise``     +5  — push the worst-case pair apart.
     * ``mean_pairwise``    +2  — broad spreading signal.
     * ``all_on_table``     +3  — unstacking signal (key for the stack case).
     * ``reach_closest``    +1  — engage with the closest active pair.
+    * ``lift_then_place``  +3  — bias toward grasp-and-place (sim2real).
+
+    Sparse:
     * ``success``          +50 — once cleanly separated AND on table.
+
+    Penalties:
     * ``overspeed``        -3  — discourage flinging cubes.
+    * ``bowl_avoidance``   -5  — keep singulated cubes out of bowl xy.
     * ``action_rate``    -1e-4 → -1e-2 via curriculum.
     * ``joint_vel``      -1e-4 → -1e-2.
     """
@@ -210,6 +255,11 @@ class RewardsCfg:
     reach_closest = RewTerm(
         func=mdp.reach_closest_pair, params={"std": 0.10}, weight=1.0
     )
+    lift_then_place = RewTerm(
+        func=mdp.lift_then_place,
+        params={"z_lo": 0.07, "z_hi": 0.20, "gripper_closed_threshold": 0.25},
+        weight=3.0,
+    )
     success = RewTerm(
         func=mdp.singulation_success,
         params={"min_separation": 0.05, "on_table_height": 0.05},
@@ -217,6 +267,11 @@ class RewardsCfg:
     )
     overspeed = RewTerm(
         func=mdp.cube_overspeed_penalty, params={"speed_cap": 0.30}, weight=-3.0
+    )
+    bowl_avoid = RewTerm(
+        func=mdp.bowl_avoidance,
+        params={"bowl_command_name": "bowl_pose", "near_threshold": 0.06},
+        weight=-5.0,
     )
 
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
@@ -229,8 +284,10 @@ class RewardsCfg:
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     cube_off = DoneTerm(func=mdp.active_cube_off_table)
-    # Optional positive termination on success — comment to require the
-    # policy to keep cubes separated through to time_out.
+    # Positive termination on success — success is a stable absorbing
+    # state, so γ-discounting on early termination incentivises *fast*
+    # singulation. Comment out if the policy needs to keep the cubes
+    # separated through time_out instead.
     done = DoneTerm(func=mdp.singulation_done)
 
 
@@ -251,9 +308,6 @@ class CurriculumCfg:
 class SingulationEnvCfg(ManagerBasedRLEnvCfg):
     """SO-ARM101 singulation env (Bonus-B)."""
 
-    # num_envs default = 2048. Singulation is the heaviest of the three
-    # multi-cube tasks (stacks → many cube↔cube contact pairs), so the
-    # PhysX buffer expansions in _multicube_sim are most important here.
     scene: SingulationSceneCfg = SingulationSceneCfg(
         num_envs=_multicube_sim.DEFAULT_TRAIN_NUM_ENVS,
         env_spacing=_multicube_sim.ENV_SPACING,
@@ -267,8 +321,9 @@ class SingulationEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
-        # 10 s = 500 policy steps @ 50 Hz — enough to clear a 4-block
-        # stack AND spread the resulting cubes.
-        self.episode_length_s = 10.0
+        # 12 s = 600 policy steps @ 50 Hz — fits ~3 grasp-lift-place
+        # cycles for a 4-stack at ~3.5 s/cycle (per Eval-1 deploy
+        # timing) plus settle headroom.
+        self.episode_length_s = 12.0
         self.viewer.eye = (2.5, 2.5, 1.5)
         _multicube_sim.apply_multicube_sim_settings(self)

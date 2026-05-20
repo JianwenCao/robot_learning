@@ -37,9 +37,11 @@ import isaac_so_arm101.tasks.pickplace.mdp as mdp
 from isaac_so_arm101.robots import SO_ARM101_CFG  # noqa: F401
 from isaac_so_arm101.tasks.pickplace.pickplace_env_cfg import (
     PickPlaceBowlEnvCfg,
+    StateAprilTagObservationsCfg,
     WRIST_RGB_HEIGHT,
     WRIST_RGB_WIDTH,
 )
+from isaaclab.managers import EventTermCfg as EventTerm
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
@@ -302,3 +304,57 @@ class SoArm101PickPlaceBowlTeacherFastEnvCfg_PLAY(SoArm101PickPlaceBowlTeacherFa
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm101PickPlaceBowlStateAprilTagEnvCfg(SoArm101PickPlaceBowlTeacherFastEnvCfg):
+    """State-only + AprilTag-noise env for the single-stage deploy path.
+
+    Inherits the Teacher-Fast subclass (camera-free, no wrist_image obs)
+    and:
+
+    * Swaps in :class:`StateAprilTagObservationsCfg` so ``PolicyCfg`` gains
+      a ``cube_pos_xy_noisy`` term (GT cube xy + per-episode bias +
+      Gaussian + dropout + post-grasp freeze — see
+      :func:`mdp.observations.cube_pos_xy_noisy`).
+    * Adds a ``reset_cube_pos_bias`` event so the per-episode bias and the
+      post-grasp freeze latch are reset each episode. Listed **after**
+      ``reset_block_position`` so ``_cube_pos_last`` is seeded against
+      the freshly-randomized cube xy.
+
+    See ``docs/STATE_APRILTAG_PLAN.md`` for the deploy-side mirror.
+    """
+
+    observations: StateAprilTagObservationsCfg = StateAprilTagObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # The reset event must run AFTER reset_block_position so the
+        # seeded ``env._cube_pos_last`` reflects the post-reset cube xy.
+        # configclass field-insertion via attribute assignment is the
+        # idiomatic pattern used elsewhere in this repo (see e.g. the
+        # bootstrap_grasped term wiring in older revisions).
+        self.events.reset_cube_pos_bias = EventTerm(
+            func=mdp.reset_cube_pos_bias, mode="reset"
+        )
+
+
+@configclass
+class SoArm101PickPlaceBowlStateAprilTagEnvCfg_PLAY(SoArm101PickPlaceBowlStateAprilTagEnvCfg):
+    """Play variant: fewer envs, no obs corruption, no AprilTag noise.
+
+    The play path is used for sim eval (``play.py``) where we want a clean
+    rollout. ``corrupt=False`` short-circuits the bias / Gaussian / dropout
+    inside :func:`mdp.observations.cube_pos_xy_noisy` so the policy sees
+    the GT cube xy each step — the post-grasp freeze still applies (it
+    reflects physical occlusion, not corruption).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        # Disable corruption inside the obs function itself. Match the
+        # pattern used by SoArm101PickPlaceBowlEnvCfg_PLAY for wrist_image.
+        self.observations.policy.cube_pos_xy_noisy.params = {"corrupt": False}

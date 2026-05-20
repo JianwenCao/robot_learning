@@ -57,6 +57,113 @@ def object_position_in_robot_root_frame(
     return pos_b
 
 
+def cube_pos_xy_noisy(
+    env: ManagerBasedRLEnv,
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    corrupt: bool = True,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    grasp_distance: float = 0.04,
+    minimal_height: float = 0.025,
+) -> torch.Tensor:
+    """Noisy 2-D block position in robot frame — *deployable* surrogate for
+    AprilTag pose estimation.
+
+    Mirrors the real-side AprilTag pipeline: GT cube xy + per-episode bias
+    (sampled by :func:`mdp.events.reset_cube_pos_bias`, models hand-eye
+    calibration residual) + per-step zero-mean Gaussian (models tag-corner
+    localization noise) + dropout (models momentary occlusion / motion blur)
+    + post-grasp deterministic freeze (models the gripper occluding the tag
+    once it has the cube — last value held for the rest of the episode).
+
+    Buffer convention (all lazy-allocated, reset by
+    :func:`mdp.events.reset_cube_pos_bias`):
+
+    * ``env._cube_pos_bias`` ``(N, 2)`` — per-episode (Δx, Δy) bias.
+    * ``env._cube_pos_frozen`` ``(N,)`` bool — sticky latch, flips True the
+      first step the kinematic grasp predicate fires, stays True for the
+      rest of the episode.
+    * ``env._cube_pos_last`` ``(N, 2)`` — last value published. Seeded at
+      reset to the post-reset cube xy so first-step dropout returns a
+      sensible value (not zeros).
+
+    Args:
+        sigma_m: Per-step Gaussian σ (m). 2 mm matches realistic AprilTag
+            corner localization at 15 cm range with a 1280×720 wrist cam.
+        dropout_p: Per-step Bernoulli probability of holding the last value
+            instead of publishing a new one (pre-grasp only).
+        corrupt: Master toggle for noise / bias / dropout. ``False`` zeros
+            them all out (set by the play cfg via ``params={"corrupt": False}``)
+            but the post-grasp freeze still applies — that's a physical
+            occlusion, not corruption.
+        grasp_distance, minimal_height: Match the privileged ``is_grasped``
+            heuristic. Don't change without updating that too.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    obj: RigidObject = env.scene[object_cfg.name]
+
+    # 1. Ground-truth cube xy in robot root frame.
+    pos_w = obj.data.root_pos_w[:, :3]
+    pos_b, _ = subtract_frame_transforms(
+        robot.data.root_state_w[:, :3], robot.data.root_state_w[:, 3:7], pos_w
+    )
+    gt_xy = pos_b[:, :2]
+
+    n = env.num_envs
+    device = env.device
+
+    # 2. Lazy-allocate buffers. Reset event seeds these properly; this is
+    #    the safety net for the very first call before any reset has run.
+    bias = getattr(env, "_cube_pos_bias", None)
+    if bias is None or bias.shape[0] != n:
+        bias = torch.zeros(n, 2, device=device)
+        env._cube_pos_bias = bias
+    frozen = getattr(env, "_cube_pos_frozen", None)
+    if frozen is None or frozen.shape[0] != n:
+        frozen = torch.zeros(n, dtype=torch.bool, device=device)
+        env._cube_pos_frozen = frozen
+    last = getattr(env, "_cube_pos_last", None)
+    if last is None or last.shape[0] != n:
+        last = gt_xy.clone()
+        env._cube_pos_last = last
+
+    # 3. Apply per-step Gaussian + per-episode bias (only if corrupting).
+    if corrupt:
+        noisy_now = gt_xy + bias + torch.randn_like(gt_xy) * sigma_m
+    else:
+        noisy_now = gt_xy
+
+    # 4. Kinematic grasp predicate — match :func:`is_grasped` exactly.
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    dist = torch.norm(pos_w - ee_w, dim=1)
+    lifted = pos_w[:, 2] > minimal_height
+    close = dist < grasp_distance
+    grasped_now = lifted & close  # (N,)
+
+    # 5. Decide what to publish this step. Hold last when frozen (post-grasp)
+    #    OR when a pre-grasp dropout fires.
+    if corrupt and dropout_p > 0.0:
+        dropout = torch.rand(n, device=device) < dropout_p
+    else:
+        dropout = torch.zeros(n, dtype=torch.bool, device=device)
+    hold = frozen | dropout
+    out = torch.where(hold.unsqueeze(-1), last, noisy_now)
+
+    # 6. Update buffers. ``_cube_pos_last`` only advances for envs that
+    #    actually published a new value (hold == False). ``_cube_pos_frozen``
+    #    is updated AFTER reading so the freeze takes effect from *next*
+    #    step — current step still publishes the in-flight detection,
+    #    mirroring "the tag is visible at the moment the gripper closes,
+    #    then occluded".
+    env._cube_pos_last = torch.where(hold.unsqueeze(-1), last, noisy_now)
+    env._cube_pos_frozen = frozen | grasped_now
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # End-effector pose (FK on joints, expressed in robot frame)
 # ---------------------------------------------------------------------------

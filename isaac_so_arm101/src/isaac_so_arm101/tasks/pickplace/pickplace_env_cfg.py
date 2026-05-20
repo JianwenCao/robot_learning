@@ -337,6 +337,26 @@ class ObservationsCfg:
     wrist_image: WristImageCfg = WristImageCfg()
 
 
+@configclass
+class StateAprilTagObservationsCfg(ObservationsCfg):
+    """Obs variant for the state-only + AprilTag deploy path.
+
+    Extends :class:`ObservationsCfg` by adding a single ``cube_pos_xy_noisy``
+    term to :class:`PolicyCfg`. This is the sim-side surrogate for the
+    AprilTag pose injection that runs on the real arm at deploy — see
+    ``docs/STATE_APRILTAG_PLAN.md`` §2. Critic and wrist_image groups are
+    inherited unchanged; the env cfg that uses this variant typically also
+    nulls ``scene.wrist_cam`` + ``observations.wrist_image`` (no rendering
+    needed for state-only PPO).
+    """
+
+    @configclass
+    class PolicyCfg(ObservationsCfg.PolicyCfg):
+        cube_pos_xy_noisy = ObsTerm(func=mdp.cube_pos_xy_noisy)
+
+    policy: PolicyCfg = PolicyCfg()
+
+
 # ---------------------------------------------------------------------------
 # Events — resets + (later) domain randomization
 # ---------------------------------------------------------------------------
@@ -491,6 +511,25 @@ class RewardsCfg:
     # bootstrap p=0.10 from random init → σ inflated, training failed).
     release_in_bowl = RewTerm(func=mdp.release_in_bowl, weight=30.0)
 
+    # --- Anti-hover terms (added 2026-05-20 from diagnostic on Stage-3 run
+    # 2026-05-20_04-21-45/model_1600.pt: lift latch fired 100%, over-bowl
+    # latch 63%, but only 27% actually released. The remaining 36 pp were
+    # "lift cube to 20 cm, hover 3-4 s above bowl xy, never open gripper".
+    # See docs/EVAL1_PLAN.md §4 for the prior reasoning against
+    # task_success termination — that fix is still correct (keep
+    # per-step release_in_bowl streaming), but on its own isn't enough
+    # because steady-state hover (reach+lift+track+track_fine ≈ 37/step)
+    # paid more than the policy's expected release reward when release
+    # was undiscoverable. These two terms (+3 lure, -1 hover penalty,
+    # both ≪ release_in_bowl=30 so they can't dominate it) make the
+    # release path cheaper to find AND make hovering net less rewarding.)
+    gripper_open_above_bowl_lure = RewTerm(
+        func=mdp.gripper_open_above_bowl_lure, weight=3.0,
+    )
+    still_grasped_above_bowl_penalty = RewTerm(
+        func=mdp.still_grasped_above_bowl_penalty, weight=-1.0,
+    )
+
     # OLD COMMENT (pre-stage-2): NO release reward — stage 1 is a
     # strict Franka Lift match. Run-18
     # (2026-05-10, w=50, p=0.10 bootstrap) showed release_in_bowl created
@@ -502,10 +541,12 @@ class RewardsCfg:
     # resume from the stage-1 checkpoint with a small release reward
     # added as a fine-tune.
 
-    # Penalties — initial -1e-4 ramped to -1e-2 by ``CurriculumCfg`` at
-    # 10 k env-steps. Stock Franka Lift ramps to -1e-1 (10× heavier);
-    # we kept -1e-2 to give the SO-ARM more action-space freedom early.
-    # Stock recipe doesn't include action_l2; we keep it off too.
+    # Penalties — initial -1e-4 ramped to -1e-1 by ``CurriculumCfg`` at
+    # 10 k env-steps. Now matches stock Franka Lift's 10× target (was -1e-2)
+    # because the 2026-05-20 diagnostic showed jerky motion under the lighter
+    # ramp — the SO-ARM action-space freedom that -1e-2 was protecting is
+    # no longer needed once the curriculum block-xy expand handles
+    # workspace coverage.
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(
         func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")}
@@ -585,11 +626,11 @@ class CurriculumCfg:
 
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 10000},
+        params={"term_name": "action_rate", "weight": -1e-1, "num_steps": 10000},
     )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 10000},
+        params={"term_name": "joint_vel", "weight": -1e-1, "num_steps": 10000},
     )
     # Stage-3-adapted block-xy expand. Ramps the reset_block_position event's
     # pose_range from ±3 cm to the live full width (±10×±15). Live full-width

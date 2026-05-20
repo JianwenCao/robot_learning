@@ -164,6 +164,33 @@ class ObservationsCfg:
 
 
 @configclass
+class SeqStateAprilTagObservationsCfg(ObservationsCfg):
+    """Eval-3 obs variant for the state-only + AprilTag deploy path.
+
+    Adds two terms to ``PolicyCfg``:
+
+    * ``cube_positions_xy_noisy`` ``(N, NUM_COLORS*2=12)`` — per-cube noisy
+      xy in robot frame, mirroring the per-frame pupil-apriltags output
+      on the real arm. Re-keys the post-grasp freeze on every sub-goal
+      transition (current target palette idx read via
+      :func:`_current_target_palette_idx`).
+    * ``cube_visible_flags`` ``(N, NUM_COLORS=6)`` — 1 if the tag was
+      detected this step (cube active + on table + not dropped), else 0.
+
+    The seq_goal vector already exposes the current sub-goal target color
+    one-hot, current bowl xy, and step idx — those stay in the policy
+    obs group via the existing ``seq_goal`` term.
+    """
+
+    @configclass
+    class PolicyCfg(ObservationsCfg.PolicyCfg):
+        cube_positions_xy_noisy = ObsTerm(func=mdp.cube_positions_xy_noisy)
+        cube_visible_flags = ObsTerm(func=mdp.cube_visible_flags)
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class EventCfg:
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
     reset_latches = EventTerm(func=mdp.reset_seq_latches, mode="reset")

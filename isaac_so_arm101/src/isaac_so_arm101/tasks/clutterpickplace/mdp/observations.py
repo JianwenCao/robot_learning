@@ -438,3 +438,230 @@ def target_is_grasped(
     lifted = target_w[:, 2] > minimal_height
     close = dist < grasp_distance
     return (lifted & close).float().unsqueeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# State-only + AprilTag observations (sim-side mirror of the real
+# pupil-apriltags pipeline). Drop-in replacement for the wrist_image obs
+# group when the deploy detector is AprilTag instead of Florence-2.
+# See docs/STATE_APRILTAG_PLAN.md §4.
+# ---------------------------------------------------------------------------
+
+
+def _compute_apriltag_obs(
+    env: "ManagerBasedRLEnv",
+    target_palette_idx: torch.Tensor,
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+    table_z_min: float = -0.05,
+    grasp_distance: float = 0.04,
+    minimal_height: float = 0.025,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    cube_prefix: str = "cube_",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Shared backbone for ``cube_positions_xy_noisy`` + ``cube_visible_flags``.
+
+    Returns ``(positions, visible)`` where
+      * ``positions``: ``(N, NUM_COLORS, 2)`` noisy xy in robot frame,
+      * ``visible``:   ``(N, NUM_COLORS)`` float in {0, 1}.
+
+    Cached per env-step (``env._apriltag_obs_cache``) so the two thin obs
+    functions don't re-compute. See module docstring for the noise model;
+    short summary:
+
+    * ``_cube_pos_bias`` ``(N, 2)`` — **shared** hand-eye bias (one extrinsic).
+    * ``_cube_pos_mount`` ``(N, NUM_COLORS, 2)`` — per-cube tape-mount offset.
+    * Per-step Gaussian σ = ``sigma_m`` per axis, **independent per cube**.
+    * Bernoulli dropout ``dropout_p`` per cube per step → hold last value
+      and flip visible flag to 0 for that step (pre-grasp).
+    * ID swap with prob ``swap_prob`` per env per step: pick a random pair
+      of *active* cubes and swap their published positions for one frame.
+      Models a rare AprilTag misdetection.
+    * Visibility = active AND on table (``cube_z_w > table_z_min``) AND
+      NOT dropped. Parked/fallen cubes always publish visible=0 with the
+      stored last value (defaults to zero).
+    * Post-grasp freeze on the **target** cube only: once the kinematic
+      grasp predicate fires for the target, freeze its slot for the rest
+      of the episode (gripper occludes the tag); visible stays 1 because
+      we hold the last-known reading rather than dropping it.
+
+    The freeze latch / dropout are gated by ``corrupt`` for symmetry with
+    Eval-1's :func:`pickplace.mdp.observations.cube_pos_xy_noisy`; the
+    post-grasp freeze is a physical occlusion and applies even when
+    ``corrupt=False``.
+    """
+    step = int(getattr(env, "common_step_counter", 0))
+    cache = getattr(env, "_apriltag_obs_cache", None)
+    if cache is not None and cache[0] == step:
+        return cache[1], cache[2]
+
+    robot: Articulation = env.scene[robot_cfg.name]
+    n = env.num_envs
+    device = env.device
+
+    # All cube xyz in WORLD then ROBOT frame.
+    all_w = _all_cube_pos_w(env, cube_prefix)  # (N, K, 3)
+    K = all_w.shape[1]
+    root_pos = robot.data.root_state_w[:, :3].unsqueeze(1).expand(-1, K, -1)
+    root_quat = robot.data.root_state_w[:, 3:7].unsqueeze(1).expand(-1, K, -1)
+    pos_b_flat, _ = subtract_frame_transforms(
+        root_pos.reshape(-1, 3), root_quat.reshape(-1, 4), all_w.reshape(-1, 3)
+    )
+    gt_b = pos_b_flat.reshape(n, K, 3)
+    gt_xy = gt_b[..., :2]
+
+    # Lazy-allocate buffers (the reset event seeds them; this is the safety
+    # net for the very first call before any reset has fired).
+    bias = getattr(env, "_cube_pos_bias", None)
+    if bias is None or bias.shape != (n, 2):
+        bias = torch.zeros(n, 2, device=device)
+        env._cube_pos_bias = bias
+    mount = getattr(env, "_cube_pos_mount", None)
+    if mount is None or mount.shape != (n, K, 2):
+        mount = torch.zeros(n, K, 2, device=device)
+        env._cube_pos_mount = mount
+    frozen = getattr(env, "_cube_pos_frozen", None)
+    if frozen is None or frozen.shape != (n, K):
+        frozen = torch.zeros(n, K, dtype=torch.bool, device=device)
+        env._cube_pos_frozen = frozen
+    last = getattr(env, "_cube_pos_last", None)
+    if last is None or last.shape != (n, K, 2):
+        last = gt_xy.clone()
+        env._cube_pos_last = last
+
+    # 1) GT + per-episode shared hand-eye bias + per-cube mount + per-step Gaussian.
+    if corrupt:
+        bias_b = bias.unsqueeze(1)  # (N, 1, 2) — broadcast across cubes
+        noisy_now = gt_xy + bias_b + mount + torch.randn_like(gt_xy) * sigma_m
+    else:
+        noisy_now = gt_xy
+
+    # 2) Visibility predicates.
+    #    on_table: cube z (world frame) above some floor — parked cubes fall
+    #              to z ≈ -1.04, so threshold -0.05 cleanly separates.
+    on_table = all_w[..., 2] > table_z_min  # (N, K) bool
+    # active_mask: derived from per-task active-set buffer. For tasks that
+    # don't populate _active_cube_indices, treat all cubes as active.
+    active = getattr(env, "_active_cube_indices", None)
+    if active is not None:
+        active_mask = torch.zeros(n, K, dtype=torch.bool, device=device)
+        active_mask.scatter_(1, active.long(), True)
+    else:
+        active_mask = torch.ones(n, K, dtype=torch.bool, device=device)
+
+    # 3) Pre-grasp dropout (independent per cube per step). Frozen cubes
+    #    don't dropout — they publish the held last value.
+    if corrupt and dropout_p > 0.0:
+        dropout = torch.rand(n, K, device=device) < dropout_p
+    else:
+        dropout = torch.zeros(n, K, dtype=torch.bool, device=device)
+
+    # 4) Kinematic grasp predicate on the target cube → set freeze for next
+    #    step (this step still publishes the in-flight detection — matches
+    #    Eval-1's contract).
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    target_w = _gather_by_index(all_w, target_palette_idx)
+    dist = torch.norm(target_w - ee_w, dim=1)
+    lifted = target_w[:, 2] > minimal_height
+    grasped_now = lifted & (dist < grasp_distance)  # (N,)
+
+    # 5) Decide what to publish per (env, cube). Hold last if frozen OR dropped.
+    hold = frozen | dropout
+    pub_xy = torch.where(hold.unsqueeze(-1), last, noisy_now)
+
+    # 6) Tag-ID swap — per env, with low prob, swap a random pair of ACTIVE
+    #    cubes' published positions for this step only.
+    if corrupt and swap_prob > 0.0:
+        do_swap = torch.rand(n, device=device) < swap_prob
+        if do_swap.any():
+            # For each env that swaps, pick two distinct active slots. Falls
+            # back to identity if <2 active cubes exist.
+            n_active_per_env = active_mask.sum(dim=1)  # (N,)
+            can_swap = do_swap & (n_active_per_env >= 2)
+            if can_swap.any():
+                swap_ids = can_swap.nonzero(as_tuple=False).squeeze(-1)
+                # active_mask[i] has 2+ True; pick two via argsort + top-2.
+                perm = torch.argsort(
+                    torch.rand(swap_ids.numel(), K, device=device) - active_mask[swap_ids].float() * 10.0,
+                    dim=1,
+                )
+                a_idx = perm[:, 0]
+                b_idx = perm[:, 1]
+                tmp = pub_xy[swap_ids, a_idx].clone()
+                pub_xy[swap_ids, a_idx] = pub_xy[swap_ids, b_idx]
+                pub_xy[swap_ids, b_idx] = tmp
+
+    # 7) Visible flag — active AND on_table AND NOT dropped. Frozen target
+    #    keeps visible=True (we hold the last reading rather than failing).
+    visible = active_mask & on_table & (~dropout)
+    visible = visible | frozen  # frozen → still visible (held value)
+    visible_f = visible.float()
+
+    # 8) For non-active (parked) cubes, zero the published xy so the policy
+    #    can't trivially read parked-cube positions through the slot. This
+    #    matches real deploy where the detector simply does not see them.
+    pub_xy = torch.where(
+        active_mask.unsqueeze(-1),
+        pub_xy,
+        torch.zeros_like(pub_xy),
+    )
+
+    # 9) Update buffers. last_xy only advances on slots that actually
+    #    published a fresh detection (not held, and active). Freeze latch
+    #    updated AFTER reading so the freeze takes effect from next step.
+    advance = active_mask & (~hold)
+    env._cube_pos_last = torch.where(advance.unsqueeze(-1), noisy_now, last)
+    if frozen.shape[1] == K:
+        frozen_next = frozen.clone()
+        target_one_hot = torch.zeros(n, K, dtype=torch.bool, device=device)
+        target_one_hot.scatter_(1, target_palette_idx.view(-1, 1), True)
+        frozen_next = frozen_next | (target_one_hot & grasped_now.unsqueeze(-1))
+        env._cube_pos_frozen = frozen_next
+
+    env._apriltag_obs_cache = (step, pub_xy, visible_f)
+    return pub_xy, visible_f
+
+
+def cube_positions_xy_noisy(
+    env: "ManagerBasedRLEnv",
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+) -> torch.Tensor:
+    """``(N, NUM_COLORS*2)`` noisy xy per palette cube — AprilTag surrogate.
+
+    Concatenation order is :data:`COLOR_NAMES`. Inactive (parked) cubes
+    publish zeros — see :func:`_compute_apriltag_obs`. Mirrors the real
+    pupil-apriltags pipeline (per-ID xy, per-cube independent noise,
+    shared hand-eye bias, dropout, post-grasp target freeze).
+    """
+    pos, _ = _compute_apriltag_obs(
+        env, env._target_cube_idx,
+        sigma_m=sigma_m, dropout_p=dropout_p, swap_prob=swap_prob, corrupt=corrupt,
+    )
+    return pos.reshape(pos.shape[0], -1)
+
+
+def cube_visible_flags(
+    env: "ManagerBasedRLEnv",
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+) -> torch.Tensor:
+    """``(N, NUM_COLORS)`` per-cube visibility flag.
+
+    Companion to :func:`cube_positions_xy_noisy`. Shares the cached
+    computation via ``env._apriltag_obs_cache`` so calling both costs one
+    pass. See :func:`_compute_apriltag_obs` for the full predicate.
+    """
+    _, vis = _compute_apriltag_obs(
+        env, env._target_cube_idx,
+        sigma_m=sigma_m, dropout_p=dropout_p, swap_prob=swap_prob, corrupt=corrupt,
+    )
+    return vis

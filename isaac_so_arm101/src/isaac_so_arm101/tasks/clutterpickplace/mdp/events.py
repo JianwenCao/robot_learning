@@ -229,6 +229,85 @@ def place_clutter_blocks(
 # ---------------------------------------------------------------------------
 
 
+def reset_cube_positions_bias(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    hand_eye_bias_range_m: tuple[float, float] = (-0.005, 0.005),
+    mount_offset_range_m: tuple[float, float] = (-0.002, 0.002),
+    cube_prefix: str = "cube_",
+) -> None:
+    """Per-episode reset for the AprilTag-noise buffers used by
+    :func:`mdp.observations.cube_positions_xy_noisy`.
+
+    Three responsibilities per reset:
+
+    * Sample a per-env **shared** hand-eye bias from
+      ``U[hand_eye_bias_range_m, ...]`` and store in ``env._cube_pos_bias``.
+      Models calibration residual — one extrinsic per camera so the bias
+      is the same for every cube in that env. Default ±5 mm matches
+      the verify gate in ``docs/STATE_APRILTAG_PLAN.md`` §3.
+    * Sample a per-env, **per-cube** mount offset from
+      ``U[mount_offset_range_m, ...]`` into
+      ``env._cube_pos_mount`` ``(N, NUM_COLORS, 2)``. Models the fact
+      that adhesive tape never centers the tag perfectly on each cube
+      face (independent across cubes, constant within an episode).
+    * Clear the post-grasp freeze latch ``env._cube_pos_frozen`` and seed
+      ``env._cube_pos_last`` with the post-reset cube xy in robot frame
+      so first-step dropout returns a sensible value.
+
+    List **AFTER ``place_clutter_blocks``** so the seeded last-value
+    reflects the freshly-placed cube positions.
+    """
+    n_envs = env.num_envs
+    device = env.device
+    K = NUM_COLORS
+
+    if not hasattr(env, "_cube_pos_bias"):
+        env._cube_pos_bias = torch.zeros(n_envs, 2, device=device)
+    if not hasattr(env, "_cube_pos_mount"):
+        env._cube_pos_mount = torch.zeros(n_envs, K, 2, device=device)
+    if not hasattr(env, "_cube_pos_frozen"):
+        env._cube_pos_frozen = torch.zeros(n_envs, K, dtype=torch.bool, device=device)
+    if not hasattr(env, "_cube_pos_last"):
+        env._cube_pos_last = torch.zeros(n_envs, K, 2, device=device)
+
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        env_ids_t = env_ids.long()
+    else:
+        if len(env_ids) == 0:
+            return
+        env_ids_t = torch.as_tensor(env_ids, device=device, dtype=torch.long)
+    n = env_ids_t.numel()
+
+    lo_h, hi_h = hand_eye_bias_range_m
+    env._cube_pos_bias[env_ids_t] = lo_h + (hi_h - lo_h) * torch.rand((n, 2), device=device)
+
+    lo_m, hi_m = mount_offset_range_m
+    env._cube_pos_mount[env_ids_t] = lo_m + (hi_m - lo_m) * torch.rand((n, K, 2), device=device)
+
+    env._cube_pos_frozen[env_ids_t] = False
+
+    # Seed last with post-reset cube xy in robot frame.
+    from isaaclab.utils.math import subtract_frame_transforms
+
+    robot = env.scene["robot"]
+    root_w = robot.data.root_state_w[env_ids_t, :3]
+    root_quat = robot.data.root_state_w[env_ids_t, 3:7]
+    seeds = torch.empty((n, K, 2), device=device)
+    for k, name in enumerate(COLOR_NAMES):
+        cube = env.scene[f"{cube_prefix}{name}"]
+        cube_w = cube.data.root_pos_w[env_ids_t, :3]
+        cube_b, _ = subtract_frame_transforms(root_w, root_quat, cube_w)
+        seeds[:, k, :] = cube_b[:, :2]
+    env._cube_pos_last[env_ids_t] = seeds
+
+    # Invalidate the per-step obs cache so the next forward sees fresh state.
+    if hasattr(env, "_apriltag_obs_cache"):
+        env._apriltag_obs_cache = None
+
+
 def reset_target_latches(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:
     """Clear the target-aware per-episode latches at reset.
 

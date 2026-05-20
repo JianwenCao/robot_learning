@@ -26,7 +26,9 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import FrameTransformer
 
-from .events import COLOR_NAMES, NUM_COLORS
+from isaac_so_arm101.tasks.pickplace.mdp.observations import gripper_state
+
+from .events import ARRANGEMENT_NAMES, COLOR_NAMES, NUM_ARRANGEMENTS, NUM_COLORS
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -255,7 +257,85 @@ def reach_closest_pair(
 
 
 # ---------------------------------------------------------------------------
-# Curriculum metric — TB log of success rate.
+# Intermediate — grasp-and-place bias (sim2real-friendly behaviour).
+# ---------------------------------------------------------------------------
+
+
+def lift_then_place(
+    env: "ManagerBasedRLEnv",
+    z_lo: float = 0.07,
+    z_hi: float = 0.20,
+    gripper_closed_threshold: float = 0.25,
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """1.0 when any active cube is lifted into ``[z_lo, z_hi]`` AND the
+    gripper is closed.
+
+    Biases the emergent strategy toward grasp-and-place over pure pushing.
+    Real Feetech grip force is low — sustained sliding contact is
+    unreliable on hardware, so we want the sim policy to prefer firmly
+    grasping a cube, lifting it clear of the cluster, and placing it
+    aside. The z-band excludes both "cube still on table" (z < 0.07,
+    nothing happened) and "cube being flung overhead" (z > 0.20).
+
+    Gripper closure is read from the joint position directly (matches the
+    real-robot signal). Threshold of 0.25 splits the open=0.5 vs
+    close=0.0 binary command cleanly.
+    """
+    pos = _all_cube_pos_w(env, cube_prefix)
+    z = pos[:, :, 2]
+    active = env._singulation_active_mask
+    in_band = (z > z_lo) & (z < z_hi) & active
+    any_lifted = in_band.any(dim=1)
+
+    g = gripper_state(env).squeeze(-1)
+    closed = g < gripper_closed_threshold
+    return (any_lifted & closed).float()
+
+
+# ---------------------------------------------------------------------------
+# Bowl avoidance — keep singulated cubes out of the bowl xy so the
+# chained P2 (Eval-3 pick-and-place) handoff isn't confused by a cube
+# already sitting in its release zone.
+# ---------------------------------------------------------------------------
+
+
+def bowl_avoidance(
+    env: "ManagerBasedRLEnv",
+    bowl_command_name: str = "bowl_pose",
+    near_threshold: float = 0.06,
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """1.0 if any active cube's xy is within ``near_threshold`` of the
+    bowl xy AND that cube is on or near the table (z < 0.06).
+
+    Composed with a negative weight in cfg. Doesn't trigger while a cube
+    is being transported overhead (z > 0.06) — only catches the bad
+    end-state "cube ended up in the bowl spot."
+    """
+    cmd = env.command_manager.get_command(bowl_command_name)
+    bowl_xy = cmd[:, :2]  # (N, 2) in robot frame
+
+    # Cube xy in robot frame.
+    from isaaclab.utils.math import subtract_frame_transforms
+    robot = env.scene["robot"]
+    pos_w = _all_cube_pos_w(env, cube_prefix)  # (N, 6, 3)
+    n, k, _ = pos_w.shape
+    root_pos = robot.data.root_state_w[:, :3].unsqueeze(1).expand(-1, k, -1)
+    root_quat = robot.data.root_state_w[:, 3:7].unsqueeze(1).expand(-1, k, -1)
+    pos_b, _ = subtract_frame_transforms(
+        root_pos.reshape(-1, 3), root_quat.reshape(-1, 4), pos_w.reshape(-1, 3),
+    )
+    pos_b = pos_b.reshape(n, k, 3)
+
+    active = env._singulation_active_mask  # (N, 6) bool
+    d_xy = torch.norm(pos_b[:, :, :2] - bowl_xy.unsqueeze(1), dim=-1)  # (N, 6)
+    near_bowl = (d_xy < near_threshold) & active & (pos_b[:, :, 2] < 0.06)
+    return near_bowl.any(dim=1).float()
+
+
+# ---------------------------------------------------------------------------
+# Curriculum metric — TB log of success rate (split by arrangement).
 # ---------------------------------------------------------------------------
 
 
@@ -263,6 +343,9 @@ def log_singulation_metrics(
     env: "ManagerBasedRLEnv",
     env_ids: torch.Tensor | None,
 ) -> dict[str, float]:
+    """Per-reset metrics. Splits success rate by arrangement family and
+    by n_active so per-family progress is visible in TensorBoard.
+    """
     latch = getattr(env, "_singulation_success_latch", None)
     if latch is None or env_ids is None:
         return {}
@@ -272,25 +355,26 @@ def log_singulation_metrics(
     elif len(env_ids) == 0:
         return {}
     outcomes = latch[env_ids].float()
-    metrics = {
+    metrics: dict[str, float] = {
         "success_rate": outcomes.mean().item(),
         "n_episodes_ended": float(outcomes.numel()),
     }
-    # Split by arrangement (stacked vs clustered) for diagnosis.
-    arr = env._singulation_arrangement[env_ids]
-    n_stack = (arr == 0).sum().item()
-    n_cluster = (arr == 1).sum().item()
-    if n_stack > 0:
-        metrics["success_stacked"] = outcomes[arr == 0].mean().item()
-    if n_cluster > 0:
-        metrics["success_clustered"] = outcomes[arr == 1].mean().item()
+
+    # Split by arrangement family (11-way).
+    arr_idx = env._singulation_arrangement_idx[env_ids]
+    for k, name in enumerate(ARRANGEMENT_NAMES):
+        mask = arr_idx == k
+        n_k = mask.sum().item()
+        if n_k > 0:
+            metrics[f"success_{name.lower()}"] = outcomes[mask].mean().item()
+
     # Split by n_active (3 vs 4).
     n_active = env._singulation_n_active[env_ids]
-    n3 = (n_active == 3).sum().item()
-    n4 = (n_active == 4).sum().item()
-    if n3 > 0:
-        metrics["success_n3"] = outcomes[n_active == 3].mean().item()
-    if n4 > 0:
-        metrics["success_n4"] = outcomes[n_active == 4].mean().item()
+    for nv in (3, 4):
+        mask = n_active == nv
+        n_k = mask.sum().item()
+        if n_k > 0:
+            metrics[f"success_n{nv}"] = outcomes[mask].mean().item()
+
     latch[env_ids] = False
     return metrics

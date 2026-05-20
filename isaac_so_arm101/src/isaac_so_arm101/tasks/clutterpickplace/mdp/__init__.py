@@ -49,9 +49,12 @@ from .events import (  # noqa: F401
     HIDDEN_PARK_XY,
     NUM_COLORS,
     place_clutter_blocks,
+    reset_cube_positions_bias,
     reset_target_latches,
 )
 from .observations import (  # noqa: F401
+    cube_positions_xy_noisy,
+    cube_visible_flags,
     distractor_block_position,
     target_block_position,
     target_block_to_bowl_xy,

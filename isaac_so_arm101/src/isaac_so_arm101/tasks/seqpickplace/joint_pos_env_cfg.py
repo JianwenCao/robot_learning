@@ -22,6 +22,7 @@ import isaac_so_arm101.tasks.seqpickplace.mdp as mdp
 from isaac_so_arm101.robots import SO_ARM101_CFG
 from isaac_so_arm101.tasks.seqpickplace.seqpickplace_env_cfg import (
     SeqPickPlaceEnvCfg,
+    SeqStateAprilTagObservationsCfg,
     WRIST_RGB_HEIGHT,
     WRIST_RGB_WIDTH,
 )
@@ -30,6 +31,7 @@ from isaac_so_arm101.tasks.seqpickplace.mdp.events import (
     COLOR_NAMES,
     HIDDEN_PARK_XY,
 )
+from isaaclab.managers import EventTermCfg as EventTerm
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
@@ -184,3 +186,48 @@ class SoArm101SeqPickPlaceTeacherFastEnvCfg_PLAY(SoArm101SeqPickPlaceTeacherFast
         self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
         self.scene.env_spacing = _multicube_sim.ENV_SPACING
         self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm101SeqPickPlaceStateAprilTagEnvCfg(SoArm101SeqPickPlaceTeacherFastEnvCfg):
+    """State-only + AprilTag deploy path for Eval-3 (3 sequential sub-goals).
+
+    Inherits Teacher-Fast (camera-free, no wrist_image) and:
+
+    * Swaps in :class:`SeqStateAprilTagObservationsCfg` so ``PolicyCfg``
+      gains ``cube_positions_xy_noisy`` ``(N, 12)`` and
+      ``cube_visible_flags`` ``(N, 6)``. The existing ``seq_goal`` term
+      (current target color one-hot + current bowl xy + step idx) stays
+      — it's the sub-goal switching signal the outer deploy loop changes
+      between picks.
+    * Adds a ``reset_cube_positions_bias`` event after ``place_blocks`` so
+      the per-episode hand-eye bias + per-cube mount + last-value seed
+      live alongside the placement.
+
+    Same actor as Eval-1/Eval-2 StateAprilTag (plain MLP via
+    :class:`PickPlaceVisionActorCritic` auto-disabling its CNN). The
+    sub-goal switching is realised entirely through the ``seq_goal``
+    obs and the post-grasp freeze keyed on the current target.
+    """
+
+    observations: SeqStateAprilTagObservationsCfg = SeqStateAprilTagObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_cube_positions_bias = EventTerm(
+            func=mdp.reset_cube_positions_bias, mode="reset"
+        )
+
+
+@configclass
+class SoArm101SeqPickPlaceStateAprilTagEnvCfg_PLAY(SoArm101SeqPickPlaceStateAprilTagEnvCfg):
+    """Play variant: smaller envs, no corruption."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        from isaac_so_arm101.tasks import _multicube_sim
+        self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
+        self.scene.env_spacing = _multicube_sim.ENV_SPACING
+        self.observations.policy.enable_corruption = False
+        self.observations.policy.cube_positions_xy_noisy.params = {"corrupt": False}
+        self.observations.policy.cube_visible_flags.params = {"corrupt": False}

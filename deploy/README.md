@@ -1,11 +1,12 @@
 # Real-Robot Deploy (Eval-1 / Eval-2 / Eval-3)
 
-PPO checkpoint (trained in `isaac_so_arm101/`) → closed-loop on a real SO-ARM101. No `rsl_rl` / `isaaclab` needed on this PC — the actors are reimplemented in `deploy/ppo_actor.py` (Eval-1: `PPOActor`, Eval-2/3: `PPOActorClutter`).
+PPO checkpoint (trained in `isaac_so_arm101/`) → closed-loop on a real SO-ARM101. No `rsl_rl` / `isaaclab` needed on this PC — the actor is reimplemented forward-only in `deploy/ppo_actor.py` (`PPOActorState`). All evals share the **same state-only AprilTag policy**: `cube_xy` is injected into the state vector via `pupil-apriltags` reading the per-cube tag, and Eval-2/3 (once their outer loops land) just route which tag ID the detector tracks.
 
-Two entry points share the same hardware + image stack:
+Single entry point — `python -m deploy.deploy_real …` covers all three evals:
 
-* `python -m deploy.deploy_real …` — Eval-1 (single dex_cube).
-* `python -m deploy.deploy_real_clutter …` — Eval-2 (single target colour) and Eval-3 (3 sub-goals, shared bowl). See [§Eval-2/3](#eval-23--clutter-deploy) below.
+* **Eval-1** (single cube into bowl) — default; `--target-color red` (or just omit; red is the default).
+* **Eval-2** (single target in clutter) — same script, `--target-color blue|yellow|green|purple|orange` selects which cube to grasp. The AprilTag ID is what disambiguates the target from the distractors, so no additional flag or policy change is needed.
+* **Eval-3** (three sub-goals, shared bowl) — `--colors red,blue,yellow` (comma-separated sequence) runs the same policy three times in a row, calling `detector.set_target_id(...)` between sub-goals. Knobs: `--release-detect {manual,vision,timed}` (default `manual`) and `--no-home-between-subgoals`.
 
 ## Step 1 — clone
 
@@ -20,9 +21,65 @@ cd project3
 bash deploy/setup_inference_pc.sh
 ```
 
-## Step 3 — checkpoint
+## Step 3 — print AprilTag tags
 
-Download a known-good vision-PPO checkpoint to `deploy/runs/model.pt`:
+PNGs are vendored at `deploy/apriltags/tag41_12_*.png` — no download needed. Family is **`tagStandard41h12`** (5×5 bits — fits a 2 cm cube face; `tag36h11` is too dense at this size). See [`docs/STATE_APRILTAG_PLAN.md`](../docs/STATE_APRILTAG_PLAN.md) for the full plan.
+
+| ID | Use | Size | Where it goes | Required for |
+|---|---|---|---|---|
+| `0` | Cube — red | 15 mm | Top face, red cube | Eval-1, Eval-2/3 |
+| `1`–`5` | Cubes — blue, yellow, green, purple, orange | 15 mm | Top face, matching cube | Eval-2/3 |
+| `99` | **Calibration** | 30 mm | Flat on table during hand-eye calibration only | All evals |
+
+**For Eval-1 only**, print just `0` and `99` (two pieces total). For new object classes use IDs `≥ 10` and add a row above in the same PR; keep `0..9` reserved for cube colours and `99` reserved for calibration.
+
+**How to print**:
+
+1. Open `deploy/apriltags/tag41_12_00000.png` → set print size to **15 × 15 mm** (ID 99 → **30 × 30 mm**). If your print dialog won't accept mm, at 600 DPI a 15 mm tag is `15 / 25.4 × 600 ≈ 354 px`.
+2. **Matte** paper at **600 DPI** or higher. Glossy paper → specular highlights kill detection under room lighting.
+3. Cut keeping the **white border intact** — the detector treats the white quiet zone as part of the pattern. Never cut into the black border.
+4. Laminate flat with **matte** clear film (optional for first tests, required for durability — never glossy).
+5. Stick to the cube's top face with double-sided tape **under** the laminate.
+
+Tip: print all required IDs on a single A4 sheet — they're tiny. Make 2-3 spares in case cutting goes wrong.
+
+**Verify a print** before mounting. Hold it flat under the wrist cam and run:
+
+```bash
+conda activate so_arm
+python - <<'PY'
+import cv2
+from pupil_apriltags import Detector
+det = Detector(families="tagStandard41h12")
+cap = cv2.VideoCapture(0)
+ok, frame = cap.read()
+gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+print("Detected IDs:", [t.tag_id for t in det.detect(gray)])
+PY
+```
+
+Expected IDs missing? Common causes: smudged black border (reprint), tag too small relative to camera distance (reprint at 30 mm or move closer), glossy paper (reprint matte).
+
+## Step 4 — hand-eye calibration
+
+Computes `T_ee_cam` (rigid transform from end-effector frame → wrist-cam frame) and writes it to `deploy/hand_eye.yaml`. **Load-bearing**: a 1 cm error here shifts every tag pose by 1 cm in base frame → policy can't grasp. Re-run any time the camera mount is bumped, removed, or reseated.
+
+Procedure (~1 hour, one-time per camera mount):
+
+1. Place the **30 mm ID-99 tag** flat on the table, anywhere visible to the wrist cam.
+2. Manually teleop the arm to **≥ 12 distinct poses** that all keep the tag in view. Vary EE position **and** orientation. At each pose, record:
+   - `joint_pos` (servo read-back)
+   - RGB frame → `pupil-apriltags` → `T_cam_tag` (4×4 pose)
+3. Compute `T_base_ee` per sample via URDF FK (`kinpy`).
+4. Solve `cv2.calibrateHandEye(R_base_ee, t_base_ee, R_cam_tag, t_cam_tag, method=CALIB_HAND_EYE_TSAI)` → `T_ee_cam`.
+5. Write to `deploy/hand_eye.yaml` (sibling of `camera_intrinsics.yaml`).
+6. **Verify**: command the EE to the projected tag center (project `T_base_tag` to xy, move EE there). Offset must be **≤ 5 mm** by ruler. If larger, redo step 2 with more / better-distributed poses.
+
+`deploy/calibrate_hand_eye.py` runs steps 2–6 interactively (prompts each pose, captures the frame, solves at the end). *Script lands with the AprilTag pipeline — until then, this section is forward-looking; see [`docs/STATE_APRILTAG_PLAN.md`](../docs/STATE_APRILTAG_PLAN.md) §3 for the canonical procedure.*
+
+## Step 5 — checkpoint
+
+Download a known-good state-only + AprilTag PPO checkpoint to `deploy/runs/model.pt`:
 
 ```bash
 pip install --quiet gdown
@@ -30,95 +87,22 @@ mkdir -p deploy/runs
 gdown "https://drive.google.com/uc?id=1ixXvEX-JmKj9aODik-4Mw9UqJ0yKi_cp" -O deploy/runs/model.pt
 ```
 
-## Step 4 — real-arm rollout
+## Step 6 — real-arm rollout
+
+Tag ↔ colour: `0`=red, `1`=blue, `2`=yellow, `3`=green, `4`=purple, `5`=orange.
 
 ```bash
 conda activate so_arm
+
+# Eval-1 (red cube; --target-color red is the default)
 python -m deploy.deploy_real --bowl-xy 0.30,0.0
+
+# Eval-2 (--target-color picks the cube colour)
+python -m deploy.deploy_real --bowl-xy 0.22,0.0 --target-color blue
+
+# Eval-3 (three sub-goals, shared bowl). Defaults: manual release-detect
+# between sub-goals, homing on between sub-goals. Add --no-confirm to
+# skip the manual prompts; add --no-home-between-subgoals for speed.
+python -m deploy.deploy_real --bowl-xy 0.22,0.0 --colors red,blue,yellow
+
 ```
-
-### Mask source (`--mask-source`)
-
-The 4-channel wrist tensor the policy expects is `RGB + binary block mask`. Two ways to produce the mask channel on the real arm:
-
-| Flag | Speed | Robustness | When to use |
-|---|---|---|---|
-| `--mask-source florence` *(default)* | ~2–5 s/frame on CPU | Open-vocabulary segmentation via Florence-2 (`microsoft/Florence-2-base`) with a text prompt fixed in code (Eval-1 is single-cube). Robust to clutter, lighting changes, shadows | Production deploy. First run downloads ~1 GB of weights to `~/.cache/huggingface/`. |
-| `--mask-source hsv` | ~ms/frame, 50 Hz control loop | Brittle — `cv2.inRange` saturation gate + largest-CC pick latches onto the wrong blob whenever an in-FOV distractor (tool handle, cable, sticker) is more saturated than the cube | Clean scenes with only the cube on a near-white table; sim-vs-real visual gap A/B tests. Tune with `--hsv-low` / `--hsv-high`. |
-
-The prompt for `florence` is hardcoded for Eval-1 (single cube, no target-color input). Color-aware prompts ("red cube", "blue cube", …) are an Eval-2 / Eval-3 concern where the task carries a target color. To swap in a different segmenter (GroundedSAM, SAM-3, CLIPSeg, …) implement the `Detector` protocol in `deploy/cube_detector.py` and register it in `build_detector`. The interface is one method: `mask(rgb_hwc_uint8) -> (H, W) float32 in {0, 1}`.
-
-## Step 5 — sim↔real gap dump (optional)
-
-To diagnose the sim-to-real gap, run the same Eval-1 PPO checkpoint in both stacks with `--debug-dump` and compare the resulting folders. Both sides emit `step_XXXX.png` (RGB | mask composite, 72×256), a `log.jsonl` row per step (`state`, `action`, `q_sim_rad`, `ee_xy`, `target_sim_rad`), and `meta.json`. Pick a fixed `--bowl-xy` so the rollouts are comparable.
-
-```bash
-# --- Real (inference PC, conda env so_arm) ---------------------------------
-conda activate so_arm
-python -m deploy.deploy_real --bowl-xy 0.20,-0.05 --debug-dump
-# → deploy/runs/debug/<timestamp>/
-```
-
-```bash
-# --- Sim (training PC, uv env inside isaac_so_arm101/) ---------------------
-cd isaac_so_arm101
-# Use --load_run alone; the runner cfg's `load_checkpoint` glob picks the
-# highest-iter model_*.pt. If you need a specific iteration, pass --checkpoint
-# with the FULL absolute path (bare filenames are not resolved).
-uv run play --task Isaac-SO-ARM101-PickPlace-Bowl-Play-v0 \
-    --load_run <run-timestamp> \
-    --enable_cameras --debug-dump --dump-bowl-xy 0.20,-0.05
-# → logs/rsl_rl/pickplace_bowl/<run-timestamp>/debug_dump/<timestamp>/
-```
-
-The sim dump also includes critic-only ground truth (`block_xyz_gt`, `block_to_bowl_xy_gt`, `is_grasped_gt`) per row so you can pin down whether a divergence is upstream of the policy (image / state distribution) or downstream (action execution).
-
-The two folders share filenames and the jsonl schema (real dump simply omits the `*_gt` keys), so a row-by-row diff is direct.
-
-## Eval-2/3 — clutter deploy
-
-Same hardware loop, different policy class and observation contract. `deploy/deploy_real_clutter.py` consumes a Stage-3 vision PPO checkpoint from the `clutterpickplace` (Eval 2) or `eval3clutter` (Eval 3) task and routes the target colour through both the policy's FiLM head and Florence's text prompt.
-
-Drop a Stage-3 checkpoint at one of the search paths (or pass `--ckpt`):
-
-```bash
-deploy/runs/clutter_model.pt   # Eval-2
-deploy/runs/eval3_model.pt     # Eval-3
-```
-
-### Eval-2 — single target
-
-```bash
-conda activate so_arm
-python -m deploy.deploy_real_clutter --mode eval2 \
-    --target-color red --bowl-xy 0.22,0.0
-```
-
-What happens:
-
-* Loads `PPOActorClutter` (frozen ResNet-18 layer1-2 + FiLM + spatial-softmax + MLP[256,128,64]).
-* Builds the wrist tensor `(4, 72, 128)` with channel 3 from Florence-2 prompted `"red cube"`.
-* State vector is 31-D: policy(25) ++ target_color_onehot(6). The trailing 6 dims are sliced inside the actor and fed to the FiLM head.
-* One 5-s rollout, then exits.
-
-### Eval-3 — 3 sub-goals, shared bowl
-
-```bash
-conda activate so_arm
-python -m deploy.deploy_real_clutter --mode eval3 \
-    --colors red,blue,yellow --bowl-xy 0.22,0.0 \
-    --release-detect timed --subgoal-steps 250
-```
-
-What happens per sub-goal `k`:
-
-* Calls `detector.set_prompt(f"{colors[k]} cube")` — cheap, no model reload.
-* Overwrites the policy state's trailing 6-D one-hot with `onehot(colors[k])`.
-* Runs `--subgoal-steps` ticks (default 5 s @ 50 Hz).
-* If `--release-detect manual`, also accepts a non-blocking `<enter>` to advance early.
-
-A `vision`-based release detector (HSV-match the target cube's colour against the bowl region) is the spec's third suggestion; not implemented — add a new class behind the flag if you want it.
-
-### Mask source for Eval-2/3
-
-`--mask-source` works the same as Eval-1's table above, with one difference: the Florence prompt is **derived from the current target colour** (not fixed in code). The HSV fallback (`--mask-source hsv`) does **not** discriminate by colour and will produce a single-blob mask of "the most-saturated thing in view" — useful only as an A/B for Eval-2 with one cube on the table; do not use it for the actual multi-cube eval.

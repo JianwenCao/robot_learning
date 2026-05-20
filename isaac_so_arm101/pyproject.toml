@@ -33,6 +33,13 @@ url = "https://pypi.nvidia.com/"
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu128"
 
+# flatdict 4.0.1 (transitive dep of isaaclab 2.3.0) imports pkg_resources in
+# setup.py without declaring it. setuptools>=81 dropped the auto-installed
+# shim, so the legacy build fails under uv's build isolation. Inject
+# setuptools as a build dep so pkg_resources resolves.
+[tool.uv.extra-build-dependencies]
+flatdict = ["setuptools<81"]
+
 [build-system]
 requires = ["uv_build>=0.8.21,<0.9.0"]
 build-backend = "uv_build"

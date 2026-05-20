@@ -19,6 +19,13 @@ from isaac_so_arm101.tasks.pickplace.mdp.events import (  # noqa: F401
     randomize_wrist_hsv_dr,
     randomize_wrist_image_tint,
 )
+# AprilTag reset event is task-agnostic (uses NUM_COLORS / COLOR_NAMES
+# from clutterpickplace events.py, which match seqpickplace's palette
+# verbatim). Re-exported here so seqpickplace env cfgs can list it as a
+# reset event without a cross-task import.
+from isaac_so_arm101.tasks.clutterpickplace.mdp.events import (  # noqa: F401
+    reset_cube_positions_bias,
+)
 from isaac_so_arm101.tasks.pickplace.mdp.rewards import (  # noqa: F401
     wrist_cam_table_clearance,
 )
@@ -36,6 +43,8 @@ from .events import (  # noqa: F401
 )
 from .observations import (  # noqa: F401
     all_active_block_positions,
+    cube_positions_xy_noisy,
+    cube_visible_flags,
     current_step_onehot,
     current_target_block_position,
     current_target_block_to_bowl_xy,

@@ -271,6 +271,35 @@ class ObservationsCfg:
     wrist_image: WristImageCfg = WristImageCfg()
 
 
+@configclass
+class ClutterStateAprilTagObservationsCfg(ObservationsCfg):
+    """Obs variant for the state-only + AprilTag deploy path (Eval-2/3).
+
+    Extends :class:`ObservationsCfg` by adding two terms to ``PolicyCfg``:
+
+    * ``cube_positions_xy_noisy`` ``(N, NUM_COLORS*2)`` — sim-side mirror
+      of the pupil-apriltags pose pipeline (noisy xy per palette cube,
+      shared hand-eye bias + per-cube mount + per-step Gaussian + dropout
+      + tag-ID swap + post-grasp target freeze; inactive/parked cubes
+      publish zeros).
+    * ``cube_visible_flags`` ``(N, NUM_COLORS)`` — 1 if the tag was
+      detected this step, 0 if dropped / off-table / inactive.
+
+    Goal group (target_color_onehot) is inherited unchanged — the policy
+    still needs the goal-conditioning signal to know which cube is the
+    target. The env cfg that wires this in typically also nulls
+    ``scene.wrist_cam`` + ``observations.wrist_image`` (no rendering
+    needed for the state-only PPO path).
+    """
+
+    @configclass
+    class PolicyCfg(ObservationsCfg.PolicyCfg):
+        cube_positions_xy_noisy = ObsTerm(func=mdp.cube_positions_xy_noisy)
+        cube_visible_flags = ObsTerm(func=mdp.cube_visible_flags)
+
+    policy: PolicyCfg = PolicyCfg()
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------

@@ -77,3 +77,28 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# State-only + AprilTag deploy path. Camera-free env, PolicyCfg extended
+# with per-cube noisy xy + visibility flags. The seq_goal vector encodes
+# the current sub-goal target color + bowl xy + step idx — the deploy
+# loop advances the step counter between sub-goals; the post-grasp
+# freeze re-keys to the new target on each transition.
+gym.register(
+    id="Isaac-SO-ARM101-SeqPickPlace-StateAprilTag-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceStateAprilTagEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.state_apriltag_ppo_cfg:SeqPickPlaceStateAprilTagPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-SeqPickPlace-StateAprilTag-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceStateAprilTagEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.state_apriltag_ppo_cfg:SeqPickPlaceStateAprilTagPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)

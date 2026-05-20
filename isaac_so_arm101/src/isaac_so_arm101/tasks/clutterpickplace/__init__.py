@@ -107,3 +107,28 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# State-only + AprilTag deploy path — camera-free env, PolicyCfg extended
+# with cube_positions_xy_noisy + cube_visible_flags (sim-side mirror of
+# pupil-apriltags pose injection on the real arm). See
+# ``docs/STATE_APRILTAG_PLAN.md``. Single-stage PPO (no distillation, no
+# vision warm-start). No ``--enable_cameras`` needed.
+gym.register(
+    id="Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101ClutterPickPlaceStateAprilTagEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.state_apriltag_ppo_cfg:ClutterPickPlaceStateAprilTagPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101ClutterPickPlaceStateAprilTagEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.state_apriltag_ppo_cfg:ClutterPickPlaceStateAprilTagPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)

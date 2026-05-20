@@ -41,6 +41,7 @@ import isaac_so_arm101.tasks.clutterpickplace.mdp as mdp
 from isaac_so_arm101.robots import SO_ARM101_CFG
 from isaac_so_arm101.tasks.clutterpickplace.clutterpickplace_env_cfg import (
     ClutterPickPlaceEnvCfg,
+    ClutterStateAprilTagObservationsCfg,
     WRIST_RGB_HEIGHT,
     WRIST_RGB_WIDTH,
 )
@@ -49,6 +50,7 @@ from isaac_so_arm101.tasks.clutterpickplace.mdp.events import (
     COLOR_NAMES,
     HIDDEN_PARK_XY,
 )
+from isaaclab.managers import EventTermCfg as EventTerm
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 
@@ -282,3 +284,53 @@ class SoArm101ClutterPickPlaceTeacherFastEnvCfg_PLAY(SoArm101ClutterPickPlaceTea
         self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
         self.scene.env_spacing = _multicube_sim.ENV_SPACING
         self.observations.policy.enable_corruption = False
+
+
+@configclass
+class SoArm101ClutterPickPlaceStateAprilTagEnvCfg(SoArm101ClutterPickPlaceTeacherFastEnvCfg):
+    """State-only + AprilTag deploy path for Eval-2 (single sub-goal).
+
+    Inherits the Teacher-Fast subclass (camera-free, no wrist_image obs)
+    and:
+
+    * Swaps in :class:`ClutterStateAprilTagObservationsCfg` so ``PolicyCfg``
+      gains ``cube_positions_xy_noisy`` ``(N, 12)`` and ``cube_visible_flags``
+      ``(N, 6)``. Goal group (``target_color`` one-hot) is inherited.
+    * Adds ``reset_cube_positions_bias`` event listed **after**
+      ``place_clutter_blocks`` so ``_cube_pos_last`` is seeded against
+      the freshly-placed cube positions.
+
+    See ``docs/STATE_APRILTAG_PLAN.md`` for the deploy-side mirror. The
+    accompanying runner cfg uses
+    ``obs_groups = {"policy": ["policy", "goal"], "critic": ["policy", "goal", "critic"]}``
+    — actor consumes deployable obs only; critic sees privileged GT cube
+    positions for stable value estimation.
+    """
+
+    observations: ClutterStateAprilTagObservationsCfg = ClutterStateAprilTagObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.events.reset_cube_positions_bias = EventTerm(
+            func=mdp.reset_cube_positions_bias, mode="reset"
+        )
+
+
+@configclass
+class SoArm101ClutterPickPlaceStateAprilTagEnvCfg_PLAY(SoArm101ClutterPickPlaceStateAprilTagEnvCfg):
+    """Play variant: fewer envs, no corruption, no AprilTag noise.
+
+    ``corrupt=False`` short-circuits the bias / Gaussian / dropout / ID
+    swap inside :func:`mdp.observations._compute_apriltag_obs`. The
+    post-grasp target freeze still applies (physical occlusion, not
+    corruption).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        from isaac_so_arm101.tasks import _multicube_sim
+        self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
+        self.scene.env_spacing = _multicube_sim.ENV_SPACING
+        self.observations.policy.enable_corruption = False
+        self.observations.policy.cube_positions_xy_noisy.params = {"corrupt": False}
+        self.observations.policy.cube_visible_flags.params = {"corrupt": False}

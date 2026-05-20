@@ -61,7 +61,12 @@ def _cube_cfg(color_name: str, default_xy: tuple[float, float]) -> RigidObjectCf
                 static_friction=1.0,
                 dynamic_friction=1.0,
             ),
-            semantic_tags=[("class", "block")],
+            # Per-color semantic tag so the wrist-cam segmentation can
+            # carry instance information; `wrist_rgb_union_mask_dr`
+            # OR-reduces over all 6 IDs into one binary channel, and the
+            # `_resolve_color_class_ids` helper (from clutterpickplace)
+            # is reused as-is.
+            semantic_tags=[("class", f"cube_{color_name}")],
         ),
     )
 
@@ -78,6 +83,13 @@ class SoArm101SingulationEnvCfg(SingulationEnvCfg):
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state=home_state,
         )
+
+        # Bowl command anchors its xy goal to gripper_link, same as
+        # Eval-1/2/3 (this only determines which body the goal pose is
+        # *expressed relative to* for the upstream UniformPoseCommand —
+        # SingulationBowlPoseCommand still uses robot-frame xy via
+        # `pose_command_b`).
+        self.commands.bowl_pose.body_name = "gripper_link"
 
         self.actions.arm_action = mdp.JointPositionActionCfg(
             asset_name="robot",
@@ -117,7 +129,8 @@ class SoArm101SingulationEnvCfg(SingulationEnvCfg):
             update_period=self.sim.dt * self.decimation,
             height=WRIST_RGB_HEIGHT,
             width=WRIST_RGB_WIDTH,
-            data_types=["rgb"],
+            data_types=["rgb", "semantic_segmentation"],
+            colorize_semantic_segmentation=False,
             spawn=PinholeCameraCfg(
                 focal_length=intrinsics["focal_length"],
                 horizontal_aperture=intrinsics["horizontal_aperture"],

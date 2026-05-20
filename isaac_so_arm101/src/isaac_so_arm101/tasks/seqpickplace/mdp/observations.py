@@ -28,6 +28,7 @@ from isaac_so_arm101.tasks.pickplace.mdp.observations import (
 )
 from isaac_so_arm101.tasks.clutterpickplace.mdp.observations import (
     _binary_mask_for_palette_idx,
+    _compute_apriltag_obs,
     _morph_mask,
     _resolve_color_class_ids,
 )
@@ -174,6 +175,50 @@ def current_target_block_to_bowl_xy(
 # ---------------------------------------------------------------------------
 # Wrist RGB (DR-applied; no seg)
 # ---------------------------------------------------------------------------
+
+
+def cube_positions_xy_noisy(
+    env: "ManagerBasedRLEnv",
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+) -> torch.Tensor:
+    """``(N, NUM_COLORS*2)`` noisy xy per palette cube — Eval-3 AprilTag obs.
+
+    Identical noise model to
+    :func:`clutterpickplace.mdp.observations.cube_positions_xy_noisy`,
+    but the post-grasp freeze tracks the **current sub-goal target**
+    (read via :func:`_current_target_palette_idx`) so the freeze re-keys
+    when the policy advances to the next sub-goal.
+    """
+    target = _current_target_palette_idx(env)
+    pos, _ = _compute_apriltag_obs(
+        env, target,
+        sigma_m=sigma_m, dropout_p=dropout_p, swap_prob=swap_prob, corrupt=corrupt,
+    )
+    return pos.reshape(pos.shape[0], -1)
+
+
+def cube_visible_flags(
+    env: "ManagerBasedRLEnv",
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+) -> torch.Tensor:
+    """``(N, NUM_COLORS)`` per-cube visibility flag (Eval-3 variant).
+
+    Shares the cached :func:`_compute_apriltag_obs` pass with
+    :func:`cube_positions_xy_noisy`; key freeze target is the current
+    sub-goal target palette idx.
+    """
+    target = _current_target_palette_idx(env)
+    _, vis = _compute_apriltag_obs(
+        env, target,
+        sigma_m=sigma_m, dropout_p=dropout_p, swap_prob=swap_prob, corrupt=corrupt,
+    )
+    return vis
 
 
 def wrist_rgb_dr(

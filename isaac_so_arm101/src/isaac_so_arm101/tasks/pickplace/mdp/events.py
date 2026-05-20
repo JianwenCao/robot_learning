@@ -32,6 +32,7 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import Camera
+from isaaclab.utils.math import subtract_frame_transforms
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -259,6 +260,64 @@ def reset_was_grasped(
     elif len(env_ids) == 0:
         return
     flag[env_ids] = False
+
+
+def reset_cube_pos_bias(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    bias_range_m: tuple[float, float] = (-0.005, 0.005),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Per-episode reset for the AprilTag-noise buffers used by
+    :func:`mdp.observations.cube_pos_xy_noisy`.
+
+    Three responsibilities on each reset:
+
+    * Sample a fresh per-env (Δx, Δy) bias from ``U[bias_range_m, ...]`` and
+      store in ``env._cube_pos_bias``. Models hand-eye calibration residual
+      — constant across the episode (a single calibration offset doesn't
+      change mid-rollout) and small (default ±5 mm, matching the 5 mm
+      verify gate from STATE_APRILTAG_PLAN §3).
+    * Clear the post-grasp freeze latch ``env._cube_pos_frozen``.
+    * Seed ``env._cube_pos_last`` with the freshly randomized cube xy so
+      first-step dropout returns a sensible value (not zeros).
+
+    **List this term AFTER ``reset_block_position`` in EventCfg** so the
+    seeded ``_cube_pos_last`` reflects the post-reset cube position. Doing
+    so before reset_block_position would seed last with the pre-reset
+    pose, biasing the very first obs of each episode.
+    """
+    n_envs = env.num_envs
+    device = env.device
+
+    # Lazy-allocate. Same buffer layout as cube_pos_xy_noisy expects.
+    if not hasattr(env, "_cube_pos_bias"):
+        env._cube_pos_bias = torch.zeros(n_envs, 2, device=device)
+    if not hasattr(env, "_cube_pos_frozen"):
+        env._cube_pos_frozen = torch.zeros(n_envs, dtype=torch.bool, device=device)
+    if not hasattr(env, "_cube_pos_last"):
+        env._cube_pos_last = torch.zeros(n_envs, 2, device=device)
+
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+    elif len(env_ids) == 0:
+        return
+    n = env_ids.numel() if isinstance(env_ids, torch.Tensor) else len(env_ids)
+
+    lo, hi = bias_range_m
+    env._cube_pos_bias[env_ids] = lo + (hi - lo) * torch.rand((n, 2), device=device)
+    env._cube_pos_frozen[env_ids] = False
+
+    # Seed last with the post-reset cube xy in robot frame.
+    obj: RigidObject = env.scene[object_cfg.name]
+    robot: Articulation = env.scene[robot_cfg.name]
+    cube_w = obj.data.root_pos_w[env_ids, :3]
+    root_w = robot.data.root_state_w[env_ids, :3]
+    root_quat = robot.data.root_state_w[env_ids, 3:7]
+    cube_b, _ = subtract_frame_transforms(root_w, root_quat, cube_w)
+    env._cube_pos_last[env_ids] = cube_b[:, :2]
 
 
 def reset_was_over_bowl_above_rim(

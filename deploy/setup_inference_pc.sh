@@ -101,37 +101,11 @@ else
   pip install --quiet --upgrade 'transformers<5'
 fi
 
-# 6. Off-the-shelf cube segmenter deps (florence is the default --mask-source).
-#    Florence-2 ships custom modeling code that imports einops + timm; Pillow
-#    is needed to feed PIL.Image into the AutoProcessor. accelerate is used
-#    by transformers' device_map machinery and silences a runtime warning.
-#    We install eagerly so first-run of --mask-source florence isn't held up
-#    by a 1-minute pip resolve on the inference PC.
-python -c "import timm"       2>/dev/null || pip install --quiet timm
-python -c "import einops"     2>/dev/null || pip install --quiet einops
-python -c "import accelerate" 2>/dev/null || pip install --quiet accelerate
-python -c "import PIL"        2>/dev/null || pip install --quiet Pillow
-
-# 6b. Pre-download Florence-2 weights (~1 GB) into the HF cache so the first
-#     real-robot run isn't blocked on a model download. Florence is the
-#     default --mask-source for both deploy_real and deploy_real_clutter.
-FLORENCE_ID="microsoft/Florence-2-base"
-if python - <<PY 2>/dev/null
-from huggingface_hub import snapshot_download
-from pathlib import Path
-p = Path(snapshot_download("$FLORENCE_ID", local_files_only=True))
-# Sanity-check that weights (not just the config) are present.
-assert any(p.glob("*.safetensors")) or any(p.glob("pytorch_model*.bin")), "weights missing"
-PY
-then
-  echo "[setup] Florence-2 weights already cached — skipping download."
-else
-  echo "[setup] downloading Florence-2 weights ($FLORENCE_ID, ~1 GB) ..."
-  python - <<PY
-from huggingface_hub import snapshot_download
-snapshot_download("$FLORENCE_ID")
-PY
-fi
+# 6. AprilTag detector (CPU, ~2 ms/frame). The project is pivoting toward
+#    state-only + AprilTag pose-injection as the default real-robot mask
+#    source (see docs/STATE_APRILTAG_PLAN.md). pupil-apriltags is the
+#    detector dep; the calibration + sim-side obs work is tracked separately.
+python -c "import pupil_apriltags" 2>/dev/null || pip install --quiet pupil-apriltags
 
 # ============================================================ verify ===
 echo
@@ -140,8 +114,8 @@ python - <<'PY'
 import importlib, sys
 mods = [
     "torch", "torchvision", "numpy", "cv2", "yaml", "kinpy",
-    "PIL", "transformers", "timm", "einops", "accelerate",
-    "deploy.ppo_actor", "deploy.deploy_real", "deploy.cube_detector",
+    "pupil_apriltags",
+    "deploy.ppo_actor", "deploy.driver", "deploy.deploy_real", "deploy.cube_detector",
 ]
 fails = []
 for m in mods:
@@ -156,34 +130,23 @@ import torch
 print(f"  torch                     = {torch.__version__}")
 print(f"  torch.cuda.is_available() = {torch.cuda.is_available()}  (CPU is fine for this model)")
 
-# Florence-2 load smoke-test: catches bad cache / trust_remote_code issues
-# now rather than at the start of the first real-robot run.
-try:
-    from transformers import AutoProcessor, AutoModelForCausalLM
-    AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
-    AutoModelForCausalLM.from_pretrained(
-        "microsoft/Florence-2-base", trust_remote_code=True, torch_dtype=torch.float32
-    )
-    print("  ok   microsoft/Florence-2-base (processor + weights load)")
-except Exception as e:
-    fails.append(("microsoft/Florence-2-base", e))
-    print(f"  FAIL microsoft/Florence-2-base: {e}")
-
 sys.exit(1 if fails else 0)
 PY
 
 # ============================================================ artifacts ===
 echo
-CKPT="deploy/runs/model.pt"
+CKPT_PRIMARY="deploy/runs/state_apriltag_model.pt"
+CKPT_FALLBACK="deploy/runs/model.pt"
 
-if [[ -f "$CKPT" ]]; then
-  echo "[verify] PPO checkpoint present at $CKPT."
+if [[ -f "$CKPT_PRIMARY" || -f "$CKPT_FALLBACK" ]]; then
+  echo "[verify] state+AprilTag PPO checkpoint present (one of $CKPT_PRIMARY, $CKPT_FALLBACK)."
 else
   cat >&2 <<EOF
-[verify] WARNING: PPO checkpoint missing at:
-   $CKPT
+[verify] WARNING: state+AprilTag PPO checkpoint missing. Looked at:
+   $CKPT_PRIMARY
+   $CKPT_FALLBACK
 
-Drop a trained vision-PPO checkpoint there (see deploy/README.md step 3).
+Drop a trained state-only checkpoint at $CKPT_PRIMARY (see deploy/README.md step 5).
 EOF
 fi
 
