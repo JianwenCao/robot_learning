@@ -39,9 +39,15 @@ Action pipeline (must match training):
   ``BinaryJointPositionActionCfg(open=0.5, close=0.0)``).
 * Per-motor unit conversion lives in ``LerobotSO101Driver``: the five arm
   motors are in ``MotorNormMode.DEGREES`` (so rad ↔ deg) and the gripper
-  is in ``MotorNormMode.RANGE_0_100`` (so the sim's [0, 0.5] rad maps
-  linearly to [0, 100] %). Writing sim-rad straight to the bus would put
-  the gripper at 0.5 % open (≈ fully closed) on every "open" command.
+  is in ``MotorNormMode.RANGE_0_100``. The standard SO-101 calibration
+  sweeps the jaw through its full mechanical travel, so on the bus 0 % =
+  jaw fully closed and 100 % = jaw fully open (≈ URDF upper 1.7453 rad).
+  Sim's "open" command is only 0.5 rad — partway up that band — so we
+  use an affine map over the URDF range (``GRIPPER_JAW_RAD_MIN/MAX``) to
+  convert pct ↔ sim_rad. Sim 0.5 rad lands at ~35 % pct; treating the
+  bus value as a direct scale of sim_rad (the old ``×200`` factor) would
+  drive the real jaw to the mechanical limit on every "open" command,
+  well outside the policy's training distribution.
 
 Control rate is 50 Hz to match the sim (``decimation=2``, ``sim.dt=0.01`` →
 50 Hz, 250 steps over the 5 s episode). The policy is queried *every* step
@@ -110,14 +116,28 @@ ARM_ACTION_SCALE = 0.5                  # JointPositionActionCfg.scale
 GRIPPER_OPEN_RAD = 0.5                  # sim "open" gripper joint position
 GRIPPER_CLOSE_RAD = 0.0                 # sim "closed" gripper joint position
 # Gripper unit conversion. LeRobot's ``SO101Follower`` puts the gripper
-# motor in ``MotorNormMode.RANGE_0_100`` (not DEGREES like the arm). So
-# ``obs["gripper.pos"] ∈ [0, 100]`` and goal-position writes to
-# ``gripper.pos`` are interpreted as % of the calibrated range. We map
-# [0, 100] linearly to the sim's [0, GRIPPER_OPEN_RAD] joint range so the
-# observation and the action both arrive in the sim's units (which is the
-# distribution the policy was trained on). 100 % open → 0.5 sim_rad, 0 %
-# → 0 sim_rad.
-GRIPPER_PCT_PER_SIM_RAD = 100.0 / GRIPPER_OPEN_RAD
+# motor in ``MotorNormMode.RANGE_0_100`` (not DEGREES like the arm). The
+# standard SO-101 calibration sweep records ``range_min``/``range_max``
+# at the jaw's mechanical limits, so on the bus 0 % = jaw fully closed
+# and 100 % = jaw fully open. The URDF (``so_arm101.urdf``) declares the
+# matching joint range as ``lower=-0.1745, upper=1.7453`` rad — sim
+# defaults the gripper to 0.5 rad ("open" per the lift task's
+# ``BinaryJointPositionActionCfg(open=0.5)``), which is only ~35 % of
+# that band, NOT the mechanical limit. We therefore use an affine map
+# pct ↔ sim_rad over the URDF range so 100 % pct lands at the URDF upper
+# (where the calibration sweep ended), and sim 0.5 rad lands at ~35.1 %
+# pct — both obs and action stay in the policy's training distribution.
+GRIPPER_JAW_RAD_MIN = -0.174533         # URDF gripper joint ``lower``
+GRIPPER_JAW_RAD_MAX = 1.74533           # URDF gripper joint ``upper``
+GRIPPER_JAW_RAD_SPAN = GRIPPER_JAW_RAD_MAX - GRIPPER_JAW_RAD_MIN
+
+
+def _gripper_pct_from_sim_rad(sim_rad: float) -> float:
+    return (sim_rad - GRIPPER_JAW_RAD_MIN) / GRIPPER_JAW_RAD_SPAN * 100.0
+
+
+def _gripper_sim_rad_from_pct(pct: float) -> float:
+    return pct / 100.0 * GRIPPER_JAW_RAD_SPAN + GRIPPER_JAW_RAD_MIN
 
 # Pre-rollout homing target. Arm joints match the sim reset pose
 # (``SO_ARM101_CFG.init_state.joint_pos`` overridden in ``joint_pos_env_cfg.py``
@@ -282,7 +302,7 @@ class LerobotSO101Driver:
         out = np.empty(6, dtype=np.float32)
         for i, n in enumerate(JOINT_NAMES[:5]):
             out[i] = float(obs[f"{n}.pos"]) * (np.pi / 180.0)
-        out[5] = float(obs["gripper.pos"]) / GRIPPER_PCT_PER_SIM_RAD
+        out[5] = _gripper_sim_rad_from_pct(float(obs["gripper.pos"]))
         return out
 
     def capture_wrist_rgb_hwc(self) -> np.ndarray:
@@ -303,7 +323,7 @@ class LerobotSO101Driver:
         cmd: dict[str, float] = {}
         for i, n in enumerate(JOINT_NAMES[:5]):
             cmd[f"{n}.pos"] = float(target_sim_rad[i]) * (180.0 / np.pi)
-        pct = float(np.clip(target_sim_rad[5] * GRIPPER_PCT_PER_SIM_RAD, 0.0, 100.0))
+        pct = float(np.clip(_gripper_pct_from_sim_rad(float(target_sim_rad[5])), 0.0, 100.0))
         cmd["gripper.pos"] = pct
         self._robot.send_action(cmd)
 
@@ -367,18 +387,18 @@ def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
             return q
         step = _slew_limit(target_rad, q, max_step=max_step)
         # Bypass the slew cap on the gripper jaw during homing. The jaw has
-        # gear backlash + spring preload, so a 0.03 sim_rad (~6 % pct)
+        # gear backlash + spring preload, so a 0.03 sim_rad (~1.6 % pct)
         # commanded position error never builds enough Feetech-PID torque
         # to overcome static friction — the servo doesn't move, ``q[5]``
         # stays put, and the next loop commands the same near-current
         # target, leaving the jaw stuck. Sending the full home target
-        # ``target_rad[5]`` (≈ pct 100 for "open") gives the PID a large
-        # error to drive against, and the jaw reaches home in one or two
-        # servo response cycles. The slew cap is still enforced during the
-        # rollout, where it matches the sim gripper's
-        # ``velocity_limit_sim=1.5`` rad/s — but homing is a one-time
-        # pre-rollout setup, not an in-distribution policy step, so
-        # matching sim's transition rate isn't required here.
+        # ``target_rad[5]`` (sim 0.5 rad ≈ pct 35 with the URDF-range
+        # affine map) gives the PID a large error to drive against, and
+        # the jaw reaches home in one or two servo response cycles. The
+        # slew cap is still enforced during the rollout, where it matches
+        # the sim gripper's ``velocity_limit_sim=1.5`` rad/s — but homing
+        # is a one-time pre-rollout setup, not an in-distribution policy
+        # step, so matching sim's transition rate isn't required here.
         step[5] = target_rad[5]
         driver.send_joint_targets_sim_rad(step)
         next_tick += dt
@@ -507,7 +527,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
     try:
         q0 = driver.read_proprio_sim_rad()
         print(f"[ppo] pre-home pose: q_sim_rad={q0.round(3)} "
-              f"(arm_deg={_rad_to_deg(q0[:5]).round(2)}, gripper_pct≈{q0[5]*GRIPPER_PCT_PER_SIM_RAD:.1f})")
+              f"(arm_deg={_rad_to_deg(q0[:5]).round(2)}, gripper_pct≈{_gripper_pct_from_sim_rad(float(q0[5])):.1f})")
         if not args.no_confirm:
             input("[ppo] arm will slow-slew to home (shoulder=0, wrist=90°, gripper=open). "
                   "Clear the workspace. Press <enter> to home, ctrl-C to abort … ")
