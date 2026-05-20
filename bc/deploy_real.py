@@ -68,11 +68,16 @@ match what the policy was trained against:
 * EWMA on the finite-difference joint velocity, since the sim's
   ``joint_vel_rel`` is a clean PhysX read and the servo FD is encoder-quantized
   + bus-jittered noise that lives outside the policy's training distribution;
-* pre-rollout slow-slew to the sim reset pose ``(0, 0, 0, 1.57, 0, gripper=open)``
-  using the same ``MAX_RAD_PER_STEP`` cap, so the t=0 obs has ``joint_pos_rel ≈ 0``
-  (matches the sim reset distribution; otherwise the slew cap silently clips the
-  policy's early actions while the arm catches up from whatever pose it sat in).
-  Homing has a timeout — on miss we warn and proceed rather than block the rollout.
+* pre-rollout homing to the sim reset pose ``(0, 0, 0, 1.57, 0, gripper=open)``
+  by commanding the full home target directly (slew cap bypassed) so the t=0
+  obs has ``joint_pos_rel ≈ 0`` (matches the sim reset distribution; otherwise
+  the slew cap silently clips the policy's early actions while the arm catches
+  up from whatever pose it sat in). The slew cap is intentionally *not* used
+  during homing — its tiny 0.03 rad/step position error produces too little
+  Feetech-PID torque to overcome gravity on shoulder_lift / elbow_flex, and
+  the arm never reaches home before the timeout. See ``_slew_to_home`` for
+  the full rationale. Homing has a timeout — on miss we warn and proceed
+  rather than block the rollout.
 """
 from __future__ import annotations
 
@@ -141,11 +146,12 @@ def _gripper_sim_rad_from_pct(pct: float) -> float:
 
 # Pre-rollout homing target. Arm joints match the sim reset pose
 # (``SO_ARM101_CFG.init_state.joint_pos`` overridden in ``joint_pos_env_cfg.py``
-# with ``gripper=0.5``). Slew is rate-limited by ``MAX_RAD_PER_STEP``, same as
-# the policy loop, so no jerk relative to what the policy expects.
+# with ``gripper=0.5``). The home target is commanded directly (no slew cap,
+# see ``_slew_to_home``) so gravity-loaded joints actually reach it before
+# the timeout fires.
 HOME_POSE_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, GRIPPER_OPEN_RAD], dtype=np.float32)
 HOME_TOLERANCE_RAD = 0.03               # ~1.7° — wider than Feetech deadband
-HOMING_TIMEOUT_S = 6.0                  # 1.5 rad/s cap → ~1 s per rad; 6 s covers worst-case start
+HOMING_TIMEOUT_S = 6.0                  # raw servo response; one or two PID cycles per joint
 
 IMG_H, IMG_W = 72, 128
 FPS = 50                                # matches sim (decimation=2, sim.dt=0.01 → 50 Hz)
@@ -365,13 +371,27 @@ def _slew_limit(target_rad: np.ndarray, current_rad: np.ndarray,
 def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
                   tol: float = HOME_TOLERANCE_RAD,
                   timeout_s: float = HOMING_TIMEOUT_S,
-                  fps: int = FPS,
-                  max_step: float = MAX_RAD_PER_STEP) -> np.ndarray:
-    """Drive the arm toward ``target_rad`` using the policy-loop slew cap.
+                  fps: int = FPS) -> np.ndarray:
+    """Drive the arm toward ``target_rad`` by commanding the home pose directly.
 
     Returns the last observed joint pose (rad). On timeout, prints a warning
     and returns the residual pose so the caller can proceed — a sticky joint
     or off-by-a-lot start pose shouldn't block the rollout.
+
+    Bypasses the policy-loop slew cap (``MAX_RAD_PER_STEP``) on *all* joints
+    during homing. The slew cap exists to mirror sim's
+    ``velocity_limit_sim=1.5 rad/s`` during the in-distribution rollout, but
+    during homing it instead keeps the per-step commanded-position error
+    tiny (~0.03 rad), which produces almost no Feetech-PID torque (configured
+    P=16 by LeRobot to suppress shakiness). Gravity-loaded joints —
+    shoulder_lift and elbow_flex in particular — then never move from their
+    pre-home pose, the 6 s timeout fires, and the rollout starts well outside
+    the trained workspace (~9 cm off in ee_x in one observed run). Sending
+    the full home target directly gives the PID a large position error to
+    drive against, so each joint reaches home in one or two servo response
+    cycles. Homing is a one-time pre-rollout setup, not an in-distribution
+    policy step, so matching sim's transition rate isn't required here; the
+    slew cap is still enforced during the rollout itself.
     """
     dt = 1.0 / fps
     t_start = time.time()
@@ -385,22 +405,7 @@ def _slew_to_home(driver, target_rad: np.ndarray = HOME_POSE_RAD,
             print(f"[ppo] homed in {time.time() - t_start:.2f}s "
                   f"(per-joint residual={per_joint})")
             return q
-        step = _slew_limit(target_rad, q, max_step=max_step)
-        # Bypass the slew cap on the gripper jaw during homing. The jaw has
-        # gear backlash + spring preload, so a 0.03 sim_rad (~1.6 % pct)
-        # commanded position error never builds enough Feetech-PID torque
-        # to overcome static friction — the servo doesn't move, ``q[5]``
-        # stays put, and the next loop commands the same near-current
-        # target, leaving the jaw stuck. Sending the full home target
-        # ``target_rad[5]`` (sim 0.5 rad ≈ pct 35 with the URDF-range
-        # affine map) gives the PID a large error to drive against, and
-        # the jaw reaches home in one or two servo response cycles. The
-        # slew cap is still enforced during the rollout, where it matches
-        # the sim gripper's ``velocity_limit_sim=1.5`` rad/s — but homing
-        # is a one-time pre-rollout setup, not an in-distribution policy
-        # step, so matching sim's transition rate isn't required here.
-        step[5] = target_rad[5]
-        driver.send_joint_targets_sim_rad(step)
+        driver.send_joint_targets_sim_rad(target_rad)
         next_tick += dt
         sleep_for = next_tick - time.time()
         if sleep_for > 0:
@@ -529,7 +534,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
         print(f"[ppo] pre-home pose: q_sim_rad={q0.round(3)} "
               f"(arm_deg={_rad_to_deg(q0[:5]).round(2)}, gripper_pct≈{_gripper_pct_from_sim_rad(float(q0[5])):.1f})")
         if not args.no_confirm:
-            input("[ppo] arm will slow-slew to home (shoulder=0, wrist=90°, gripper=open). "
+            input("[ppo] arm will home to (shoulder=0, wrist=90°, gripper=open). "
                   "Clear the workspace. Press <enter> to home, ctrl-C to abort … ")
         q_rad_prev = _slew_to_home(driver)
         ee_xyz_now = fk.ee_xyz(q_rad_prev)
