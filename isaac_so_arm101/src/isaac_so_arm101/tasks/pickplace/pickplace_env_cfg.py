@@ -530,14 +530,17 @@ class RewardsCfg:
     # per-step release_in_bowl streaming), but on its own isn't enough
     # because steady-state hover (reach+lift+track+track_fine ≈ 37/step)
     # paid more than the policy's expected release reward when release
-    # was undiscoverable. These two terms (+3 lure, -1 hover penalty,
-    # both ≪ release_in_bowl=30 so they can't dominate it) make the
-    # release path cheaper to find AND make hovering net less rewarding.)
+    # was undiscoverable. The lure now pays only for opening while the
+    # cube is currently over the bowl at release height, and the closed-
+    # gripper penalty applies throughout the near-bowl zone. This biases
+    # the policy toward "open above target and let the cube fall" instead
+    # of "keep the gripper closed and push the cube down into the target".
+    # Both terms remain small relative to release_in_bowl=30.)
     gripper_open_above_bowl_lure = RewTerm(
         func=mdp.gripper_open_above_bowl_lure, weight=3.0,
     )
     still_grasped_above_bowl_penalty = RewTerm(
-        func=mdp.still_grasped_above_bowl_penalty, weight=-1.0,
+        func=mdp.still_grasped_above_bowl_penalty, weight=-2.0,
     )
 
     # OLD COMMENT (pre-stage-2): NO release reward — stage 1 is a
