@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup for the Eval-1 PPO **real-robot** inference PC.
+# One-time setup for the Eval-1/2/3 PPO **real-robot** inference PC.
 #
 # Idempotent: safe to re-run — each step skips itself when already satisfied.
 # Creates/updates the `so_arm` conda env with PyTorch + the deploy deps
@@ -106,6 +106,11 @@ fi
 #    source (see docs/STATE_APRILTAG_PLAN.md). pupil-apriltags is the
 #    detector dep; the calibration + sim-side obs work is tracked separately.
 python -c "import pupil_apriltags" 2>/dev/null || pip install --quiet pupil-apriltags
+
+# 7. gdown — used by deploy/README.md Step 5 to fetch the trained PPO
+#    checkpoint from Google Drive. Tiny pure-Python dep; install once here
+#    so the README's `gdown ...` line works without extra steps.
+python -c "import gdown" 2>/dev/null || pip install --quiet gdown
 
 # ============================================================ verify ===
 echo

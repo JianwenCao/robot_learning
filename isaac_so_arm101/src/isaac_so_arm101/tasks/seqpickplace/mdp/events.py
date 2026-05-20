@@ -64,7 +64,7 @@ def place_seq_blocks(
     env_ids: torch.Tensor,
     block_x: tuple[float, float] = (0.13, 0.28),
     block_y: tuple[float, float] = (-0.15, 0.15),
-    min_block_separation: float = 0.06,
+    min_block_separation: float = 0.08,
     table_z: float = 0.01,
     max_attempts: int = 80,
     bowl_x: tuple[float, float] = (0.15, 0.28),
@@ -95,10 +95,10 @@ def place_seq_blocks(
     Cube placement: 4 cubes placed independently in the workspace
     with sequential rejection sampling — each new cube must be ≥
     ``min_block_separation`` from all previously-placed cubes. Default
-    7 cm gives ~5 cm edge gap for 2 cm cubes — wider than the gripper
-    fingers so the policy can pick any cube without colliding with a
-    neighbor. The bowl is sampled FIRST so cube placement can reject
-    against it.
+    8 cm gives ~6 cm edge gap for 2 cm cubes — wider than the SO-ARM
+    gripper finger span so the policy can pick any cube without
+    contacting a neighbour. The bowl is sampled FIRST so cube placement
+    can reject against it.
     """
     del command_name  # The command is passive; we own all the state.
     if isinstance(env_ids, torch.Tensor):

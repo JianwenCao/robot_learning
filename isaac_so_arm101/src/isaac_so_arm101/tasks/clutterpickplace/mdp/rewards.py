@@ -92,7 +92,7 @@ def _target_lifted_mask(
 def _target_over_bowl_high_mask(
     env: "ManagerBasedRLEnv",
     r_safe: float = 0.06,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "bowl_pose",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
@@ -175,9 +175,9 @@ def target_transport_to_bowl(
 def target_in_bowl(
     env: "ManagerBasedRLEnv",
     r_safe: float = 0.06,
-    bowl_height: float = 0.08,
+    bowl_height: float = 0.06,
     minimal_height: float = 0.025,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "bowl_pose",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
@@ -208,7 +208,7 @@ def release_target_in_bowl(
     gripper_open_threshold: float = 0.2,
     block_speed_threshold: float = 0.05,
     minimal_height: float = 0.07,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "bowl_pose",
     gripper_joint_name: str = "gripper",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

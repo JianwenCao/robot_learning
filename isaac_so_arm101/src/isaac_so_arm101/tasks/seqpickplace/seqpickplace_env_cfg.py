@@ -200,13 +200,15 @@ class EventCfg:
         params={
             # 4 cubes spread independently with pairwise rejection.
             # Workspace 0.15×0.30 m² is enough to fit 4 cubes at
-            # ≥ 6 cm pairwise separation (≥ 4 cm edge gap for 2 cm
-            # cubes — gripper-friendly). With 0.07 separation in a
-            # tighter workspace, rejection sampling can't fit the 4th
-            # cube → PhysX collision ejects one off-table.
+            # ≥ 8 cm pairwise separation (≥ 6 cm edge gap for 2 cm
+            # cubes — comfortably wider than the SO-ARM gripper finger
+            # span). Bumped from 6 cm per EVAL3_PLAN.md §2 to give
+            # more grasp margin. If rejection sampling stops fitting
+            # the 4th cube reliably (max_attempts warnings), widen
+            # block_x / block_y rather than dropping back.
             "block_x": (0.13, 0.28),
             "block_y": (-0.15, 0.15),
-            "min_block_separation": 0.06,
+            "min_block_separation": 0.08,
             "table_z": 0.01,
             "max_attempts": 80,
             # Bowl in a tighter range than blocks → cubes can spill into

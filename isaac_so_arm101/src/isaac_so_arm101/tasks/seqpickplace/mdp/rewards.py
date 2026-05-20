@@ -96,7 +96,7 @@ def _lifted_mask(
 def _over_bowl_high_mask(
     env: "ManagerBasedRLEnv",
     r_safe: float = 0.06,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "seq_goal",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
@@ -172,7 +172,7 @@ def release_current_target_in_bowl(
     gripper_open_threshold: float = 0.2,
     block_speed_threshold: float = 0.05,
     minimal_height: float = 0.07,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "seq_goal",
     gripper_joint_name: str = "gripper",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

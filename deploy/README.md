@@ -72,7 +72,7 @@ Procedure (~1 hour, one-time per camera mount):
    - RGB frame → `pupil-apriltags` → `T_cam_tag` (4×4 pose)
 3. Compute `T_base_ee` per sample via URDF FK (`kinpy`).
 4. Solve `cv2.calibrateHandEye(R_base_ee, t_base_ee, R_cam_tag, t_cam_tag, method=CALIB_HAND_EYE_TSAI)` → `T_ee_cam`.
-5. Write to `deploy/hand_eye.yaml` (sibling of `camera_intrinsics.yaml`).
+5. Write to `deploy/hand_eye.yaml`. (Note `camera_intrinsics.yaml` lives at the repo root, not in `deploy/` — they're loaded from different paths by `deploy/cube_detector.py`.)
 6. **Verify**: command the EE to the projected tag center (project `T_base_tag` to xy, move EE there). Offset must be **≤ 5 mm** by ruler. If larger, redo step 2 with more / better-distributed poses.
 
 `deploy/calibrate_hand_eye.py` runs steps 2–6 interactively (prompts each pose, captures the frame, solves at the end). *Script lands with the AprilTag pipeline — until then, this section is forward-looking; see [`docs/STATE_APRILTAG_PLAN.md`](../docs/STATE_APRILTAG_PLAN.md) §3 for the canonical procedure.*

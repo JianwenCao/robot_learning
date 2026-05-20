@@ -334,12 +334,13 @@ class EventCfg:
             # the manipulable region.
             "block_x": (0.13, 0.25),
             "block_y": (-0.12, 0.12),
-            # 10 cm pairwise separation between the 2 active cubes
-            # leaves ~8 cm edge gap (for 2 cm cubes) — wider than the
-            # gripper fingers, so the policy can approach either cube
-            # without colliding with the other. Eval-2 spec says
-            # "adjacent" but the real eval setup spreads them.
-            "min_block_separation": 0.10,
+            # 12 cm pairwise separation between the 2 active cubes
+            # leaves ~10 cm edge gap (for 2 cm cubes) — comfortably wider
+            # than the SO-ARM gripper finger span, so the policy can
+            # approach either cube without contacting the other. Bumped
+            # from 10 cm to give more margin against AprilTag noise and
+            # approach-jitter (per EVAL2_PLAN.md §1).
+            "min_block_separation": 0.12,
             "table_z": 0.01,
             "max_attempts": 20,
             "command_name": "target_color",

@@ -79,7 +79,7 @@ def _bowl_xy_w(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 def _episode_over_bowl_high_mask(
     env: ManagerBasedRLEnv,
     r_safe: float = 0.06,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
@@ -590,9 +590,9 @@ def transport_to_bowl(
 def place_in_bowl(
     env: ManagerBasedRLEnv,
     r_safe: float = 0.06,
-    bowl_height: float = 0.08,
+    bowl_height: float = 0.06,
     minimal_height: float = 0.025,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
@@ -613,9 +613,13 @@ def place_in_bowl(
       an over-the-top descent trajectory.
 
     Geometric "in bowl" condition: block xy within ``r_safe`` of bowl xy
-    AND block z below ``bowl_height``. ``rim_clearance=0.08`` puts the
-    cube *bottom* 1 cm above the 5 cm rim plus a 2 cm cube — i.e. the
-    cube body fully clears the rim before any descent begins.
+    AND block z below ``bowl_height`` (= ``BOWL_RIM_Z = 0.06 m`` — the cube
+    centre has descended below the rim, i.e. the cube is *in* the bowl).
+    ``rim_clearance = 0.12`` puts the cube centre 6 cm above the 6 cm rim
+    — enough for the SO-ARM gripper fingers (~4 cm tall below the wrist
+    flange) holding a 2 cm cube to clear the rim by ~1 cm before the
+    over-rim latch fires. The previous 0.08 m gave only 2 cm of clearance
+    and produced rim-strike failures at deploy.
     """
     obj: RigidObject = env.scene[object_cfg.name]
     block_xy = obj.data.root_pos_w[:, :2]
@@ -742,7 +746,7 @@ def release_proximity(
 
 def gripper_open_above_bowl_lure(
     env: ManagerBasedRLEnv,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     r_safe: float = 0.06,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
@@ -772,7 +776,7 @@ def gripper_open_above_bowl_lure(
 
 def still_grasped_above_bowl_penalty(
     env: ManagerBasedRLEnv,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     r_safe: float = 0.06,
     minimal_height: float = 0.07,
     command_name: str = "bowl_pose",
@@ -816,7 +820,7 @@ def release_in_bowl(
     gripper_open_threshold: float = 0.2,
     block_speed_threshold: float = 0.05,
     minimal_height: float = 0.07,
-    rim_clearance: float = 0.08,
+    rim_clearance: float = 0.12,
     command_name: str = "bowl_pose",
     gripper_joint_name: str = "gripper",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
@@ -840,14 +844,14 @@ def release_in_bowl(
     * block linear speed below ``block_speed_threshold`` m/s (settled).
 
     ``minimal_height`` defaults to **0.07 m** (the lift-once latch — see
-    :func:`_episode_lifted_mask`). ``rim_clearance`` defaults to **0.08 m**
+    :func:`_episode_lifted_mask`). ``rim_clearance`` defaults to **0.12 m**
     and gates the *over-the-bowl* approach latch — see
     :func:`_episode_over_bowl_high_mask`. Sim has no physical bowl prim
     (bowl = 2-D goal command), so the two latches together encode the
-    real bowl's 5 cm rim:
+    real bowl's ~6 cm rim:
 
     * lift-once latch (≥ 0.07): closes the drag-on-table exploit.
-    * over-bowl-above-rim latch (≥ 0.08 *while* over bowl xy): closes the
+    * over-bowl-above-rim latch (≥ 0.12 *while* over bowl xy): closes the
       lateral-slide-in exploit. Forces the descent to come from above
       the rim, not from the side.
 

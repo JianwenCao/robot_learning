@@ -71,7 +71,7 @@ def place_clutter_blocks(
     env_ids: torch.Tensor,
     block_x: tuple[float, float] = (0.13, 0.25),
     block_y: tuple[float, float] = (-0.12, 0.12),
-    min_block_separation: float = 0.10,
+    min_block_separation: float = 0.12,
     table_z: float = 0.01,
     max_attempts: int = 20,
     command_name: str = "target_color",
@@ -94,11 +94,11 @@ def place_clutter_blocks(
 
     Geometry: 2 cubes placed independently in
     ``[block_x] × [block_y]`` workspace with rejection sampling so the
-    pairwise distance ≥ ``min_block_separation`` (10 cm default — leaves
-    ~8 cm edge gap for 2 cm cubes, comfortably wider than the gripper
-    fingers so the policy can approach either cube without colliding
-    with the other). Up to ``max_attempts`` redraws per cube; if no
-    valid layout is found the last sample is accepted.
+    pairwise distance ≥ ``min_block_separation`` (12 cm default — leaves
+    ~10 cm edge gap for 2 cm cubes, comfortably wider than the SO-ARM
+    gripper finger span so the policy can approach either cube without
+    contacting the other). Up to ``max_attempts`` redraws per cube; if
+    no valid layout is found the last sample is accepted.
 
     Bowl xy is rejection-sampled against these cube positions by
     :class:`mdp.ClusterBowlPoseCommand` (which fires AFTER this event
