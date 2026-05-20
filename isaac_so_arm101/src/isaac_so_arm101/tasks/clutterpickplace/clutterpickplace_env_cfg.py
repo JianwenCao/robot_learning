@@ -11,10 +11,15 @@ Scene differences vs Eval-1:
   adjacent in the workspace per episode (the "active pair"); the other
   four are parked off-table where the wrist camera can't see them. See
   :func:`mdp.events.place_clutter_blocks` for the placement geometry.
-* **No** semantic-segmentation channel on the wrist image (Eval-1's mask
-  doesn't disambiguate target from distractor when both are visible).
-  Wrist image is 3-channel RGB only; the policy learns to read color
-  from the RGB pixels conditioned on the target-color one-hot.
+* **4-channel wrist image** (``RGB + target_mask``). Each cube carries
+  a unique semantic class (``class:cube_<color>``), and
+  :func:`mdp.wrist_rgb_mask_dr` filters the TiledCamera's
+  ``semantic_segmentation`` output to the *target* cube per env. On the
+  real arm the same mask comes from Florence-2 prompted by the target
+  colour; the mask channel is corrupted in sim with morphology /
+  dropout / wrong-colour-swap to match Florence-2's noise profile. The
+  target_color one-hot is still in the policy state + FiLM head as
+  belt-and-suspenders (fallback when the mask drops out).
 * The bowl-pose command's rejection-sampling targets the *target* cube
   only (no need to keep the bowl away from the distractor).
 
@@ -121,21 +126,30 @@ class ClutterSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Two commands:
 
-    * ``bowl_pose`` — same UniformPoseCommand as Eval-1 (where to place
-      the cube). We do **not** use Eval-1's :class:`BowlPoseCommand`
-      rejection sampler because its ``target_asset_name`` is a single
-      scene asset — here the "target cube" varies per env. We accept a
-      small fraction of episodes where the bowl spawns over the active
-      cluster; the place-only-target-cube reward still penalizes those.
+    * ``bowl_pose`` — :class:`mdp.ClusterBowlPoseCommand`, a generalization
+      of Eval-1's :class:`BowlPoseCommand` that rejection-samples bowl
+      xy against the **two active cubes** (read from
+      ``env._active_cube_indices``). 15 cm minimum separation in robot
+      frame, 16 rejection attempts. Without this, ~5–10 % of episodes
+      spawn the bowl on top of the cluster, giving the policy free
+      "block already in bowl" reward signal.
     * ``target_color`` — see :class:`mdp.TargetColorCommand`. Samples the
       active pair + target index per episode.
     """
 
-    bowl_pose = UniformPoseCommandCfg(
+    bowl_pose = mdp.ClusterBowlPoseCommandCfg(
         asset_name="robot",
         body_name=MISSING,
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
+        # Bumped 0.12 → 0.15 (2026-05-20) to match Eval-1's spacing —
+        # the two active cubes land clearly away from the bowl so the
+        # policy must actually transport (no visual ambiguity at the
+        # ~20 cm wrist-cam standoff). max_attempts bumped 8 → 16 because
+        # two cubes excluding two 15-cm disks in the 13×24 cm bowl
+        # workspace makes rejection acceptance noticeably lower.
+        min_distance=0.15,
+        max_attempts=16,
         ranges=UniformPoseCommandCfg.Ranges(
             pos_x=(0.15, 0.28),
             pos_y=(-0.12, 0.12),
@@ -173,7 +187,13 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Three groups: deployable policy, privileged critic, wrist image."""
+    """Four groups: deployable policy, privileged critic, target-color goal, wrist image.
+
+    ``goal`` carries the target_color one-hot in its own obs group so the
+    vision actor-critic can route it to the CNN's FiLM head (Eval-2 §3.1).
+    Stage 1 teacher includes it in ``policy``+``critic`` of ``obs_groups``
+    so the MLP also reads it.
+    """
 
     @configclass
     class PolicyCfg(ObsGroup):
@@ -183,7 +203,6 @@ class ObservationsCfg:
         bowl_xy = ObsTerm(func=mdp.bowl_xy, params={"command_name": "bowl_pose"})
         ee_proj_xy = ObsTerm(func=mdp.ee_proj_xy)
         ee_to_bowl_xy = ObsTerm(func=mdp.ee_to_bowl_xy, params={"command_name": "bowl_pose"})
-        target_color = ObsTerm(func=mdp.target_color_onehot, params={"command_name": "target_color"})
         last_action = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
@@ -198,7 +217,6 @@ class ObservationsCfg:
         bowl_xy = ObsTerm(func=mdp.bowl_xy, params={"command_name": "bowl_pose"})
         ee_proj_xy = ObsTerm(func=mdp.ee_proj_xy)
         ee_to_bowl_xy = ObsTerm(func=mdp.ee_to_bowl_xy, params={"command_name": "bowl_pose"})
-        target_color = ObsTerm(func=mdp.target_color_onehot, params={"command_name": "target_color"})
         target_block_position = ObsTerm(func=mdp.target_block_position)
         distractor_block_position = ObsTerm(func=mdp.distractor_block_position)
         target_block_to_bowl_xy = ObsTerm(
@@ -213,18 +231,33 @@ class ObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
-    class WristImageCfg(ObsGroup):
-        """3-channel RGB only (no semantic mask).
+    class GoalCfg(ObsGroup):
+        """Goal conditioning — target color one-hot, kept separate so the
+        vision actor-critic can route it to the CNN's FiLM head."""
 
-        Mask doesn't disambiguate target vs distractor when both are
-        tagged ``class:block`` — keeping channels = 3 forces the policy
-        to read color from RGB pixels conditioned on the target-color
-        one-hot. On real, the same 3-channel RGB feeds the same CNN; no
-        HSV thresholding required since there's no mask to replicate.
+        target_color = ObsTerm(func=mdp.target_color_onehot, params={"command_name": "target_color"})
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class WristImageCfg(ObsGroup):
+        """4-channel ``RGB + target_mask`` wrist obs.
+
+        Each cube is tagged ``class:cube_<color>`` in
+        :mod:`joint_pos_env_cfg`; :func:`mdp.wrist_rgb_mask_dr` filters
+        the TiledCamera's ``semantic_segmentation`` to the *target*
+        cube per env (resolved via ``env._target_cube_idx``). The mask
+        channel is corrupted to mimic Florence-2's failure modes at
+        deploy — see ``mdp.wrist_rgb_mask_dr`` docstring for the four
+        DR axes (small-area dropout, morphology, full dropout, wrong-
+        colour swap). Play cfgs override ``corrupt=False`` so the eval
+        viewer sees the GT mask.
         """
 
         wrist_image = ObsTerm(
-            func=mdp.wrist_rgb_dr,
+            func=mdp.wrist_rgb_mask_dr,
             params={"corrupt": True},
         )
 
@@ -234,6 +267,7 @@ class ObservationsCfg:
 
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
+    goal: GoalCfg = GoalCfg()
     wrist_image: WristImageCfg = WristImageCfg()
 
 
@@ -266,15 +300,19 @@ class EventCfg:
         func=mdp.place_clutter_blocks,
         mode="reset",
         params={
-            "cluster_center_x": (0.15, 0.22),
-            "cluster_center_y": (-0.10, 0.10),
-            # Per-episode half-separation sampled uniformly. 0.0125–0.030
-            # gives cube centers 2.5–6 cm apart → 0.5–4 cm edge-to-edge
-            # margin for 2 cm cubes. "Adjacent" per the Eval-2 spec is
-            # not literally touching; humans place blocks with a gap, and
-            # sampling the range trains a margin-robust policy.
-            "half_separation": (0.0125, 0.030),
+            # Workspace ranges for cube placement. Slightly tighter than
+            # the bowl ranges (0.15-0.28, -0.12-0.12) so cubes stay in
+            # the manipulable region.
+            "block_x": (0.13, 0.25),
+            "block_y": (-0.12, 0.12),
+            # 10 cm pairwise separation between the 2 active cubes
+            # leaves ~8 cm edge gap (for 2 cm cubes) — wider than the
+            # gripper fingers, so the policy can approach either cube
+            # without colliding with the other. Eval-2 spec says
+            # "adjacent" but the real eval setup spreads them.
+            "min_block_separation": 0.10,
             "table_z": 0.01,
+            "max_attempts": 20,
             "command_name": "target_color",
             "cube_prefix": "cube_",
         },
@@ -353,12 +391,26 @@ class RewardsCfg:
         func=mdp.distractor_disturb_penalty, weight=-0.5,
         params={"threshold_speed": 0.05},
     )
-    wrong_block_in_bowl = RewTerm(func=mdp.wrong_block_in_bowl, weight=-20.0)
+    # Reduced -20 → -5 after Stage-1 v2 (logs/...2026-05-19_21-47-10):
+    # weight -20 at iter 200 fired -0.30 per episode (≈ 1.5 % of steps
+    # the random-policy distractor lands in the bowl xy) while reach
+    # was only +0.16 — net negative reward incentivized the policy to
+    # "stay still" before reach gradient could lock in. -5 keeps the
+    # signal directional (correct release +30 > wrong-block penalty)
+    # without making the early-exploration MDP unsolvable.
+    wrong_block_in_bowl = RewTerm(func=mdp.wrong_block_in_bowl, weight=-5.0)
 
     # Penalties — ramped via curriculum, same as Eval-1.
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(
         func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")}
+    )
+
+    # Wrist-cam standoff from table — see Eval-1 RewardsCfg for rationale.
+    wrist_cam_clearance = RewTerm(
+        func=mdp.wrist_cam_table_clearance,
+        params={"margin": 0.03, "table_top_z": 0.0},
+        weight=-50.0,
     )
 
 
@@ -394,13 +446,20 @@ class CurriculumCfg:
     from the start to learn target-color discrimination.
     """
 
+    # Curriculum num_steps stretched 10000 → 30000 after Stage-1 v2: at
+    # 10k, the ramp completed between iter 200-400, just as reach reward
+    # was emerging (+0.16). The action_rate penalty (-0.20 at full weight)
+    # then exceeded reach, and the policy retreated to "stay still" —
+    # reach reward dropped 0.16 → 0.04 across iter 200-400. 30k delays
+    # full ramp to ~iter 900, giving the policy room to lock in grasp +
+    # transport before penalties dominate.
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 10000},
+        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 30000},
     )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 10000},
+        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 30000},
     )
     log_success = CurrTerm(func=mdp.log_target_success_metrics, params={})
 

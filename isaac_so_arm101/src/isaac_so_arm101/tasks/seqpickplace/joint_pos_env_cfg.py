@@ -61,7 +61,13 @@ def _cube_cfg(color_name: str, default_xy: tuple[float, float]) -> RigidObjectCf
                 static_friction=1.0,
                 dynamic_friction=1.0,
             ),
-            semantic_tags=[("class", "block")],
+            # Per-color semantic class — mirrors clutterpickplace. The
+            # wrist camera's ``semantic_segmentation`` is filtered to the
+            # current step's target cube by
+            # :func:`mdp.wrist_rgb_mask_dr` and exposed as the 4th
+            # wrist-image channel. At deploy the same mask is produced by
+            # Florence-2 prompted with the current target colour.
+            semantic_tags=[("class", f"cube_{color_name}")],
         ),
     )
 
@@ -113,14 +119,18 @@ class SoArm101SeqPickPlaceEnvCfg(SeqPickPlaceEnvCfg):
             ],
         )
 
-        # wrist cam
+        # wrist cam — RGB + semantic_segmentation. The seg output is
+        # filtered per-step-target-color by :func:`mdp.wrist_rgb_mask_dr`
+        # to produce the 4th image channel; matches the clutterpickplace
+        # (Eval-2) image contract one-to-one.
         intrinsics = mdp.load_wrist_cam_intrinsics()
         self.scene.wrist_cam = TiledCameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/gripper_link/wrist_cam",
             update_period=self.sim.dt * self.decimation,
             height=WRIST_RGB_HEIGHT,
             width=WRIST_RGB_WIDTH,
-            data_types=["rgb"],
+            data_types=["rgb", "semantic_segmentation"],
+            colorize_semantic_segmentation=False,
             spawn=PinholeCameraCfg(
                 focal_length=intrinsics["focal_length"],
                 horizontal_aperture=intrinsics["horizontal_aperture"],

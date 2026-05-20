@@ -7,10 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two cooperating packages plus shared assets:
 
 - `isaac_so_arm101/` — Isaac Lab / Isaac Sim 5.1 RL environment + RSL-RL training scripts for SO-ARM101 (Python 3.11, managed with **`uv`**). Vendored fork; the active task is `Isaac-SO-ARM101-PickPlace-*` (see `src/isaac_so_arm101/tasks/pickplace/`).
-- `bc/` — runs on the inference / real-robot PC. Contains a goal-conditioned behavior-cloning baseline (training + sim eval) **and** the real-robot deploy stack for the PPO policy trained in `isaac_so_arm101/`. Uses a separate conda env (`so_arm`), CPU torch, no Isaac.
+- `deploy/` — runs on the inference / real-robot PC. Closed-loop PPO deploy for policies trained in `isaac_so_arm101/`. Uses a separate conda env (`so_arm`), CPU torch, no Isaac. `ppo_actor.py` holds two forward-only actor mirrors so this PC never imports `rsl_rl` / `isaaclab`: `PPOActor` (Eval-1, small-CNN, 25-D state) and `PPOActorClutter` (Eval-2/3, frozen ResNet-18 layer1-2 + FiLM + spatial-softmax, 31-D state = policy + target_color_onehot). Entry points: `deploy_real.py` (Eval-1) and `deploy_real_clutter.py` (Eval-2 single-target / Eval-3 multi-sub-goal). `cube_detector.py` is the pluggable mask-source layer (HSV or Florence-2); Florence supports `set_prompt()` so the Eval-3 outer loop can re-key per sub-goal without reloading the 1 GB model.
 - `docs/EVAL1_PLAN.md` — authoritative spec for the Eval-1 task. Read first when touching the pick-and-place env or training pipeline.
 - `camera_intrinsics.yaml` — real wrist-cam calibration. Loaded by both the sim camera spawn (`joint_pos_env_cfg.py`) and the real-robot deploy undistort. Keep these in lockstep.
-- `demonstrations/` and `bc/runs/`, `logs/` — gitignored; large data downloaded out-of-band.
+- `deploy/runs/` and `logs/` — gitignored; checkpoints/run artefacts live here.
 
 ## Common commands
 
@@ -44,27 +44,27 @@ uv run play --task Isaac-SO-ARM101-PickPlace-Bowl-Play-v0 \
 
 Logs land in `logs/rsl_rl/<experiment_name>/<timestamp>/` (TB + `model_*.pt` + `params/*.yaml`). `experiment_name` is per-runner-cfg (`pickplace_bowl`, `pickplace_bowl_teacher`, etc.) — do **not** rename, the three-stage scripts reference these paths.
 
-### BC baseline + real-robot deploy (`bc/`)
+### Real-robot deploy (`deploy/`)
 
 ```bash
 # One-time setup of the inference-PC conda env `so_arm`:
-bash bc/setup_inference_pc.sh
+bash deploy/setup_inference_pc.sh
 
-# Train the BC policy (full epoch loop, or --overfit N for the one-batch sanity test):
-conda activate so_arm
-python -m bc.train --epochs 50
-python -m bc.train --overfit 200            # gate: loss<0.01 in <200 steps
-
-# Closed-loop BC in Isaac sim (training PC; needs isaac_so_arm101 env):
-bash bc/run_eval1_rollout.sh 0.20 -0.05     # bowl xy in robot base frame
-# wraps:  python -m bc.deploy_sim --bowl-xy 0.20,-0.05 ...
+# Drop trained vision-PPO checkpoints at deploy/runs/ (see deploy/README.md):
+#   Eval-1: deploy/runs/model.pt
+#   Eval-2: deploy/runs/clutter_model.pt
+#   Eval-3: deploy/runs/eval3_model.pt
 
 # Closed-loop PPO on the real arm (inference PC; needs `so_arm` env, /dev/ttyACM0, USB cam):
-python -m bc.deploy_real --bowl-xy 0.20,-0.05
-python -m bc.deploy_real --bowl-xy 0.20,-0.05 --dry-run   # no hardware; one synthetic forward
+conda activate so_arm
+python -m deploy.deploy_real --bowl-xy 0.20,-0.05                                # Eval-1
+python -m deploy.deploy_real_clutter --mode eval2 --target-color red --bowl-xy 0.22,0.0
+python -m deploy.deploy_real_clutter --mode eval3 --colors red,blue,yellow --bowl-xy 0.22,0.0
+python -m deploy.deploy_real --bowl-xy 0.20,-0.05 --dry-run                       # no hardware; synthetic forward
+python -m deploy.deploy_real_clutter --mode eval2 --target-color red --bowl-xy 0.22,0.0 --dry-run
 ```
 
-There is currently no test suite, lint config, or CI. Smoke-test entry points: `python -m bc.model` (`_smoke_test`), `python -m bc.train --overfit 200`, `uv run zero_agent`, `python -m bc.deploy_real --dry-run`.
+There is currently no test suite, lint config, or CI. Smoke-test entry points: `uv run zero_agent`, `python -m deploy.deploy_real --dry-run`, `python -m deploy.deploy_real_clutter --mode eval2 --target-color red --bowl-xy 0.22,0.0 --dry-run`.
 
 ## Architecture you can't see from a single file
 
@@ -93,29 +93,31 @@ RSL-RL resolves `policy.class_name` with `eval()` against the runner module's gl
 
 Action decoder lives in two places that **must** match exactly:
 - Sim (`joint_pos_env_cfg.py`): `JointPositionActionCfg(joint_names=["shoulder_.*","elbow_flex","wrist_.*"], scale=0.5, use_default_offset=True)` + `BinaryJointPositionActionCfg(open=0.5, close=0.0)`.
-- Real (`bc/deploy_real.py`): `arm_target_rad = JOINT_DEFAULTS_RAD[:5] + 0.5 * action[:5]`; gripper `open if action[5] > 0 else close`; finally `rad → deg` for the Feetech bus.
+- Real (`deploy/deploy_real.py`): `arm_target_rad = JOINT_DEFAULTS_RAD[:5] + 0.5 * action[:5]`; gripper `open if action[5] > 0 else close`; finally `rad → deg` for the Feetech bus.
 
 Home pose `JOINT_DEFAULTS_RAD = (0, 0, 0, 1.57, 0, 0)` is duplicated by hand on the real side. Same for `JOINT_NAMES` order — it must agree with the URDF and LeRobot's SO101Follower obs keys.
 
 ### Wrist image is 4-channel (RGB + mask), shape `(N, 4, 72, 128)`
 
-- Sim: `TiledCamera` renders `["rgb","semantic_segmentation"]` filtered to `class:block`. `mdp.wrist_image` concatenates RGB/255 with the binary semantic-seg mask and applies per-step photometric DR (only when `corrupt=True`; the `_PLAY` cfgs short-circuit this).
-- Real: `bc/deploy_real._build_image` undistorts via `camera_intrinsics.yaml`, resizes to 128×72, and replaces the seg-mask with an HSV `cv2.inRange` against the wood-tone block. Tune `--hsv-low/--hsv-high` per scene.
-- The BC baseline (`bc/model.py`) only consumes RGB — its sim renders are stored in `demonstrations/<pilot>/sim_renders.npy` and image augmentation lives in the model module so dataloader workers can stay simple.
+- **Eval-1 sim**: `TiledCamera` renders `["rgb","semantic_segmentation"]` with `class:block` on the single dex_cube. `mdp.wrist_image` concatenates RGB/255 with the binary semantic-seg mask and applies per-step photometric DR.
+- **Eval-2/3 sim**: same `TiledCamera` data types, but each of the 6 cubes carries a unique `class:cube_<color>` tag. `mdp.wrist_rgb_mask_dr` filters the seg image to the per-env target colour (via `env._target_cube_idx`) and corrupts the mask channel to mimic Florence-2's noise profile at deploy: small-area dropout (cube too far), morphological erode/dilate ±2 px, Bernoulli full-frame dropout (p=0.10), wrong-colour swap (p=0.03, replaces with a distractor's instance mask). Play cfgs override `corrupt=False`.
+- **Eval-1 real**: `deploy/deploy_real._build_image` undistorts → resizes → mask channel from `--mask-source` (default `florence` with the fixed prompt `"small wooden cube"`; `hsv` keeps the saturation-gate fallback).
+- **Eval-2/3 real**: `deploy/deploy_real_clutter` uses the same `_build_image` helper, but the Florence prompt is set per sub-goal via `Detector.set_prompt(f"{target_color} cube")` — no model reload. Pass the target via `--target-color` (Eval-2) or `--colors red,blue,yellow` (Eval-3). HSV fallback is colour-agnostic and only useful as an A/B for Eval-2 with one cube on the table.
+- The `Detector` protocol in `deploy/cube_detector.py` is the swap-in slot for other segmenters (GroundedSAM / SAM-3 / CLIPSeg) — implement `mask(rgb)` + `set_prompt(prompt)` and register in `build_detector`.
 
 ### Two PyTorch installs, two requirement chains
 
 The repo intentionally splits envs because Isaac Lab demands CUDA-pinned wheels from `pypi.nvidia.com` and the inference PC must not need any of that:
 
 - **Training PC** (`isaac_so_arm101/`): `uv sync` resolves `isaaclab[all,isaacsim]==2.3.0`, `torch==2.7.0` (cu128).
-- **Inference PC** (`bc/setup_inference_pc.sh`): conda env `so_arm`, **CPU** torch from `download.pytorch.org/whl/cpu`, plus `lerobot`, `feetech-servo-sdk`, `kinpy`, `opencv-python`, `pyyaml`. Pins `transformers<5` (huggingface_hub API broke).
+- **Inference PC** (`deploy/setup_inference_pc.sh`): conda env `so_arm`, **CPU** torch from `download.pytorch.org/whl/cpu`, plus `lerobot`, `feetech-servo-sdk`, `kinpy`, `opencv-python`, `pyyaml`, and Florence-2 segmenter deps (`timm`, `einops`, `accelerate`, `Pillow` — only used when `--mask-source florence`). Pins `transformers<5` (huggingface_hub API broke).
 
-`bc/ppo_actor.py` is a hand-rewritten forward-only copy of `PickPlaceVisionActorCritic` so `bc/deploy_real.py` never imports `rsl_rl` / `isaaclab`. If you change the sim-side actor architecture, mirror the change here or checkpoints will load with shape mismatches.
+`deploy/ppo_actor.py` is a hand-rewritten forward-only copy of the training-side actors so the deploy scripts never import `rsl_rl` / `isaaclab`. `PPOActor` mirrors `PickPlaceVisionActorCritic` (Eval-1); `PPOActorClutter` mirrors `ClutterPickPlaceVisionActorCritic` (Eval-2/3: frozen ResNet-18 layer1-2, 1×1 conv head with FiLM modulated by the target_color one-hot, spatial-softmax, MLP[256,128,64]; state is 31-D = policy(25) + target_color_onehot(6), and the trailing 6 dims are sliced inside `forward()` to feed the FiLM head). If you change the sim-side actor architecture, mirror the change here or checkpoints will load with shape mismatches.
 
 ### Curriculum, latches, and γ
 
 Reward (`mdp/rewards.py`) uses per-episode latches stored on the env (`reset_was_grasped`, `reset_was_over_bowl_above_rim`). `release_in_bowl=30` is a long-horizon dense tail; **`gamma=0.98` is load-bearing** across Stage 1 and Stage 3 (mismatched γ between the teacher critic and Stage-3 PPO breaks the Bellman fixed point that the warm-start relies on — see EVAL1_PLAN §7.2 #3).
 
-### `bc/deploy_sim.py` quirks
+### Sim replay / debug-dump (`scripts/rsl_rl/play.py`)
 
-Bowl xy is normally sampled per reset; `_force_bowl_xy` reaches into `env.unwrapped.command_manager._terms["bowl_pose"].command` and overwrites env 0's slot to evaluate at a fixed `(x,y)`. The BC policy outputs **degree-absolute joint targets in 8-step chunks** (`CHUNK_K=8`, execute first `EXECUTE_K=4`); `deploy_sim` re-converts these to the env's rad-delta-around-home action space. Demos are 30 Hz, sim is 50 Hz — pass `--control-stride 2` (default) to hold each BC target for two sim ticks ≈ 25 Hz.
+Use `play.py` (not a separate sim-deploy script) to evaluate a trained PPO checkpoint in sim. `--dump-bowl-xy x,y` reaches into `env.unwrapped.command_manager._terms["bowl_pose"].command` and overwrites env 0's slot so the rollout runs against a fixed bowl, mirroring what `deploy/deploy_real.py --bowl-xy` does on hardware. `--debug-dump` writes the same per-step `step_XXXX.png` + `log.jsonl` schema the real deploy emits, so the two folders can be diffed directly (see `deploy/README.md` §6).

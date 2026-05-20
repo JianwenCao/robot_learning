@@ -226,11 +226,14 @@ class _ResNetSpatialSoftmaxCNN(nn.Module):
         in_shape: tuple[int, int, int],
         out_dim: int = 128,
         freeze: bool = True,
-        bc_v1_weights_path: str | None = None,
+        truncate_at: str = "layer3",
+        film_cond_dim: int = 0,
     ):
         super().__init__()
         if out_dim % 2 != 0:
             raise ValueError(f"out_dim={out_dim} must be even (2 coords per keypoint)")
+        if truncate_at not in {"layer2", "layer3"}:
+            raise ValueError(f"truncate_at must be 'layer2' or 'layer3', got {truncate_at!r}")
         num_keypoints = out_dim // 2
         in_channels, in_h, in_w = in_shape
 
@@ -259,20 +262,18 @@ class _ResNetSpatialSoftmaxCNN(nn.Module):
                     new_conv1.weight[:, 3:] = rgb_mean.expand(-1, in_channels - 3, -1, -1)
             backbone.conv1 = new_conv1
 
-        # Truncate at layer3 — gives a richer spatial map than layer4
-        # (which is 3×4 at 72×128) without losing too much resolution.
-        self.trunk = nn.Sequential(
+        # Build trunk up to the requested layer. Default (layer3) preserves
+        # the Eval-1 behavior; Eval-2 uses layer2 to get a finer 9×16 spatial
+        # map (vs 4×8 at layer3) so 2 cm cubes occupy enough cells for
+        # spatial-softmax precision (see ``docs/EVAL2_PLAN.md`` §3).
+        trunk_children: list[nn.Module] = [
             backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
-            backbone.layer1, backbone.layer2, backbone.layer3,
-        )
-
-        # Optionally overlay BC v1's encoder weights — torchvision's
-        # ResNet-18 children layout matches what bc/model.py saves under
-        # ``img_enc.backbone.*`` (also a ``nn.Sequential`` of the same
-        # children, minus avgpool/fc). Loaded with strict=False so missing
-        # keys (avgpool/fc) and extra keys (BC v1's ``proj``) are tolerated.
-        if bc_v1_weights_path is not None:
-            self._maybe_load_bc_v1(bc_v1_weights_path, expected_in_channels=in_channels)
+            backbone.layer1, backbone.layer2,
+        ]
+        if truncate_at == "layer3":
+            trunk_children.append(backbone.layer3)
+        self.trunk = nn.Sequential(*trunk_children)
+        self.truncate_at = truncate_at
 
         # ---- ImageNet input normalization (for RGB channels only) ----------
         # Channel 3+ (mask) is binary {0, 1}; we leave it untouched.
@@ -297,6 +298,30 @@ class _ResNetSpatialSoftmaxCNN(nn.Module):
         # 1×1 conv to num_keypoints channels — small, trainable.
         self.head = nn.Conv2d(trunk_c, num_keypoints, kernel_size=1)
 
+        # Optional FiLM head — feature-wise affine modulation of the
+        # *frozen* trunk's output before the trainable 1×1 conv. Used
+        # for goal conditioning in Eval-2 (target color one-hot) and
+        # Eval-3 (current target color + bowl idx one-hot). When
+        # ``film_cond_dim == 0`` (default, Eval-1 path), no FiLM is
+        # built and the forward pass skips it. See
+        # ``docs/EVAL2_PLAN.md`` §3.1 — Perez et al., AAAI 2018.
+        self.film_cond_dim = int(film_cond_dim)
+        if self.film_cond_dim > 0:
+            self.film_mlp = nn.Sequential(
+                nn.Linear(self.film_cond_dim, 64),
+                nn.ELU(),
+                nn.Linear(64, 2 * trunk_c),  # γ and β interleaved
+            )
+            # Init γ-output near 1, β-output near 0 (identity at init), so
+            # the FiLM layer doesn't disturb early-training feature scale.
+            with torch.no_grad():
+                last = self.film_mlp[-1]
+                last.weight.zero_()
+                last.bias.zero_()
+                last.bias[:trunk_c] = 1.0  # γ = 1 at init
+        else:
+            self.film_mlp = None
+
         # Soft-argmax grid (same as _SpatialSoftmaxCNN).
         ys, xs = torch.meshgrid(
             torch.linspace(-1.0, 1.0, feat_h),
@@ -309,49 +334,12 @@ class _ResNetSpatialSoftmaxCNN(nn.Module):
         self.norm = nn.LayerNorm(out_dim)
         self.num_keypoints = num_keypoints
         self.out_dim = out_dim
+        self.trunk_c = trunk_c
         self.feat_h = feat_h
         self.feat_w = feat_w
 
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self._in_mean) / self._in_std
-
-    def _maybe_load_bc_v1(self, path: str, expected_in_channels: int) -> None:
-        """Best-effort overlay of BC v1's ResNet-18 weights onto this trunk."""
-        import os
-        if not os.path.isfile(path):
-            print(f"[ResNetEncoder] BC v1 ckpt not found at {path} — keeping ImageNet init.")
-            return
-        try:
-            ck = torch.load(path, map_location="cpu", weights_only=False)
-        except Exception as e:
-            print(f"[ResNetEncoder] failed to load BC v1 ckpt: {e!r} — ImageNet init.")
-            return
-        sd = ck.get("model", ck)
-        # Extract keys matching ``img_enc.backbone.<idx>.*`` and rename to
-        # ``<idx>.*`` so they line up with our ``trunk`` Sequential indices.
-        backbone_prefix = "img_enc.backbone."
-        overlay = {}
-        for k, v in sd.items():
-            if k.startswith(backbone_prefix):
-                overlay[k[len(backbone_prefix):]] = v
-        if not overlay:
-            print("[ResNetEncoder] BC v1 ckpt has no img_enc.backbone.* keys — skipping.")
-            return
-        # If conv1 was inflated (channels > 3), the saved BC v1 conv1 is
-        # (64, 3, 7, 7) — strict load would fail. Pad it to current channels.
-        conv1_key = "0.weight"  # trunk[0] = conv1
-        if conv1_key in overlay:
-            w = overlay[conv1_key]
-            if w.shape[1] != expected_in_channels:
-                with torch.no_grad():
-                    new_w = torch.zeros(w.shape[0], expected_in_channels, w.shape[2], w.shape[3])
-                    new_w[:, :min(w.shape[1], expected_in_channels)] = w[:, :min(w.shape[1], expected_in_channels)]
-                    if expected_in_channels > w.shape[1]:
-                        new_w[:, w.shape[1]:] = w.mean(dim=1, keepdim=True)
-                    overlay[conv1_key] = new_w
-        missing, unexpected = self.trunk.load_state_dict(overlay, strict=False)
-        print(f"[ResNetEncoder] loaded BC v1 weights from {path}: "
-              f"{len(overlay)} keys overlaid, missing={len(missing)} unexpected={len(unexpected)}")
 
     def train(self, mode: bool = True):  # noqa: D401
         """Override so the frozen trunk stays in eval mode regardless."""
@@ -360,13 +348,21 @@ class _ResNetSpatialSoftmaxCNN(nn.Module):
             self.trunk.eval()
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, film_cond: torch.Tensor | None = None) -> torch.Tensor:
         x = self._normalize_input(x)
         if self.freeze:
             with torch.no_grad():
                 feat = self.trunk(x)
         else:
             feat = self.trunk(x)
+        # FiLM modulation of the trunk output, gated on having both a film
+        # head and a conditioning input. γ-init = 1 / β-init = 0 means the
+        # first few iters are functionally identity; gradient learns to
+        # specialize per-channel based on the goal.
+        if self.film_mlp is not None and film_cond is not None:
+            gamma_beta = self.film_mlp(film_cond)                # (N, 2C)
+            gamma, beta = gamma_beta[:, :self.trunk_c], gamma_beta[:, self.trunk_c:]
+            feat = gamma.unsqueeze(-1).unsqueeze(-1) * feat + beta.unsqueeze(-1).unsqueeze(-1)
         heat = self.head(feat)                                   # (N, K, H, W)
         n, k, h, w = heat.shape
         attn = torch.softmax(heat.view(n, k, h * w), dim=-1)
@@ -408,8 +404,25 @@ class PickPlaceVisionActorCritic(ActorCritic):
         noise_std_type: str = "scalar",
         image_group_name: str = DEFAULT_IMAGE_GROUP,
         image_feat_dim: int = 128,
+        cnn_class: str = "small",
+        cnn_kwargs: dict | None = None,
+        std_max: list[float] | tuple[float, ...] | None = None,
         **kwargs,
     ):
+        """Asymmetric A-C with a CNN encoder for the wrist image.
+
+        ``cnn_class`` selects the encoder:
+
+        * ``"small"`` (default) — Eval-1's from-scratch
+          :class:`_SpatialSoftmaxCNN`. Lightweight, ~50 k params, no
+          pretraining. Backward-compatible default.
+        * ``"resnet"`` — :class:`_ResNetSpatialSoftmaxCNN` (frozen
+          ImageNet ResNet-18 trunk + trainable 1×1 conv +
+          spatial-softmax head). Accepts ``cnn_kwargs`` like
+          ``{"truncate_at": "layer2", "film_cond_dim": 6}`` for Eval-2.
+
+        ``cnn_kwargs`` is forwarded verbatim to the encoder constructor.
+        """
         # We deliberately do NOT call super().__init__ — the parent's init
         # asserts every obs group is 1-D, which fails for the image group.
         # We replicate the parts of the parent we still need (actor/critic
@@ -423,6 +436,8 @@ class PickPlaceVisionActorCritic(ActorCritic):
 
         self.obs_groups = obs_groups
         self.image_group_name = image_group_name
+        self.cnn_class = cnn_class
+        self.cnn_kwargs = dict(cnn_kwargs or {})
 
         # ------------------------------------------------------------------
         # Inspect obs to compute input dims for actor / critic MLPs.
@@ -452,12 +467,26 @@ class PickPlaceVisionActorCritic(ActorCritic):
 
         # Two encoders — keep actor/critic decoupled so the privileged
         # critic info doesn't leak into the actor's encoder gradients.
+        # Dispatch on cnn_class so Eval-2 / future tasks can opt into
+        # the frozen ResNet backbone (+ FiLM) without forking the class.
+        if cnn_class == "small":
+            cnn_factory = lambda: _SpatialSoftmaxCNN(img_in_shape, image_feat_dim)  # noqa: E731
+        elif cnn_class == "resnet":
+            cnn_factory = lambda: _ResNetSpatialSoftmaxCNN(  # noqa: E731
+                img_in_shape, image_feat_dim, **self.cnn_kwargs
+            )
+        else:
+            raise ValueError(
+                f"Unknown cnn_class={cnn_class!r}; expected one of "
+                "{'small', 'resnet'}."
+            )
+
         if actor_uses_image:
-            self.actor_cnn: nn.Module = _ImpalaSmallCNN(img_in_shape, image_feat_dim)
+            self.actor_cnn: nn.Module = cnn_factory()
         else:
             self.actor_cnn = None
         if critic_uses_image:
-            self.critic_cnn: nn.Module = _ImpalaSmallCNN(img_in_shape, image_feat_dim)
+            self.critic_cnn: nn.Module = cnn_factory()
         else:
             self.critic_cnn = None
 
@@ -520,13 +549,48 @@ class PickPlaceVisionActorCritic(ActorCritic):
         # discover sustained-close trajectories). Removing the override
         # restores stock semantics; ``self.std`` is still a learnable
         # Parameter so PPO adapts σ as usual.
+        # Accept ``init_noise_std`` as either a scalar (apply to all dims)
+        # OR a list/tuple of length ``num_actions`` for per-dim init.
+        # The per-dim path is the principled fix for binary-gripper RL
+        # discussed in the long comment above: arm dims want σ~1.0 for
+        # exploration, gripper dim wants σ~0.1 for sustained binary
+        # closure. Eval-2 (clutter, attached cubes) requires this; Eval-1
+        # (single cube) gets away with scalar 1.0.
         self.noise_std_type = noise_std_type
+        if isinstance(init_noise_std, (list, tuple)):
+            init_t = torch.tensor(list(init_noise_std), dtype=torch.float32)
+            if init_t.numel() != num_actions:
+                raise ValueError(
+                    f"init_noise_std list length {init_t.numel()} != "
+                    f"num_actions={num_actions}"
+                )
+        else:
+            init_t = float(init_noise_std) * torch.ones(num_actions)
         if noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+            self.std = nn.Parameter(init_t.clone())
         elif noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            self.log_std = nn.Parameter(torch.log(init_t.clone()))
         else:
             raise ValueError(f"Unknown noise_std_type {noise_std_type!r}")
+
+        # Per-dim σ upper cap. Eval-2 needs this to keep the binary
+        # gripper σ from inflating under entropy bonus (per-dim init=0.1
+        # works at iter 0 but entropy_coef=0.006 pushes gripper σ → 0.4+
+        # over training, destroying decisive closure). The cap is applied
+        # in ``update_distribution`` via ``torch.minimum``: gradients are
+        # zero above the cap so PPO stops trying to push σ higher there,
+        # but σ can still be reduced *below* the cap by other gradients.
+        # Set per-dim, e.g. ``[1e3, 1e3, 1e3, 1e3, 1e3, 0.2]`` to leave
+        # arm σ unrestricted but cap gripper σ.
+        if std_max is not None:
+            cap_t = torch.tensor(list(std_max), dtype=torch.float32)
+            if cap_t.numel() != num_actions:
+                raise ValueError(
+                    f"std_max length {cap_t.numel()} != num_actions={num_actions}"
+                )
+            self.register_buffer("_std_max", cap_t)
+        else:
+            self._std_max = None
 
         self.distribution: Normal | None = None
         Normal.set_default_validate_args(False)
@@ -609,6 +673,12 @@ class PickPlaceVisionActorCritic(ActorCritic):
             std = self.std.expand_as(mean)
         else:
             std = torch.exp(self.log_std).expand_as(mean)
+        # Per-dim σ upper cap (Eval-2: keep gripper σ ≤ 0.2 even under
+        # entropy bonus). ``torch.minimum`` is differentiable; gradient
+        # is zero above the cap, so PPO can't keep pushing σ up there
+        # but is free to push it down anywhere via other losses.
+        if getattr(self, "_std_max", None) is not None:
+            std = torch.minimum(std, self._std_max.to(std.device).expand_as(std))
         self.distribution = Normal(mean, std)
 
     def act(self, obs, **kwargs):

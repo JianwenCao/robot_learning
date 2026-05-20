@@ -51,6 +51,7 @@ HIDDEN_PARK_XY: tuple[tuple[float, float], ...] = tuple(
 # Eval-3 task constants
 N_ACTIVE_BLOCKS = 4
 N_GOAL_STEPS = 3
+N_BOWLS = 1  # Single bowl per rollout; all 3 sequential placements target it.
 
 
 # ---------------------------------------------------------------------------
@@ -61,19 +62,18 @@ N_GOAL_STEPS = 3
 def place_seq_blocks(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
-    block_x: tuple[float, float] = (0.13, 0.22),
-    block_y: tuple[float, float] = (-0.12, 0.12),
-    min_block_separation: float = 0.05,
+    block_x: tuple[float, float] = (0.13, 0.28),
+    block_y: tuple[float, float] = (-0.15, 0.15),
+    min_block_separation: float = 0.06,
     table_z: float = 0.01,
-    max_attempts: int = 20,
+    max_attempts: int = 80,
     bowl_x: tuple[float, float] = (0.15, 0.28),
     bowl_y: tuple[float, float] = (-0.12, 0.12),
-    min_bowl_separation: float = 0.10,
-    distinct_bowls: bool = True,
+    min_bowl_block_separation: float = 0.10,
     command_name: str = "seq_goal",
     cube_prefix: str = "cube_",
 ) -> None:
-    """Sample the full per-episode schedule, then place all six cubes.
+    """Sample the full per-episode schedule, then place 4 cubes spread + 1 bowl.
 
     Per-episode sampling is done here (not in
     :class:`SequentialGoalCommand`) because Isaac Lab's reset pipeline
@@ -84,19 +84,21 @@ def place_seq_blocks(
       the 4 active cubes per env.
     * ``env._seq_goal_color_pos``    ``(N, 3)`` long ∈ [0, 4) — for each
       of the 3 steps, which slot inside ``active_indices`` is the target.
-    * ``env._seq_goal_bowl_idx``     ``(N, 3)`` long ∈ [0, 3) — which of
-      the 3 bowls is targeted at each step.
-    * ``env._seq_bowl_positions``    ``(N, 3, 2)`` float — bowl xy
-      positions in robot root frame, rejection-sampled to be ≥
-      ``min_bowl_separation`` apart.
+    * ``env._seq_bowl_positions``    ``(N, 1, 2)`` float — bowl xy in
+      robot frame, rejection-sampled against the 4 placed cubes
+      (≥ ``min_bowl_block_separation``). All 3 sequential cube placements
+      target this single bowl.
     * ``env._target_cube_idx_per_step`` ``(N, 3)`` long — derived
       ``active[step_color_pos[step]]`` per step, cached for hot-path
       reward access.
 
-    Cube placement: rejection-samples each active cube's xy so pairwise
-    distance ≥ ``min_block_separation`` (5 cm by default). Up to
-    ``max_attempts`` redraws per env; if no valid layout is found the
-    last sample is accepted.
+    Cube placement: 4 cubes placed independently in the workspace
+    with sequential rejection sampling — each new cube must be ≥
+    ``min_block_separation`` from all previously-placed cubes. Default
+    7 cm gives ~5 cm edge gap for 2 cm cubes — wider than the gripper
+    fingers so the policy can pick any cube without colliding with a
+    neighbor. The bowl is sampled FIRST so cube placement can reject
+    against it.
     """
     del command_name  # The command is passive; we own all the state.
     if isinstance(env_ids, torch.Tensor):
@@ -119,58 +121,30 @@ def place_seq_blocks(
     active = perms[:, :N_ACTIVE_BLOCKS]  # (n, 4)
 
     # 3-step goal sequence: which slot-in-active is the target at each step.
-    goal_color_pos = torch.randint(0, N_ACTIVE_BLOCKS, (n, N_GOAL_STEPS), device=device)
+    # **Distinct** across the 3 steps — once a block is placed in the bowl
+    # it can't be re-picked, so targeting the same color twice in a row
+    # would be ill-defined. Sample a random permutation of the 4 active
+    # slots, take the first 3.
+    slot_perms = torch.argsort(torch.rand((n, N_ACTIVE_BLOCKS), device=device), dim=1)
+    goal_color_pos = slot_perms[:, :N_GOAL_STEPS]  # (n, 3) distinct in [0, 4)
 
-    # 3-step bowl indices.
-    if distinct_bowls:
-        goal_bowl_idx = torch.argsort(torch.rand((n, N_GOAL_STEPS), device=device), dim=1)
-    else:
-        goal_bowl_idx = torch.randint(0, N_GOAL_STEPS, (n, N_GOAL_STEPS), device=device)
-
-    # 3 bowl positions, rejection-sampled.
-    bowl_positions = torch.zeros((n, N_GOAL_STEPS, 2), device=device)
-    for slot in range(N_GOAL_STEPS):
-        cand = torch.stack(
-            [
-                torch.empty(n, device=device).uniform_(*bowl_x),
-                torch.empty(n, device=device).uniform_(*bowl_y),
-            ],
-            dim=1,
-        )
-        if slot == 0:
-            bowl_positions[:, 0] = cand
-            continue
-        for _ in range(max_attempts):
-            placed = bowl_positions[:, :slot]
-            d = torch.norm(cand.unsqueeze(1) - placed, dim=2)
-            bad = d.min(dim=1).values < min_bowl_separation
-            if not bad.any():
-                break
-            n_bad = int(bad.sum())
-            cand_new = torch.stack(
-                [
-                    torch.empty(n_bad, device=device).uniform_(*bowl_x),
-                    torch.empty(n_bad, device=device).uniform_(*bowl_y),
-                ],
-                dim=1,
-            )
-            cand[bad] = cand_new
-        bowl_positions[:, slot] = cand
+    # Single bowl per rollout — buffer kept ``(N, N_BOWLS=1, 2)`` for
+    # uniformity with the existing observation/reward plumbing.
+    bowl_positions = torch.zeros((n, N_BOWLS, 2), device=device)
 
     # Write schedule into env buffers (allocated eagerly by the command's
     # __init__; lazy-init here as a safety net).
     for buf_name, default in (
         ("_seq_active_indices", torch.zeros((env.num_envs, N_ACTIVE_BLOCKS), dtype=torch.long, device=device)),
         ("_seq_goal_color_pos", torch.zeros((env.num_envs, N_GOAL_STEPS), dtype=torch.long, device=device)),
-        ("_seq_goal_bowl_idx",  torch.zeros((env.num_envs, N_GOAL_STEPS), dtype=torch.long, device=device)),
-        ("_seq_bowl_positions", torch.zeros((env.num_envs, N_GOAL_STEPS, 2), dtype=torch.float32, device=device)),
+        ("_seq_bowl_positions", torch.zeros((env.num_envs, N_BOWLS, 2), dtype=torch.float32, device=device)),
     ):
         if not hasattr(env, buf_name):
             setattr(env, buf_name, default)
     env._seq_active_indices[env_ids_t] = active
     env._seq_goal_color_pos[env_ids_t] = goal_color_pos
-    env._seq_goal_bowl_idx[env_ids_t] = goal_bowl_idx
-    env._seq_bowl_positions[env_ids_t] = bowl_positions
+    # NOTE: ``_seq_bowl_positions`` is written below, AFTER bowl sampling
+    # (which depends on the cube layout sampled in this function).
     # Reset step counter for the resetting envs.
     if hasattr(env, "_seq_step_idx"):
         env._seq_step_idx[env_ids_t] = 0
@@ -178,7 +152,28 @@ def place_seq_blocks(
     robot = env.scene["robot"]
     root_xy_w = robot.data.root_pos_w[env_ids_t, :2]
 
-    # Rejection-sampled spread layout per env.
+    # -----------------------------------------------------------------
+    # Step 1: sample the single bowl position FIRST.
+    # -----------------------------------------------------------------
+    # Bowl is sampled first so the block placement loop below can reject
+    # against it.
+    bowl_positions[:, 0] = torch.stack(
+        [
+            torch.empty(n, device=device).uniform_(*bowl_x),
+            torch.empty(n, device=device).uniform_(*bowl_y),
+        ],
+        dim=1,
+    )
+    env._seq_bowl_positions[env_ids_t] = bowl_positions
+
+    # -----------------------------------------------------------------
+    # Step 2: rejection-sampled spread layout for the 4 active cubes,
+    # checking each new cube against (a) all previously-placed cubes
+    # (≥ ``min_block_separation``) AND (b) the bowl
+    # (≥ ``min_bowl_block_separation``). Cubes thus always spawn
+    # *slightly away* from the bowl position — no need to rely on
+    # post-hoc bowl-rejection to enforce separation.
+    # -----------------------------------------------------------------
     pair_local_xy = torch.zeros((n, N_ACTIVE_BLOCKS, 2), device=device)
     for slot in range(N_ACTIVE_BLOCKS):
         good = torch.zeros(n, dtype=torch.bool, device=device)
@@ -196,14 +191,18 @@ def place_seq_blocks(
                 dim=1,
             )
             cand[need] = cand_new
-            # Check distance against already-placed slots [0, slot).
+            # vs bowls (always check — bowls are placed already)
+            d_bowl = torch.norm(cand.unsqueeze(1) - bowl_positions, dim=2)
+            ok_bowl = d_bowl.min(dim=1).values >= min_bowl_block_separation
+            # vs previously-placed cubes
             if slot == 0:
-                good = good | need  # always accept first
+                ok_blk = torch.ones(n, dtype=torch.bool, device=device)
             else:
-                placed = pair_local_xy[:, :slot, :]  # (n, slot, 2)
-                d = torch.norm(cand.unsqueeze(1) - placed, dim=2)  # (n, slot)
-                ok = (d.min(dim=1).values >= min_block_separation)
-                good = good | (need & ok)
+                placed = pair_local_xy[:, :slot, :]
+                d_blk = torch.norm(cand.unsqueeze(1) - placed, dim=2)
+                ok_blk = d_blk.min(dim=1).values >= min_block_separation
+            ok = ok_bowl & ok_blk
+            good = good | (need & ok)
         pair_local_xy[:, slot] = cand
 
     quat = torch.zeros((n, 4), device=device)
@@ -279,5 +278,7 @@ def reset_seq_latches(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:
         env._seq_was_over_bowl_above_rim[ids] = False
     if hasattr(env, "_seq_success_per_step_latch"):
         env._seq_success_per_step_latch[ids] = False
+    if hasattr(env, "_seq_success_per_step_latch_strict"):
+        env._seq_success_per_step_latch_strict[ids] = False
     if hasattr(env, "_seq_step_release_indicator"):
         env._seq_step_release_indicator[ids] = False

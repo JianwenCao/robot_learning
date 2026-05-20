@@ -218,6 +218,24 @@ def release_current_target_in_bowl(
         cols = env._seq_step_idx[rows]
         env._seq_success_per_step_latch[rows, cols] = True
 
+    # PDF-strict per-step latch: "correct block placed in the
+    # corresponding bowl AND released" — minimal gate (in_xy ∧ low ∧
+    # opened) without the safety latches / ``settled``. Logged in
+    # parallel as ``success_rate_strict`` so we can tell whether the
+    # conservative gate is biasing the headline ``all_steps_success``
+    # low. Step-advance (``_seq_step_release_indicator``) still uses
+    # the strict-AND-safety gate so the command term doesn't advance
+    # on a still-spinning unstable release.
+    strict_step_indicator = in_xy & low & opened & step_active
+    if not hasattr(env, "_seq_success_per_step_latch_strict"):
+        env._seq_success_per_step_latch_strict = torch.zeros(
+            (env.num_envs, N_GOAL_STEPS), dtype=torch.bool, device=env.device
+        )
+    if strict_step_indicator.any():
+        rows = torch.where(strict_step_indicator)[0]
+        cols = env._seq_step_idx[rows]
+        env._seq_success_per_step_latch_strict[rows, cols] = True
+
     if not hasattr(env, "_seq_step_release_indicator"):
         env._seq_step_release_indicator = torch.zeros(
             env.num_envs, dtype=torch.bool, device=env.device
@@ -308,4 +326,17 @@ def log_seq_success_metrics(
         "n_episodes_ended": float(outcomes.shape[0]),
     }
     latch[env_ids] = False
+
+    # PDF-strict counterparts (in_xy ∧ low ∧ opened, no safety latches /
+    # no settled). See :func:`release_current_target_in_bowl` for why we
+    # log this in parallel.
+    strict_latch = getattr(env, "_seq_success_per_step_latch_strict", None)
+    if strict_latch is not None:
+        strict_out = strict_latch[env_ids].float()
+        metrics["step0_success_strict"] = strict_out[:, 0].mean().item()
+        metrics["step1_success_strict"] = strict_out[:, 1].mean().item()
+        metrics["step2_success_strict"] = strict_out[:, 2].mean().item()
+        metrics["success_rate_strict"] = (strict_out.sum(dim=1) == N_GOAL_STEPS).float().mean().item()
+        strict_latch[env_ids] = False
+
     return metrics

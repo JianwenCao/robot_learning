@@ -243,6 +243,16 @@ def release_target_in_bowl(
     if not hasattr(env, "_target_task_success_latch"):
         env._target_task_success_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     env._target_task_success_latch |= indicator
+
+    # PDF-strict target-success indicator: "correct block placed inside
+    # the bowl AND released" (in_xy ∧ low ∧ opened) without the safety
+    # latches. Logged as ``success_rate_strict`` alongside the headline
+    # SR so we can tell whether the latches are biasing the conservative
+    # number low. Same semantics as Eval-1's strict latch.
+    strict_indicator = in_xy & low & opened
+    if not hasattr(env, "_target_task_success_latch_strict"):
+        env._target_task_success_latch_strict = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    env._target_task_success_latch_strict |= strict_indicator
     return indicator.float()
 
 
@@ -313,6 +323,9 @@ def log_target_success_metrics(
 ) -> dict[str, float]:
     """Per-episode target-success rate for TB. Same pattern as Eval-1's
     :func:`log_success_metrics`, reading ``env._target_task_success_latch``.
+    Also emits ``success_rate_strict`` from
+    ``env._target_task_success_latch_strict`` (PDF-minimal gate, target
+    cube) so a gap between the two flags safety-latch bias.
     """
     latch = getattr(env, "_target_task_success_latch", None)
     if latch is None or env_ids is None:
@@ -327,4 +340,14 @@ def log_target_success_metrics(
     success_rate = outcomes.mean().item()
     n_ended = int(outcomes.numel())
     latch[env_ids] = False
-    return {"success_rate": success_rate, "n_episodes_ended": float(n_ended)}
+    metrics: dict[str, float] = {
+        "success_rate": success_rate,
+        "n_episodes_ended": float(n_ended),
+    }
+    # PDF-strict SR (in_xy ∧ low ∧ opened, target cube). See
+    # :func:`release_target_in_bowl` for the rationale.
+    strict_latch = getattr(env, "_target_task_success_latch_strict", None)
+    if strict_latch is not None:
+        metrics["success_rate_strict"] = strict_latch[env_ids].float().mean().item()
+        strict_latch[env_ids] = False
+    return metrics

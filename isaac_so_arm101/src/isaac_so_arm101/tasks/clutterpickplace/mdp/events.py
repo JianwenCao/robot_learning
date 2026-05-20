@@ -69,14 +69,15 @@ HIDDEN_PARK_XY: tuple[tuple[float, float], ...] = tuple(
 def place_clutter_blocks(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
-    cluster_center_x: tuple[float, float] = (0.15, 0.22),
-    cluster_center_y: tuple[float, float] = (-0.10, 0.10),
-    half_separation: tuple[float, float] = (0.0125, 0.030),
+    block_x: tuple[float, float] = (0.13, 0.25),
+    block_y: tuple[float, float] = (-0.12, 0.12),
+    min_block_separation: float = 0.10,
     table_z: float = 0.01,
+    max_attempts: int = 20,
     command_name: str = "target_color",
     cube_prefix: str = "cube_",
 ) -> None:
-    """Sample the active pair + target, then place all cubes accordingly.
+    """Sample the active pair + target, place 2 cubes spread out, park the other 4.
 
     All per-episode sampling happens here (NOT in the
     :class:`TargetColorCommand`) because Isaac Lab's reset pipeline runs
@@ -91,23 +92,19 @@ def place_clutter_blocks(
     * ``env._target_idx_in_pair``  ``(N,)``  long ∈ {0, 1}.
     * ``env._target_cube_idx``     ``(N,)``  long ∈ [0, NUM_COLORS).
 
-    Geometry of the active pair:
+    Geometry: 2 cubes placed independently in
+    ``[block_x] × [block_y]`` workspace with rejection sampling so the
+    pairwise distance ≥ ``min_block_separation`` (10 cm default — leaves
+    ~8 cm edge gap for 2 cm cubes, comfortably wider than the gripper
+    fingers so the policy can approach either cube without colliding
+    with the other). Up to ``max_attempts`` redraws per cube; if no
+    valid layout is found the last sample is accepted.
 
-    * cluster center ``c = (cx, cy)`` is sampled uniformly from
-      ``cluster_center_x × cluster_center_y``.
-    * random in-plane axis angle ``θ ~ U[0, 2π)``.
-    * per-env half-separation ``hs ~ U(*half_separation)``.
-    * cube ``A`` (slot 0) at ``c + hs * (cos θ, sin θ)``.
-    * cube ``B`` (slot 1) at ``c - hs * (cos θ, sin θ)``.
-
-    Default ``half_separation=(0.0125, 0.030)`` puts cube centers
-    2.5–6.0 cm apart per episode — for 2 cm cubes that's 0.5–4 cm of
-    edge-to-edge margin. The Eval-2 spec says "adjacent (flat cluster)",
-    which in practice (human-placed evaluation) means visibly separated
-    but close — not touching. Sampling a range covers placement noise
-    and trains a margin-robust policy.
+    Bowl xy is rejection-sampled against these cube positions by
+    :class:`mdp.ClusterBowlPoseCommand` (which fires AFTER this event
+    in the reset pipeline) so the bowl never spawns on top of a cube.
     """
-    del command_name  # The command is now passive; we own all the state.
+    del command_name  # The command is passive; we own all the state.
     if isinstance(env_ids, torch.Tensor):
         if env_ids.numel() == 0:
             return
@@ -146,20 +143,40 @@ def place_clutter_blocks(
     robot = env.scene["robot"]
     root_xy_w = robot.data.root_pos_w[env_ids_t, :2]  # (n, 2)
 
-    # Sample cluster center (env-local, robot frame) + axis + per-env
-    # half-separation. Margin is sampled per episode so the policy sees
-    # the full distribution from touching-ish to clearly-separated.
-    cx = torch.empty(n, device=device).uniform_(*cluster_center_x)
-    cy = torch.empty(n, device=device).uniform_(*cluster_center_y)
-    theta = torch.empty(n, device=device).uniform_(0.0, 2.0 * math.pi)
-    hs_lo, hs_hi = float(half_separation[0]), float(half_separation[1])
-    hs = torch.empty(n, device=device).uniform_(hs_lo, hs_hi)
-    dx = hs * torch.cos(theta)
-    dy = hs * torch.sin(theta)
-
-    cube_a_local_xy = torch.stack([cx + dx, cy + dy], dim=1)
-    cube_b_local_xy = torch.stack([cx - dx, cy - dy], dim=1)
-    pair_local_xy = torch.stack([cube_a_local_xy, cube_b_local_xy], dim=1)  # (n, 2, 2)
+    # Rejection-sampled spread placement of the 2 active cubes. Each
+    # cube xy is sampled independently in the workspace; cube B is
+    # re-drawn up to ``max_attempts`` times until it is ≥
+    # ``min_block_separation`` from cube A. After the budget is
+    # exhausted, we accept the last sample (gracefully degrades for
+    # rare bad seeds rather than infinite-looping).
+    cube_a_xy = torch.stack(
+        [
+            torch.empty(n, device=device).uniform_(*block_x),
+            torch.empty(n, device=device).uniform_(*block_y),
+        ],
+        dim=1,
+    )  # (n, 2)
+    cube_b_xy = torch.stack(
+        [
+            torch.empty(n, device=device).uniform_(*block_x),
+            torch.empty(n, device=device).uniform_(*block_y),
+        ],
+        dim=1,
+    )
+    for _ in range(int(max_attempts)):
+        d = torch.norm(cube_b_xy - cube_a_xy, dim=1)
+        bad = d < min_block_separation
+        if not bad.any():
+            break
+        n_bad = int(bad.sum())
+        cube_b_xy[bad] = torch.stack(
+            [
+                torch.empty(n_bad, device=device).uniform_(*block_x),
+                torch.empty(n_bad, device=device).uniform_(*block_y),
+            ],
+            dim=1,
+        )
+    pair_local_xy = torch.stack([cube_a_xy, cube_b_xy], dim=1)  # (n, 2, 2)
 
     # Identity quaternion (w, x, y, z) — cubes are spawn-identical so the
     # initial orientation doesn't matter; let physics relax them.
@@ -231,7 +248,12 @@ def reset_target_latches(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:
             return
     elif len(env_ids) == 0:
         return
-    for name in ("_target_was_grasped", "_target_was_over_bowl_above_rim", "_target_task_success_latch"):
+    for name in (
+        "_target_was_grasped",
+        "_target_was_over_bowl_above_rim",
+        "_target_task_success_latch",
+        "_target_task_success_latch_strict",
+    ):
         flag = getattr(env, name, None)
         if flag is not None:
             flag[env_ids] = False

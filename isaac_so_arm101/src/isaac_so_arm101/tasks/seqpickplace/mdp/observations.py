@@ -26,6 +26,11 @@ from isaac_so_arm101.tasks.pickplace.mdp.observations import (
     _normalize_rgb,
     apply_color_jitter,
 )
+from isaac_so_arm101.tasks.clutterpickplace.mdp.observations import (
+    _binary_mask_for_palette_idx,
+    _morph_mask,
+    _resolve_color_class_ids,
+)
 
 from .events import COLOR_NAMES, NUM_COLORS, N_ACTIVE_BLOCKS, N_GOAL_STEPS
 
@@ -208,3 +213,121 @@ def wrist_rgb_dr(
     if corrupt and rgb_noise_std > 0.0:
         rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
     return rgb
+
+
+def wrist_rgb_mask_dr(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    corrupt: bool = True,
+    rgb_brightness_jitter: float = 0.15,
+    rgb_noise_std: float = 5.0 / 255.0,
+    hue_microjitter_deg: float = 3.0,
+    mask_dropout_prob: float = 0.10,
+    mask_wrong_swap_prob: float = 0.03,
+    mask_morph_max_radius: int = 2,
+    mask_min_pixel_area: int = 8,
+) -> torch.Tensor:
+    """4-channel wrist obs: ``[R, G, B, current_target_mask]`` (Eval-3).
+
+    Mirrors :func:`clutterpickplace.mdp.observations.wrist_rgb_mask_dr`
+    but indexes the mask by the **current step's** target palette idx
+    (``_current_target_palette_idx``) and samples the wrong-color swap
+    against any of the other 3 active cubes (vs the 2-cube case in
+    Eval-2). See that function for the full DR semantics.
+    """
+    cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
+    out = cam.data.output
+
+    # ---- RGB --------------------------------------------------------------
+    rgb = _normalize_rgb(out["rgb"])
+    n, _, h, w = rgb.shape
+
+    dr = getattr(env, "_wrist_image_dr", None)
+    if dr is not None:
+        scale = dr[:, :3].view(-1, 3, 1, 1)
+        bright = dr[:, 3].view(-1, 1, 1, 1)
+        rgb = (rgb * scale + bright).clamp_(0.0, 1.0)
+    hsv_dr = getattr(env, "_wrist_hsv_dr", None)
+    if hsv_dr is not None:
+        rgb = apply_color_jitter(rgb, hsv_dr[:, 0], hsv_dr[:, 1], hsv_dr[:, 2])
+    if corrupt and rgb_brightness_jitter > 0.0:
+        bscale = 1.0 + (torch.rand(n, 1, 1, 1, device=rgb.device) * 2 - 1) * rgb_brightness_jitter
+        rgb = (rgb * bscale).clamp_(0.0, 1.0)
+    if corrupt and hue_microjitter_deg > 0.0:
+        import math as _math
+        micro = (torch.rand(n, device=rgb.device) * 2 - 1) * hue_microjitter_deg * (_math.pi / 180.0)
+        rgb = apply_color_jitter(
+            rgb, micro,
+            torch.ones(n, device=rgb.device),
+            torch.ones(n, device=rgb.device),
+        )
+    if corrupt and rgb_noise_std > 0.0:
+        rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
+
+    # ---- Current-target instance mask -------------------------------------
+    class_ids = _resolve_color_class_ids(cam)
+    if class_ids is None:
+        mask = torch.zeros((n, 1, h, w), device=rgb.device, dtype=rgb.dtype)
+        return torch.cat([rgb, mask], dim=1)
+
+    seg = out["semantic_segmentation"]
+    if seg.dim() == 4 and seg.shape[-1] == 1:
+        seg = seg.squeeze(-1)
+    seg = seg.long()
+
+    target_palette = _current_target_palette_idx(env)
+    mask = _binary_mask_for_palette_idx(seg, class_ids, target_palette)
+
+    if corrupt:
+        # 1) Wrong-color swap — random non-target *active* cube.
+        if mask_wrong_swap_prob > 0.0:
+            active = env._active_cube_indices  # (N, 4) long
+            # Build a (N,) palette index of a random "wrong" active cube.
+            # Strategy: sample idx ∈ {0..N_ACTIVE-1}, then if it points
+            # to the current target's slot, shift by 1 (mod N_ACTIVE).
+            step = env._seq_step_idx.clamp(max=N_GOAL_STEPS - 1)
+            target_slot_in_active = env._target_slot_in_active.gather(
+                1, step.view(-1, 1)
+            ).squeeze(1) if hasattr(env, "_target_slot_in_active") else None
+            # Fallback: derive slot from palette comparison.
+            if target_slot_in_active is None:
+                target_pal = target_palette.view(-1, 1)  # (N, 1)
+                eq = (active == target_pal).long()        # (N, 4)
+                target_slot_in_active = eq.argmax(dim=1)  # (N,)
+            wrong_slot = torch.randint(0, N_ACTIVE_BLOCKS, (n,), device=rgb.device)
+            collide = (wrong_slot == target_slot_in_active)
+            wrong_slot = torch.where(
+                collide, (wrong_slot + 1) % N_ACTIVE_BLOCKS, wrong_slot
+            )
+            distractor_palette = active.gather(1, wrong_slot.view(-1, 1)).squeeze(1)
+            distractor_mask = _binary_mask_for_palette_idx(seg, class_ids, distractor_palette)
+            swap = (torch.rand(n, device=rgb.device) < mask_wrong_swap_prob).view(-1, 1, 1, 1)
+            mask = torch.where(swap, distractor_mask, mask)
+
+        # 2) Morphological jitter.
+        if mask_morph_max_radius > 0:
+            radii = torch.randint(
+                -mask_morph_max_radius, mask_morph_max_radius + 1,
+                (n,), device=rgb.device,
+            )
+            for r in torch.unique(radii).tolist():
+                r_int = int(r)
+                if r_int == 0:
+                    continue
+                sel = (radii == r_int)
+                if not sel.any():
+                    continue
+                mask[sel] = _morph_mask(mask[sel], r_int)
+
+        # 3) Small-area dropout.
+        if mask_min_pixel_area > 0:
+            area = mask.sum(dim=(1, 2, 3))
+            small = (area < float(mask_min_pixel_area)).view(-1, 1, 1, 1)
+            mask = torch.where(small, torch.zeros_like(mask), mask)
+
+        # 4) Full-frame dropout.
+        if mask_dropout_prob > 0.0:
+            drop = (torch.rand(n, device=rgb.device) < mask_dropout_prob).view(-1, 1, 1, 1)
+            mask = torch.where(drop, torch.zeros_like(mask), mask)
+
+    return torch.cat([rgb, mask.to(rgb.dtype)], dim=1)

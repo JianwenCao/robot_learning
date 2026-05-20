@@ -7,11 +7,17 @@
 
 import gymnasium as gym
 
+from . import agents
+
+# Vision env (Stage-3 target). Stage-3 vision PPO cfg isn't written yet —
+# the placeholder rsl_rl entry point lets the rsl_rl train script load
+# this env without erroring. Swap to the Stage-3 cfg when it lands.
 gym.register(
     id="Isaac-SO-ARM101-SeqPickPlace-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:SeqPickPlaceTeacherPPORunnerCfg",
     },
     disable_env_checker=True,
 )
@@ -21,16 +27,43 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:SeqPickPlaceTeacherPPORunnerCfg",
     },
     disable_env_checker=True,
 )
 
-# Camera-free state-only teacher variant.
+# State-only teacher sharing the vision env cfg — wrist camera renders
+# each tick but its output is unused (wrist_image not in obs_groups).
+# Use only for diagnostic comparison; requires --enable_cameras.
+gym.register(
+    id="Isaac-SO-ARM101-SeqPickPlace-Teacher-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:SeqPickPlaceTeacherPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-SO-ARM101-SeqPickPlace-Teacher-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:SeqPickPlaceTeacherPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+# Camera-free state-only teacher variant — wrist_cam and wrist_image both
+# nulled. Skips RTX render entirely (~2-3× faster than Teacher-v0). No
+# --enable_cameras flag required.
 gym.register(
     id="Isaac-SO-ARM101-SeqPickPlace-Teacher-Fast-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceTeacherFastEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:SeqPickPlaceTeacherPPORunnerCfg",
     },
     disable_env_checker=True,
 )
@@ -40,6 +73,7 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101SeqPickPlaceTeacherFastEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.teacher_ppo_cfg:SeqPickPlaceTeacherPPORunnerCfg",
     },
     disable_env_checker=True,
 )

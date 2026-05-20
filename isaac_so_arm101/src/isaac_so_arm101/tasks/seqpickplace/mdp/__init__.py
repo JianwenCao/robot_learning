@@ -19,6 +19,9 @@ from isaac_so_arm101.tasks.pickplace.mdp.events import (  # noqa: F401
     randomize_wrist_hsv_dr,
     randomize_wrist_image_tint,
 )
+from isaac_so_arm101.tasks.pickplace.mdp.rewards import (  # noqa: F401
+    wrist_cam_table_clearance,
+)
 
 from .commands import SequentialGoalCommand, SequentialGoalCommandCfg  # noqa: F401
 from .events import (  # noqa: F401
@@ -41,6 +44,7 @@ from .observations import (  # noqa: F401
     current_target_gripper_to_block,
     seq_goal_vector,
     wrist_rgb_dr,
+    wrist_rgb_mask_dr,
 )
 from .rewards import (  # noqa: F401
     log_seq_success_metrics,

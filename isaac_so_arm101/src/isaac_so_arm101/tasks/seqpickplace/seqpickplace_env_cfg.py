@@ -92,7 +92,12 @@ class CommandsCfg:
     seq_goal = mdp.SequentialGoalCommandCfg(
         asset_name="robot",
         resampling_time_range=(15.0, 15.0),
-        debug_vis=False,
+        # Render the single per-rollout bowl as a red sphere in the
+        # viewer (matches Eval-1/2's bowl marker pattern). All 3
+        # sequential placements target this one bowl — only its position
+        # is randomized between rollouts, not between steps. Marker impl
+        # lives in :class:`SequentialGoalCommand._debug_vis_callback`.
+        debug_vis=True,
     )
 
 
@@ -138,7 +143,16 @@ class ObservationsCfg:
 
     @configclass
     class WristImageCfg(ObsGroup):
-        wrist_image = ObsTerm(func=mdp.wrist_rgb_dr, params={"corrupt": True})
+        """4-channel ``RGB + current_target_mask`` wrist obs.
+
+        Mirrors clutterpickplace's contract: the mask is the per-color
+        instance mask of the *current step's* target cube, drawn from
+        the TiledCamera's ``semantic_segmentation`` output (each cube
+        carries a ``class:cube_<color>`` tag). Corrupted to mimic
+        Florence-2's noise profile at deploy; Play cfgs disable.
+        """
+
+        wrist_image = ObsTerm(func=mdp.wrist_rgb_mask_dr, params={"corrupt": True})
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -157,15 +171,30 @@ class EventCfg:
         func=mdp.place_seq_blocks,
         mode="reset",
         params={
-            "block_x": (0.13, 0.22),
-            "block_y": (-0.12, 0.12),
-            "min_block_separation": 0.05,
+            # 4 cubes spread independently with pairwise rejection.
+            # Workspace 0.15×0.30 m² is enough to fit 4 cubes at
+            # ≥ 6 cm pairwise separation (≥ 4 cm edge gap for 2 cm
+            # cubes — gripper-friendly). With 0.07 separation in a
+            # tighter workspace, rejection sampling can't fit the 4th
+            # cube → PhysX collision ejects one off-table.
+            "block_x": (0.13, 0.28),
+            "block_y": (-0.15, 0.15),
+            "min_block_separation": 0.06,
             "table_z": 0.01,
-            "max_attempts": 20,
-            "bowl_x": (0.15, 0.28),
-            "bowl_y": (-0.12, 0.12),
-            "min_bowl_separation": 0.10,
-            "distinct_bowls": True,
+            "max_attempts": 80,
+            # Bowl in a tighter range than blocks → cubes can spill into
+            # the y-edges where the bowl can't spawn (better separation chance).
+            "bowl_x": (0.18, 0.26),
+            "bowl_y": (-0.08, 0.08),
+            # Bumped 0.08 → 0.15 (2026-05-20) to match Eval-1/Eval-3's
+            # spacing so cubes land clearly away from the bowl. NOTE:
+            # the bowl excludes ~π·15² ≈ 707 cm² (clipped to the 450 cm²
+            # cube workspace) — with 4 cubes also needing ≥ 6 cm
+            # pairwise separation, rejection sampling is *tight*. If
+            # ``place_seq_blocks`` starts logging "max_attempts
+            # exhausted" warnings, either drop this back toward 0.10 or
+            # widen the cube workspace (block_x/block_y).
+            "min_bowl_block_separation": 0.15,
             "command_name": "seq_goal",
             "cube_prefix": "cube_",
         },
@@ -226,6 +255,13 @@ class RewardsCfg:
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(
         func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")}
+    )
+
+    # Wrist-cam standoff from table — see Eval-1 RewardsCfg for rationale.
+    wrist_cam_clearance = RewTerm(
+        func=mdp.wrist_cam_table_clearance,
+        params={"margin": 0.03, "table_top_z": 0.0},
+        weight=-50.0,
     )
 
 

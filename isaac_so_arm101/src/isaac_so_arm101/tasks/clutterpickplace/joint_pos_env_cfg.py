@@ -15,8 +15,13 @@ into :class:`ClutterPickPlaceEnvCfg`. Cube spawning differs from Eval-1:
   mass — matching the dex_cube's reliability for binary-gripper grasping
   (the Eval-1 root cause of switching from CuboidCfg → dex_cube was
   hand-tuned friction; we replicate the working values here).
-* Each cube is semantic-tagged ``class:block`` so seg masks COULD be
-  produced; we just choose not to feed them to the policy (see env cfg).
+* Each cube is semantic-tagged with its own per-color class
+  (``class:cube_red``, ``class:cube_blue``, …). The wrist TiledCamera
+  emits ``semantic_segmentation``; :func:`mdp.wrist_rgb_mask_dr` reads
+  it and produces a target-keyed binary instance mask for the wrist
+  image's 4th channel. On the real arm, the same mask comes from
+  Florence-2 prompted by the target color (HSV thresholds proved too
+  brittle at the cube's working distance — see deploy/cube_detector.py).
 """
 
 import isaaclab.sim as sim_utils
@@ -89,7 +94,13 @@ def _cube_cfg(color_name: str, default_xy: tuple[float, float]) -> RigidObjectCf
                 static_friction=1.0,
                 dynamic_friction=1.0,
             ),
-            semantic_tags=[("class", "block")],
+            # Per-color semantic class so the wrist camera's
+            # ``semantic_segmentation`` output can be filtered to the
+            # *target* cube only (vs Eval-1's single ``class:block`` tag
+            # that lumps every cube together). The class ID lookup for
+            # each color is cached in :func:`mdp.wrist_rgb_mask_dr` after
+            # the first render.
+            semantic_tags=[("class", f"cube_{color_name}")],
         ),
     )
 
@@ -160,17 +171,20 @@ class SoArm101ClutterPickPlaceEnvCfg(ClutterPickPlaceEnvCfg):
             ],
         )
 
-        # Wrist camera — RGB only (no depth, no seg) since the policy obs
-        # is 3-channel here. semantic_segmentation still produced on
-        # request would just be ignored, so we leave it out to save
-        # render cost.
+        # Wrist camera — RGB + semantic_segmentation. The seg output is
+        # filtered per-target-color by :func:`mdp.wrist_rgb_mask_dr` to
+        # produce the 4th image channel (a binary instance mask of the
+        # *target* cube only). At deploy the same mask comes from
+        # Florence-2; per-step DR on the sim mask channel matches that
+        # detector's noise profile (see ``mdp.wrist_rgb_mask_dr``).
         intrinsics = mdp.load_wrist_cam_intrinsics()
         self.scene.wrist_cam = TiledCameraCfg(
             prim_path="{ENV_REGEX_NS}/Robot/gripper_link/wrist_cam",
             update_period=self.sim.dt * self.decimation,
             height=WRIST_RGB_HEIGHT,
             width=WRIST_RGB_WIDTH,
-            data_types=["rgb"],
+            data_types=["rgb", "semantic_segmentation"],
+            colorize_semantic_segmentation=False,
             spawn=PinholeCameraCfg(
                 focal_length=intrinsics["focal_length"],
                 horizontal_aperture=intrinsics["horizontal_aperture"],
@@ -195,6 +209,48 @@ class SoArm101ClutterPickPlaceEnvCfg_PLAY(SoArm101ClutterPickPlaceEnvCfg):
         self.scene.env_spacing = _multicube_sim.ENV_SPACING
         self.observations.policy.enable_corruption = False
         self.observations.wrist_image.wrist_image.params = {"corrupt": False}
+
+
+@configclass
+class SoArm101ClutterPickPlaceTeacherFastEnvCfg(SoArm101ClutterPickPlaceEnvCfg):
+    """Camera-free env cfg for the Stage-1 state teacher.
+
+    The default env cfg spawns a ``TiledCamera`` on every env so the
+    same scene works for the vision student in Stages 2/3. The teacher
+    never reads the wrist image — but PhysX + RTX still pay the full
+    rendering cost each step. With 6 cubes per env Eval-2's render
+    cost is ~3-4× Eval-1's (proportional to per-env prim count); the
+    camera-free variant is the right default for the teacher.
+
+    This subclass nulls the camera spawn and the ``wrist_image`` obs
+    group entirely. Trade-off: the teacher's training env is no longer
+    *visually* identical to the student's. That's fine because the
+    teacher only consumes ``policy + critic`` ground-truth state — the
+    image-side DR is added back in Stage 2 distillation and Stage 3 PPO
+    where the student actually reads pixels.
+
+    No ``--enable_cameras`` needed at launch.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Null the wrist camera spawn. Scene cfg manager skips entries set to None.
+        self.scene.wrist_cam = None
+        # Drop the wrist_image obs group too — its obs function would
+        # otherwise try to read sensors["wrist_cam"] each step.
+        self.observations.wrist_image = None
+
+
+@configclass
+class SoArm101ClutterPickPlaceTeacherFastEnvCfg_PLAY(SoArm101ClutterPickPlaceTeacherFastEnvCfg):
+    """Smaller variant of the camera-free teacher env, for visual eval."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        from isaac_so_arm101.tasks import _multicube_sim
+        self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
+        self.scene.env_spacing = _multicube_sim.ENV_SPACING
+        self.observations.policy.enable_corruption = False
 
 
 @configclass

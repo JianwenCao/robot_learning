@@ -16,9 +16,9 @@ Color-conditioned PPO on SO-ARM101 → zero-shot real-arm deploy. Task: `Isaac-S
 
 **Scene composition.** Six 2 cm `CuboidCfg` primitives, one per palette color: **blue, yellow, purple, orange, green, red**. The Eval-1 NVIDIA `dex_cube` USD can't be re-tinted per env, so cubes are primitives with `PreviewSurfaceCfg` colors baked in. Friction is tuned (`static=dynamic=1.0`, `mass=0.020 kg`) to replicate the dex_cube's grippability under the binary gripper.
 
-**Active-pair sampling.** Per reset, `TargetColorCommand` samples (i) two distinct colors from the palette as the *active pair* and (ii) one of those two as the *target*. The active pair is placed adjacent in the workspace by `place_clutter_blocks`; the other four cubes are teleported to `HIDDEN_PARK_XY` slots off-table where the wrist camera can't see them. **Half-separation is sampled per episode** from `U(0.0125, 0.030) m` — cube centers 2.5–6 cm apart, edge-to-edge margin 0.5–4 cm for the 2 cm cubes. The spec calls the configuration "adjacent (flat cluster)" but in practice a human evaluator places blocks with a small gap, so sampling the range trains a margin-robust policy rather than overfitting to a single canonical spacing. Pair axis `θ ∈ U[0, 2π)` so orientation is fully randomized.
+**Active-pair sampling.** Per reset, `TargetColorCommand` samples (i) two distinct colors from the palette as the *active pair* and (ii) one of those two as the *target*. The active pair is placed adjacent in the workspace by `place_clutter_blocks`; the other four cubes are teleported to `HIDDEN_PARK_XY` slots off-table where the wrist camera can't see them. **Cubes are attached (no margin)** — `half_separation=0.0105 m`, i.e. cube centers 2.1 cm apart, leaving a 1 mm face-to-face gap at spawn that closes to true contact under gravity within a sim step. The 1 mm exists only to avoid PhysX initial-interpenetration artifacts; the real-eval setup places the two blocks touching, so we match that. Pair axis `θ ∈ U[0, 2π)` so orientation is fully randomized.
 
-**Bowl.** 2-D goal from `UniformPoseCommandCfg` — **no scene prim**, **no rejection sampling**. Eval 1's `BowlPoseCommand` rejection sampler targets a single scene asset; here the target cube varies per env, so we accept a small fraction of episodes where the bowl spawns over the cluster (the place-only-target reward still penalizes those). Same `(x, y)` frame at deploy.
+**Bowl.** 2-D goal from `ClusterBowlPoseCommandCfg` — **no scene prim**, **rejection sampling against the active cube pair**. Generalizes Eval 1's `BowlPoseCommand` (single-asset rejection) to the two-cube case: reads `env._active_cube_indices` written by `place_clutter_blocks`, then resamples bowl xy up to 16× until `‖bowl_xy − cube_xy‖ ≥ 0.15 m` for *both* active cubes in robot frame. Same `(x, y)` frame at deploy. (Without rejection, ~5–10 % of resets land the bowl on top of the cluster, giving the policy free "block already in bowl" reward signal.)
 
 ## 2. Observations (asymmetric A-C)
 
@@ -28,15 +28,15 @@ Color-conditioned PPO on SO-ARM101 → zero-shot real-arm deploy. Task: `Isaac-S
 |---|---|---|
 | `policy` (deployable) | `joint_pos_rel`, `joint_vel_rel`, `gripper_state`, `bowl_xy`, `ee_proj_xy`, `ee_to_bowl_xy`, **`target_color_onehot`** (6-D), `last_action` | 1-D |
 | `critic` (privileged) | `policy` + `target_block_position`, `distractor_block_position`, `target_block_to_bowl_xy`, `target_gripper_to_block`, `target_is_grasped` | 1-D |
-| `wrist_image` | **RGB only** (no mask) | `(N, 3, 72, 128)` |
+| `wrist_image` | **RGB + target_mask** (per-color instance mask, target-keyed) | `(N, 4, 72, 128)` |
 
-Wrist `TiledCamera`: same mount and intrinsics as Eval 1 — parented to `gripper_link` at `pos=(-0.001, 0.1, -0.04)`, ros quat `(-0.404379, -0.912179, -0.0451242, 0.0486914)`. Renders `["rgb"]` only — no `semantic_segmentation`, no depth. Reasoning: with both blocks tagged `class:block`, a class-id mask can't disambiguate target from distractor, and a per-prim instance mask would still need a sim→real bridge (HSV thresholding on the real arm with per-color calibration). Going 3-channel RGB + color one-hot puts the color discrimination inside the learned CNN, removes the HSV calibration step, and lets the same 3-channel pipeline run at deploy.
+Wrist `TiledCamera`: same mount and intrinsics as Eval 1 — parented to `gripper_link` at `pos=(-0.001, 0.1, -0.04)`, ros quat `(-0.404379, -0.912179, -0.0451242, 0.0486914)`. Renders `["rgb", "semantic_segmentation"]` (`colorize_semantic_segmentation=False`). Each cube carries a unique `class:cube_<color>` tag; `mdp.wrist_rgb_mask_dr` filters the seg image to the *target* cube per env (via `env._target_cube_idx`) and concatenates that binary mask as the 4th channel. The class-id lookup happens once on first render and is cached on the camera object. At deploy the same mask comes from **Florence-2** prompted by the target color (`f"{color_name} cube"`) — empirical HSV thresholding proved brittle at the cube's working distance (no mask when far + lighting drift). The mask channel is corrupted in sim to match Florence-2's noise profile (small-area dropout, morphology, full dropout, wrong-color swap) — see §5.
 
 When `wrist_image` is absent from `obs_groups` (Stage 1 teacher), the CNN auto-disables → pure MLP A-C.
 
 ## 3. Network — `ClutterPickPlaceVisionActorCritic`
 
-Same architecture as Eval 1's `pretrained-backbone PPO path` (commit `903ef6b`): **frozen ImageNet ResNet-18 trunk → trainable 1×1 conv → Levine-style spatial-softmax head → 128-D keypoints**. We reuse `_ResNetSpatialSoftmaxCNN` from `tasks/pickplace/agents/vision_actor_critic.py` verbatim, only re-instantiated with `in_channels=3` (RGB only, no mask).
+Same architecture as Eval 1's `pretrained-backbone PPO path` (commit `903ef6b`): **frozen ImageNet ResNet-18 trunk → trainable 1×1 conv → Levine-style spatial-softmax head → 128-D keypoints**. We reuse `_ResNetSpatialSoftmaxCNN` from `tasks/pickplace/agents/vision_actor_critic.py` verbatim with `in_channels=4` (RGB + target_mask). The class auto-inflates `conv1` to 4 input channels at construction — RGB filters keep the ImageNet weights; the mask channel is initialized to the RGB-channel mean so the trunk's activation statistics are preserved. `img_in_shape` is derived from the observation manager's `wrist_image` group shape, so the channel switch is picked up automatically; no agent-cfg change is required.
 
 ```
 wrist_image (3×72×128) ──[ResNet-18 trunk (frozen, ImageNet)]── (128, 9, 16) feat
@@ -79,8 +79,6 @@ If FiLM plateaus in Stage 3 (e.g., < 60 % target-correct after 1500 iters), swit
 1. **ImageNet features are domain-general.** Real-world lighting and color variation that sim DR can't perfectly cover are inside ImageNet's pretraining distribution. Critical for Eval 2 because color discrimination is now load-bearing.
 2. **Frozen trunk = stable PPO.** The most common visual-PPO failure mode in this repo is encoder gradients fighting RL gradients. With `requires_grad=False` on the trunk, only the 1×1 conv + spatial softmax + downstream MLPs see PPO gradients. Also keeps BatchNorm running stats from drifting under PPO's non-stationary rollouts (Wu & He, GroupNorm ECCV 2018).
 3. **Spatial-softmax inductive bias kept.** ResNet features by themselves are not localization-friendly; the 1×1 conv re-projects to per-keypoint heatmaps and the soft-argmax extracts (x, y) coords. So we get ImageNet color/texture features **and** the Levine-2016 keypoint geometry head — not ResNet → flatten → MLP.
-4. **Optional BC-v1 weight overlay.** `_ResNetSpatialSoftmaxCNN.__init__` accepts `bc_v1_weights_path=` to load BC v1's ResNet-18 weights (saved under `img_enc.backbone.*`) on top of the ImageNet init. If the Eval-1 BC pipeline produces good encoder weights, those overlay further — strictly better than raw ImageNet for our wrist-cam pixel distribution.
-
 **Wiring note.** As of writing, `PickPlaceVisionActorCritic.__init__` still hardcodes `_ImpalaSmallCNN` at the two `self.actor_cnn` / `self.critic_cnn` instantiation sites (lines ~456 / 460). For Eval 2 we add a `cnn_class: str = "resnet"` cfg arg to `ClutterPickPlaceVisionActorCriticCfg` and dispatch to `_ResNetSpatialSoftmaxCNN` when set. Same gap exists for Eval 1's pretrained-backbone runs — fixing it in one place benefits both.
 
 **GPU budget note.** ResNet-18 layer1–layer2 is ~700 k params (down from ~11 M at layer3). Frozen → no gradient memory, but activation tensors through 64-ch (layer1) and 128-ch (layer2) feature maps at the rollout batch are still real. With `num_envs=1024` and rollout `num_steps=16`, that's 16 384 images per forward pass — ResNet activations at the larger spatial resolution will pressure VRAM more than Eval 1's 50 k-param CNN. Plan to drop to 768 envs if OOM; only fall back to a smaller backbone if 768 still doesn't fit.
@@ -112,7 +110,7 @@ No `task_success` termination — same logic as Eval 1: success termination woul
 ## 5. Curriculum & DR (`mdp/events.py`, `CurriculumCfg`)
 
 Both stages:
-- `place_clutter_blocks`: cluster center in `(0.15, 0.22) × (−0.10, 0.10)`, **half-separation sampled per episode from `U(0.0125, 0.030)` m** (0.5–4 cm edge-to-edge margin), pair axis `θ ∈ U[0, 2π)`. No separation curriculum — see below.
+- `place_clutter_blocks`: cluster center in `(0.15, 0.22) × (−0.10, 0.10)`, **`half_separation=0.0105` (fixed; cubes attached, 1 mm spawn gap closing to contact under gravity)**, pair axis `θ ∈ U[0, 2π)`.
 - `reset_target_latches`: clears per-episode lift / over-bowl latches.
 - Action-rate / joint-vel penalty ramp −1e-4 → −1e-2 at 10 k env-steps.
 - `log_target_success_metrics` TB metric (target-correct success rate + wrong-block placement rate).
@@ -124,7 +122,18 @@ DR (in env cfg — applies on every reset, including Stage 1 teacher; teacher ju
 Stage 3 adds (training-only, in the model):
 - DrQ ±4 px (in CNN, see §3).
 
-**No xy expand or separation curriculum.** Eval 1 used `expand_block_xy_range` (±3 cm → ±7×±12 cm). For Eval 2 the cluster band is already tight and the margin is *already* randomized per episode (§1), so the policy sees the full distribution from touching-ish to clearly-separated from step 0 — there's no easy/hard regime to schedule between. If Stage 1 fails to converge on the small-margin end, swap the half-separation range to `(0.025, 0.030)` for the first 5 k env-steps and ramp the lower bound down to 0.0125 over the next 20 k — that's a one-line `events.py` change.
+Per-step mask-channel DR (in `mdp.wrist_rgb_mask_dr`, gated by the obs `corrupt=True` param; Play cfgs disable):
+
+| Failure mode at deploy | DR term | Default |
+|---|---|---|
+| Florence loses cube when small/far in frame | Small-area dropout — zero the mask when total mask pixels `< mask_min_pixel_area` | 8 px |
+| Edge-pixel jitter on Florence output | Per-env erode/dilate with radius uniform in `[-R, R]` | `R = 2 px` |
+| Florence occasional total miss | Per-env Bernoulli full-frame mask dropout | `p = 0.10` |
+| Florence misclassifies under bad WB → wrong cube masked | Per-env Bernoulli swap to distractor's instance mask | `p = 0.03` |
+
+The wrong-color-swap term is the load-bearing one for multi-cube robustness: without it, a single Florence misfire that masks the distractor is a catastrophic single-step failure; with it, recovery is in-distribution.
+
+**No xy expand or separation curriculum.** Eval 1 used `expand_block_xy_range` (±3 cm → ±7×±12 cm). For Eval 2 the cluster band is already tight (≤ 7 cm × ≤ 20 cm) and cubes are always attached (no margin to schedule). If Stage 1 fails to converge on the attached case, the fallback is a *separation* curriculum: start `half_separation=0.025` (4 cm face-gap, Eval-1-like difficulty) for the first 5 k env-steps and ramp down to `0.0105` over the next 20 k. One-line change in `events.py` to make `half_separation` curriculum-driven.
 
 Deferred to deploy (not in sim DR yet): cube/table material DR, HDRI background, motion blur / JPEG, distractors beyond the active pair.
 
@@ -192,21 +201,20 @@ train --task Isaac-SO-ARM101-ClutterPickPlace-v0 --resume --headless --enable_ca
 
 `--enable_cameras` mandatory on all stages — env scene cfg spawns `TiledCamera` even for the teacher (camera prim instantiation requires the flag; output discarded when `wrist_image` is absent from `obs_groups`). Same symlink dance for `--load_run` as in Eval 1 `RUNNING.md` §5.1.
 
-## 8. Visual modality — RGB only
+## 8. Visual modality — RGB + target instance mask
 
-`(N, 3, 72, 128)`:
+`(N, 4, 72, 128)`:
 
 | Ch | Sim | Real |
 |---|---|---|
-| 0–2 | TiledCamera `rgb` → `/255`, per-episode tint DR | USB cam → `cv2.undistort` → resize → `/255` |
+| 0–2 | TiledCamera `rgb` → `/255`, per-episode tint + HSV DR | USB cam → `cv2.undistort` → resize → `/255` |
+| 3 | Per-color instance mask (`semantic_segmentation` filtered to `class:cube_<target>`), corrupted to mimic Florence-2 | Florence-2 prompted with `f"{target_color} cube"` (via `deploy/cube_detector.py`'s `Detector` protocol) |
 
-**No mask channel.** This is the key departure from Eval 1. Justification:
+**Why mask channel.** HSV thresholding at the cube's working distance was empirically too brittle (no mask when the cube is far in frame, lighting-induced false positives on bowl/table). Florence-2 with a color prompt is robust to those failure modes; the cost is per-frame inference latency (~2–5 s on CPU at deploy), which is mitigated by running detection on a background thread at ~0.3–0.5 Hz while the policy runs at 25 Hz. The target_color one-hot still flows into the actor state + CNN FiLM head (§3.1) so that when the mask channel is zero (detector miss or distance-gated dropout) the policy can still operate from RGB alone — belt-and-suspenders, not redundant.
 
-1. Both blocks tagged `class:block` — semantic mask can't disambiguate.
-2. An instance mask would require HSV thresholding on the real arm, with per-color HSV calibration — adds a sim/real bridge that the 3-channel path avoids.
-3. Color is now in the *policy state* (one-hot), not in the *image channel* — the CNN learns "match my pixels to the one-hot" rather than "find the masked region". Lighting DR (§5) is the regularizer that keeps this transferable.
+**Why this beats "FiLM-only colour grounding under DR."** The FiLM-only path forces PPO to learn the colour discrimination from sparse RL gradient under lighting DR — measured Stage-3 budget ~2500 iters. With the mask channel the visual problem collapses to "go to the white pixels" (same shape as Eval 1), at the cost of training Stage 2/3 against Florence-quality mask quality rather than GT. The §5 mask DR is what closes that gap.
 
-If Stage 3 plateaus at low target-correct rate (< 60 %), the fallback is to add a target-color HSV mask channel as a 4th image channel, calibrate HSV on the real cam, and retrain Stage 3 only (Stage 1 unchanged). Don't commit unless needed.
+If a particular colour pair plateaus despite the mask channel (Florence misclassifies under deploy lighting), the next escalation is a learned color-classifier head on the policy CNN; not implemented by default.
 
 ## 9. Why we don't use teleop in Stage 1
 
@@ -214,18 +222,18 @@ Eval 2's spec says "expert data collected from teleoperation is encouraged to us
 
 The flip side: if Stage 1 fails to converge (e.g., the color-conditioned grasp doesn't emerge from PPO alone), the diagnosis is reward shape or curriculum, **not** demo deficit. Adding teleop to Stage 1 would mask the real problem.
 
-## 10. Unblocking Stage 1 — wiring TODOs
+## 10. Implementation status
 
-The plan above describes the target architecture; the following pieces are *not yet in the code* and block the §7.2 workflow:
+All wiring TODOs (items 1–5) are implemented as of the latest commit:
 
-1. **`PickPlaceVisionActorCritic` CNN dispatch.** `__init__` still hardcodes `_ImpalaSmallCNN` at lines ~456 / 460. Add `cnn_class: str = "resnet"` cfg arg + dispatch table; defaults to ResNet for Eval 2, leaves Eval 1 free to opt in. Fixes Eval 1 pretrained-backbone path too.
-2. **`_ResNetSpatialSoftmaxCNN` truncation.** Drop `backbone.layer3` from the trunk Sequential (§3, risk A); update the BC-v1 weight overlay key remap accordingly (one fewer Sequential index).
-3. **FiLM head.** Add the `film_mlp` (6 → 512 → split into γ/β) and modulate trunk output before the 1×1 conv (§3.1). Touches `_ResNetSpatialSoftmaxCNN.__init__` + `forward` only.
-4. **Task registrations.** Add `Isaac-SO-ARM101-ClutterPickPlace-Teacher-v0` and `…-Student-v0` to `tasks/clutterpickplace/__init__.py`. The first drops `wrist_image` from `obs_groups`; the second wires `DistillationRunner`-compatible cfg.
-5. **Agent module.** Create `tasks/clutterpickplace/agents/` with `vision_actor_critic.py` (`ClutterPickPlaceVisionActorCritic` subclass passing `target_color` to the FiLM head), `teacher_ppo_cfg.py`, `distill_cfg.py`, `rsl_rl_ppo_cfg.py`, and `vision_student_teacher.py`.
-6. **`reset_scene_to_default` ordering.** `EventCfg.reset_all` runs `mdp.reset_scene_to_default` *before* `place_clutter_blocks` overwrites cube poses. Confirm `reset_scene_to_default` doesn't reset cubes to their CuboidCfg spawn-time `init_state.pos` *after* `place_clutter_blocks` has teleported them (would defeat the active-pair geometry).
+1. ✅ **CNN dispatch** — `PickPlaceVisionActorCritic.__init__` now accepts `cnn_class: str = "small"` and `cnn_kwargs: dict | None = None`. `"small"` (default) preserves Eval-1 behavior; `"resnet"` instantiates `_ResNetSpatialSoftmaxCNN(**cnn_kwargs)`.
+2. ✅ **ResNet truncation** — `_ResNetSpatialSoftmaxCNN.__init__` accepts `truncate_at: str = "layer3"`; passing `"layer2"` drops `backbone.layer3` and yields a `(128, 9, 16)` feature map at 72×128 input.
+3. ✅ **FiLM head** — `_ResNetSpatialSoftmaxCNN.__init__` accepts `film_cond_dim: int = 0`; when > 0, a small `film_mlp` (cond → 64 → 2C) modulates the trunk output before the 1×1 conv. γ-init=1 / β-init=0 means identity at init. `forward()` takes an optional `film_cond` kwarg (None → no modulation).
+4. ✅ **Task registrations** — `tasks/clutterpickplace/__init__.py` registers `…-v0`, `…-Play-v0`, `…-Teacher-v0`, `…-Teacher-Play-v0`, `…-Teacher-Fast-v0`, `…-Teacher-Fast-Play-v0`, `…-Student-v0`, `…-Student-Play-v0`. All carry `rsl_rl_cfg_entry_point`.
+5. ✅ **Agent module** — `tasks/clutterpickplace/agents/` contains `teacher_ppo_cfg.py`, `rsl_rl_ppo_cfg.py`, `distill_cfg.py`, `vision_actor_critic.py` (subclass), `vision_student_teacher.py` (subclass). Subclasses read the `goal` obs group and pass its one-hot to the CNN's FiLM head.
+6. ⏳ **`reset_scene_to_default` ordering** — verification step. Run the `Teacher-Fast-Play-v0` zero-agent rollout to confirm cubes stay at the `place_clutter_blocks` xy and don't snap back to CuboidCfg `init_state.pos` after the event.
 
-Items 1–5 are blocking; 6 is a verification step that can be done with one `Play-v0` rollout watching the cube xy.
+The `ObservationsCfg` was restructured: `target_color` moved out of `policy`/`critic` into a separate `goal` group, so the vision A-C can route it to FiLM without slicing-by-position.
 
 ## References
 

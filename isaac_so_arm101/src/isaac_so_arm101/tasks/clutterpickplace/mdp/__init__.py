@@ -33,8 +33,16 @@ from isaac_so_arm101.tasks.pickplace.mdp.events import (  # noqa: F401
     reset_was_grasped,
     reset_was_over_bowl_above_rim,
 )
+from isaac_so_arm101.tasks.pickplace.mdp.rewards import (  # noqa: F401
+    wrist_cam_table_clearance,
+)
 
-from .commands import TargetColorCommand, TargetColorCommandCfg  # noqa: F401
+from .commands import (  # noqa: F401
+    ClusterBowlPoseCommand,
+    ClusterBowlPoseCommandCfg,
+    TargetColorCommand,
+    TargetColorCommandCfg,
+)
 from .events import (  # noqa: F401
     BLOCK_COLORS,
     COLOR_NAMES,
@@ -51,6 +59,7 @@ from .observations import (  # noqa: F401
     target_gripper_to_block,
     target_is_grasped,
     wrist_rgb_dr,
+    wrist_rgb_mask_dr,
 )
 from .rewards import (  # noqa: F401
     distractor_disturb_penalty,

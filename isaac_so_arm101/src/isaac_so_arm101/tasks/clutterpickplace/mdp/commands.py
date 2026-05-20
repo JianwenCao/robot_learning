@@ -31,13 +31,15 @@ from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
+from isaaclab.envs.mdp.commands.commands_cfg import UniformPoseCommandCfg
+from isaaclab.envs.mdp.commands.pose_command import UniformPoseCommand
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
-from .events import NUM_COLORS
+from .events import COLOR_NAMES, NUM_COLORS
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+    from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
 
 class TargetColorCommand(CommandTerm):
@@ -127,6 +129,79 @@ class TargetColorCommand(CommandTerm):
 
     def _debug_vis_callback(self, event) -> None:  # noqa: D401
         pass
+
+
+class ClusterBowlPoseCommand(UniformPoseCommand):
+    """Uniform pose command with rejection sampling against the active cube pair.
+
+    Same pattern as Eval-1's :class:`pickplace.mdp.commands.BowlPoseCommand`,
+    but generalized to two cubes: the bowl xy must stay ≥ ``min_distance``
+    from *both* active cubes in robot frame. Reads
+    ``env._active_cube_indices`` (written by
+    :func:`mdp.events.place_clutter_blocks`, which runs BEFORE
+    ``command_manager.reset`` per ``ManagerBasedRLEnv._reset_idx``), so the
+    active pair is already known when this resampler fires.
+
+    If the ``max_attempts`` budget is exhausted, we keep the last sample —
+    fails gracefully and surfaces in per-episode metrics rather than as a
+    silent infinite loop.
+    """
+
+    cfg: "ClusterBowlPoseCommandCfg"
+
+    def __init__(self, cfg: "ClusterBowlPoseCommandCfg", env: "ManagerBasedEnv"):
+        super().__init__(cfg, env)
+        # Cache the six cube assets in palette order for fast gather by
+        # active-indices below.
+        self._cubes = [env.scene[f"cube_{name}"] for name in COLOR_NAMES]
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        # Uniform sample first (parent populates pose_command_b).
+        super()._resample_command(env_ids)
+
+        env_ids_t = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if env_ids_t.numel() == 0:
+            return
+
+        robot_root_xy_w = self.robot.data.root_pos_w[env_ids_t, :2]  # (n, 2)
+        active = self._env._active_cube_indices[env_ids_t]           # (n, 2) long
+
+        # World xy of all six cubes for these envs.
+        all_xy_w = torch.stack(
+            [c.data.root_pos_w[env_ids_t, :2] for c in self._cubes], dim=1
+        )  # (n, 6, 2)
+        # Pick out the active pair → (n, 2, 2) → robot frame.
+        active_xy_w = all_xy_w.gather(1, active.unsqueeze(-1).expand(-1, -1, 2))
+        active_xy_b = active_xy_w - robot_root_xy_w.unsqueeze(1)
+
+        min_d = float(self.cfg.min_distance)
+        for _ in range(int(self.cfg.max_attempts)):
+            cur_xy = self.pose_command_b[env_ids_t, :2]                 # (n, 2)
+            d = torch.norm(cur_xy.unsqueeze(1) - active_xy_b, dim=2)    # (n, 2)
+            bad = d.min(dim=1).values < min_d                            # (n,)
+            if not torch.any(bad):
+                break
+            bad_global_ids = env_ids_t[bad]
+            n_bad = bad_global_ids.numel()
+            r = torch.empty(n_bad, device=self.device)
+            self.pose_command_b[bad_global_ids, 0] = r.uniform_(*self.cfg.ranges.pos_x)
+            self.pose_command_b[bad_global_ids, 1] = r.uniform_(*self.cfg.ranges.pos_y)
+
+
+@configclass
+class ClusterBowlPoseCommandCfg(UniformPoseCommandCfg):
+    """Config for :class:`ClusterBowlPoseCommand`."""
+
+    class_type: type = ClusterBowlPoseCommand
+
+    min_distance: float = 0.10
+    """Minimum xy-plane distance between sampled bowl and *each* active
+    cube, in robot frame (meters). 10 cm matches Eval-1's bowl-vs-block
+    spacing — comfortably larger than the bowl rim radius."""
+
+    max_attempts: int = 8
+    """Rejection-sampling budget. 8 attempts × ~80 % accept rate per
+    draw → < 0.001 % stuck-envs, which gracefully accept the last sample."""
 
 
 @configclass

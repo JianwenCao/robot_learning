@@ -430,6 +430,8 @@ def wrist_image(
     corrupt: bool = True,
     rgb_brightness_jitter: float = 0.15,
     rgb_noise_std: float = 5.0 / 255.0,
+    mask_morph_prob: float = 2.0 / 3.0,
+    mask_dropout_prob: float = 0.03,
 ) -> torch.Tensor:
     """4-channel wrist-camera observation: ``[R, G, B, mask]``.
 
@@ -447,6 +449,18 @@ def wrist_image(
       ``cv2.inRange(hsv, low, high)`` calibrated once on the actual
       block colour against the gray table (#B8ADA9). For Eval 2/3,
       threshold for the *target* colour per rollout.
+
+    Mask DR (``corrupt=True``): the sim mask is pixel-perfect but the
+    real Florence-2 / HSV mask has ragged edges and occasional missed
+    frames. Two per-step ops close that gap:
+
+    * **Morphology jitter** — independently per env, erode / keep /
+      dilate the mask by 1 px with prob ``mask_morph_prob`` of *any*
+      morph op (split evenly between erode and dilate). 3×3 max-pool /
+      min-pool, so cost is ~one extra conv per step.
+    * **Whole-mask dropout** — with prob ``mask_dropout_prob`` per env
+      per step, zero the mask entirely. Forces the policy to not become
+      mask-only and degrade gracefully when the detector returns nothing.
 
     ``corrupt`` is gated by a param the play config can override
     (``params={"corrupt": False}``) so visual-DR doesn't pollute eval.
@@ -508,5 +522,26 @@ def wrist_image(
         # first call before any render has completed. Return zeros for
         # this one frame; the next step will see the cached ID.
         mask = torch.zeros(seg.shape[0], 1, *seg.shape[1:], device=seg.device, dtype=torch.float32)
+
+    # ---- Mask DR (sim2real: ragged Florence/HSV edges + dropped frames) ----
+    if corrupt:
+        n = mask.shape[0]
+        if mask_morph_prob > 0.0:
+            # Per-env trichotomy {erode, identity, dilate}.
+            # P(any morph) = mask_morph_prob, split evenly: half erode, half dilate.
+            roll = torch.rand(n, device=mask.device)
+            half = mask_morph_prob * 0.5
+            sel = torch.zeros(n, dtype=torch.long, device=mask.device)  # 1 = identity
+            sel.fill_(1)
+            sel = torch.where(roll < half, torch.zeros_like(sel), sel)              # erode
+            sel = torch.where(roll >= 1.0 - half, torch.full_like(sel, 2), sel)     # dilate
+            if (sel != 1).any():
+                dilated = torch.nn.functional.max_pool2d(mask, 3, stride=1, padding=1)
+                eroded = -torch.nn.functional.max_pool2d(-mask, 3, stride=1, padding=1)
+                sel4 = sel.view(-1, 1, 1, 1)
+                mask = torch.where(sel4 == 0, eroded, torch.where(sel4 == 2, dilated, mask))
+        if mask_dropout_prob > 0.0:
+            drop = (torch.rand(n, 1, 1, 1, device=mask.device) < mask_dropout_prob).float()
+            mask = mask * (1.0 - drop)
 
     return torch.cat([rgb, mask], dim=1)  # (N, 4, H, W)

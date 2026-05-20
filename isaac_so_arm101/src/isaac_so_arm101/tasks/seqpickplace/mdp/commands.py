@@ -12,19 +12,21 @@ Encapsulates everything the 3-step sequential task needs:
     are placed in the workspace.
   - ``goal_color_pos`` ``(N, 3)`` long ∈ [0, 4) — for each of the 3
     steps, which position inside ``active_indices`` is the target.
-  - ``goal_bowl_idx`` ``(N, 3)`` long ∈ [0, 3) — for each step, which of
-    the 3 bowls is the target. Independent of color sampling.
-  - ``bowl_positions`` ``(N, 3, 2)`` float — the three bowl xy positions
-    in the robot frame, sampled with rejection so they're ≥
-    ``min_bowl_separation`` apart and the *first step's* bowl is
-    ``min_block_distance`` from the first step's target cube.
+  - ``bowl_positions`` ``(N, 1, 2)`` float — the single bowl xy position
+    in the robot frame, sampled with rejection so it's ≥
+    ``min_bowl_block_separation`` from every cube. All 3 sequential
+    placements target this bowl.
 * Per-step "advance step on success" book-keeping:
   ``_update_command`` is called every env step by the CommandManager; it
   reads ``env._seq_step_release_indicator`` (an OR-latch maintained by
   the reward function) and increments ``env._seq_step_idx`` accordingly.
 
-The command's "command" tensor is a 6 + 2 + 3 = 11-D vector per env:
-``[current_target_color_onehot(6), current_target_bowl_xy(2), current_step_idx_onehot(3)]``.
+The command's "command" tensor is a 6 + 2 = 8-D vector per env:
+``[current_target_color_onehot(6), current_target_bowl_xy(2)]`` — the
+deployable input is just what the spec lists: target color + target
+bowl position. The current step counter is tracked internally on the
+env (``env._seq_step_idx``) for reward gating but NOT exposed to the
+policy.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
-from .events import N_ACTIVE_BLOCKS, N_GOAL_STEPS, NUM_COLORS
+from .events import N_ACTIVE_BLOCKS, N_BOWLS, N_GOAL_STEPS, NUM_COLORS
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -64,15 +66,22 @@ class SequentialGoalCommand(CommandTerm):
             env._seq_active_indices = torch.zeros((N, N_ACTIVE_BLOCKS), dtype=torch.long, device=device)
         if not hasattr(env, "_seq_goal_color_pos"):
             env._seq_goal_color_pos = torch.zeros((N, N_GOAL_STEPS), dtype=torch.long, device=device)
-        if not hasattr(env, "_seq_goal_bowl_idx"):
-            env._seq_goal_bowl_idx = torch.zeros((N, N_GOAL_STEPS), dtype=torch.long, device=device)
         if not hasattr(env, "_seq_bowl_positions"):
-            env._seq_bowl_positions = torch.zeros((N, N_GOAL_STEPS, 2), dtype=torch.float32, device=device)
+            env._seq_bowl_positions = torch.zeros((N, N_BOWLS, 2), dtype=torch.float32, device=device)
         if not hasattr(env, "_seq_step_idx"):
             env._seq_step_idx = torch.zeros(N, dtype=torch.long, device=device)
+        # Hot-path lookup buffers used by observations and rewards. Must be
+        # allocated here (before the first reset) because the obs manager
+        # probes obs shapes at env construction, which calls obs functions
+        # that read these buffers before place_seq_blocks ever runs.
+        if not hasattr(env, "_active_cube_indices"):
+            env._active_cube_indices = torch.zeros((N, N_ACTIVE_BLOCKS), dtype=torch.long, device=device)
+        if not hasattr(env, "_target_cube_idx_per_step"):
+            env._target_cube_idx_per_step = torch.zeros((N, N_GOAL_STEPS), dtype=torch.long, device=device)
 
         # Output buffer for self.command (re-computed each call).
-        self._cmd = torch.zeros((N, NUM_COLORS + 2 + N_GOAL_STEPS), dtype=torch.float32, device=device)
+        # 6 (color one-hot) + 2 (bowl xy) = 8-D. Step idx is internal only.
+        self._cmd = torch.zeros((N, NUM_COLORS + 2), dtype=torch.float32, device=device)
 
     # Aliases — the source of truth is env state.
 
@@ -85,18 +94,20 @@ class SequentialGoalCommand(CommandTerm):
         return self._env._seq_goal_color_pos
 
     @property
-    def goal_bowl_idx(self) -> torch.Tensor:
-        return self._env._seq_goal_bowl_idx
-
-    @property
     def bowl_positions(self) -> torch.Tensor:
+        """``(N, 1, 2)`` float — xy position of the single bowl in robot frame."""
         return self._env._seq_bowl_positions
 
     # ----------------------------------------------------------- properties
 
     @property
     def command(self) -> torch.Tensor:
-        """``(N, 11)`` — current target color one-hot + current bowl xy + step one-hot."""
+        """``(N, 8)`` — current target color one-hot (6) + current bowl xy (2).
+
+        This matches the spec's per-goal info: target color + target bowl
+        position. The step counter is internal (used by reward gating)
+        and intentionally NOT exposed to the policy.
+        """
         return self._compose_command()
 
     def current_target_color_idx(self) -> torch.Tensor:
@@ -107,12 +118,9 @@ class SequentialGoalCommand(CommandTerm):
         return self.active_indices.gather(1, color_pos.view(-1, 1)).squeeze(1)
 
     def current_target_bowl_xy(self) -> torch.Tensor:
-        """``(N, 2)`` current step's bowl xy in robot frame."""
-        step = self._env._seq_step_idx.clamp(max=N_GOAL_STEPS - 1)
-        bowl_idx = self.goal_bowl_idx.gather(1, step.view(-1, 1)).squeeze(1)
-        return self.bowl_positions.gather(
-            1, bowl_idx.view(-1, 1, 1).expand(-1, 1, 2)
-        ).squeeze(1)
+        """``(N, 2)`` bowl xy in robot frame — constant across the 3
+        sequential steps within a rollout (single bowl per rollout)."""
+        return self.bowl_positions[:, 0]
 
     def all_steps_done(self) -> torch.Tensor:
         """Bool mask ``(N,)`` — current step idx ≥ ``N_GOAL_STEPS`` (final
@@ -122,28 +130,22 @@ class SequentialGoalCommand(CommandTerm):
     # ---------------------------------------------------------- compose cmd
 
     def _compose_command(self) -> torch.Tensor:
-        step_clamped = self._env._seq_step_idx.clamp(max=N_GOAL_STEPS - 1)
         color_idx = self.current_target_color_idx()
         bowl_xy = self.current_target_bowl_xy()
 
         # Color one-hot
         self._cmd[:, :NUM_COLORS] = 0.0
         self._cmd.scatter_(1, color_idx.view(-1, 1), 1.0)
-        # bowl xy
+        # bowl xy (target bowl is per-rollout fixed, but exposed each
+        # call for consistency)
         self._cmd[:, NUM_COLORS:NUM_COLORS + 2] = bowl_xy
-        # step one-hot — clamp the (already-incremented-past-last) case to
-        # last step so the obs stays well-defined after termination.
-        self._cmd[:, NUM_COLORS + 2:] = 0.0
-        idx = NUM_COLORS + 2 + step_clamped
-        self._cmd.scatter_(1, idx.view(-1, 1), 1.0)
-        # Zero the color/bowl one-hots for envs that have finished all
+        # Zero the color/bowl entries for envs that have finished all
         # steps so the policy gets a clear "done" signal (caller's
         # responsibility to also terminate / mask reward).
         done = self.all_steps_done()
         if done.any():
             self._cmd[done, :NUM_COLORS] = 0.0
             self._cmd[done, NUM_COLORS:NUM_COLORS + 2] = 0.0
-            # leave step one-hot at the last step
         return self._cmd
 
     # ---------------------------------------------------------- resampling
@@ -188,11 +190,55 @@ class SequentialGoalCommand(CommandTerm):
     def _update_metrics(self) -> None:
         pass
 
+    # ---------------------------------------------------------- debug viz
+    #
+    # SequentialGoalCommand carries its OWN bowl position (vs Eval-1/2's
+    # UniformPoseCommand which auto-draws via Isaac Lab's command-marker
+    # path). We implement the marker manually so ``debug_vis=True`` on
+    # the cfg renders the single per-rollout bowl as a red sphere.
+
     def _set_debug_vis_impl(self, debug_vis: bool) -> None:
-        pass
+        if debug_vis:
+            if not hasattr(self, "_bowl_markers") or self._bowl_markers is None:
+                import isaaclab.sim as sim_utils
+                from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+                marker_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/Command/seq_bowls",
+                    markers={
+                        # Single per-rollout target bowl (red).
+                        "target": sim_utils.SphereCfg(
+                            radius=0.03,
+                            visual_material=sim_utils.PreviewSurfaceCfg(
+                                diffuse_color=(1.0, 0.0, 0.0)
+                            ),
+                        ),
+                    },
+                )
+                self._bowl_markers = VisualizationMarkers(marker_cfg)
+            self._bowl_markers.set_visibility(True)
+        else:
+            if hasattr(self, "_bowl_markers") and self._bowl_markers is not None:
+                self._bowl_markers.set_visibility(False)
 
     def _debug_vis_callback(self, event) -> None:
-        pass
+        if not getattr(self, "_bowl_markers", None):
+            return
+        # Bowl xy in robot frame → world. Single bowl per env.
+        bowl_pos_b = self._env._seq_bowl_positions  # (N, 1, 2)
+        robot_root_xy_w = self.robot.data.root_pos_w[:, :2]
+        bowl_pos_w = torch.zeros(
+            (self.num_envs, N_BOWLS, 3),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        bowl_pos_w[..., :2] = bowl_pos_b + robot_root_xy_w.unsqueeze(1)
+        bowl_pos_w[..., 2] = 0.01  # at table top
+        translations = bowl_pos_w.reshape(-1, 3)
+        marker_ids = torch.zeros(translations.shape[0], device=self.device, dtype=torch.long)
+        self._bowl_markers.visualize(
+            translations=translations,
+            marker_indices=marker_ids,
+        )
 
 
 @configclass

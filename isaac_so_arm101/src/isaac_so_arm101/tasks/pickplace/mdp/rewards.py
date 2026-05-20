@@ -814,6 +814,19 @@ def release_in_bowl(
         env._task_success_latch = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     env._task_success_latch |= indicator
 
+    # PDF-strict success indicator: "block is placed inside the bowl AND
+    # released" — the minimal gate the spec actually requires (in_xy ∧
+    # low ∧ opened), without the ``settled`` / ``was_lifted`` /
+    # ``was_over_high`` safety latches. Logged as ``success_rate_strict``
+    # alongside the headline ``success_rate`` so we can tell whether the
+    # safety latches are biasing the reported number low (gap should be
+    # ~0 in practice; persistent gap means the latches are excluding
+    # otherwise-valid traces).
+    strict_indicator = in_xy & low & opened
+    if not hasattr(env, "_task_success_latch_strict"):
+        env._task_success_latch_strict = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    env._task_success_latch_strict |= strict_indicator
+
     return indicator.float()
 
 
@@ -842,6 +855,45 @@ def block_dropped(
     return (on_table & far_from_bowl).float()
 
 
+def wrist_cam_table_clearance(
+    env: ManagerBasedRLEnv,
+    cam_offset_local: tuple[float, float, float] = (-0.001, 0.1, -0.04),
+    table_top_z: float = 0.0,
+    margin: float = 0.03,
+    body_name: str = "gripper_link",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Soft penalty: meters that the wrist camera is below ``table_top_z +
+    margin``. Returns a non-negative scalar per env; multiply by a negative
+    weight in cfg.
+
+    Protects the real wrist camera from crashing into the table — the sim
+    has no collision shape on the camera housing, so absent this term PPO
+    can find low-cam trajectories that would smash the lens on hardware.
+    Linear penalty (raw shortfall in meters) so the gradient strength is
+    independent of ``margin``: doubling the margin doesn't quadruple the
+    peak signal, the weight in cfg controls it.
+
+    Camera world z is computed as ``gripper_link_pos_w + R(gripper_link) ·
+    cam_offset_local``. ``cam_offset_local`` mirrors the
+    ``OffsetCfg.pos`` on ``scene.wrist_cam`` in
+    :mod:`joint_pos_env_cfg` — keep these two in lockstep.
+
+    Returns ``(num_envs,)``: 0 when the cam is at or above ``table_top_z +
+    margin``, otherwise the shortfall in meters (positive). Cam beneath
+    the table plane yields a shortfall ``>= margin``.
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    body_idx = robot.find_bodies(body_name)[0][0]
+    body_pos = robot.data.body_pos_w[:, body_idx]
+    body_quat = robot.data.body_quat_w[:, body_idx]
+    offset = torch.tensor(cam_offset_local, device=body_pos.device, dtype=body_pos.dtype)
+    offset = offset.expand_as(body_pos)
+    cam_pos_w, _ = combine_frame_transforms(body_pos, body_quat, offset)
+    clearance = cam_pos_w[:, 2] - table_top_z
+    return (margin - clearance).clamp(min=0.0)
+
+
 # ---------------------------------------------------------------------------
 # Metrics — wired as a CurriculumTerm in cfg, not a RewardTerm. CurriculumTerms
 # whose function returns a ``dict[str, float]`` get logged automatically by
@@ -859,10 +911,12 @@ def log_success_metrics(
 ) -> dict[str, float]:
     """Per-episode binary task-success rate.
 
-    Wired as a :class:`CurriculumTermCfg`. Returns
-    ``{"success_rate": float, "n_episodes_ended": int}`` which Isaac Lab's
-    :class:`CurriculumManager` logs as
-    ``Curriculum/log_success/success_rate`` (and ``.../n_episodes_ended``).
+    Wired as a :class:`CurriculumTermCfg`. Returns a dict with at minimum
+    ``success_rate`` (conservative, includes safety latches) and
+    ``n_episodes_ended``, plus ``success_rate_strict`` (PDF-minimal gate:
+    ``in_xy ∧ low ∧ opened``) when the strict latch buffer has been
+    populated. Isaac Lab's :class:`CurriculumManager` logs each key as
+    ``Curriculum/log_success/<key>``.
 
     **What this measures.** For each env that just ended an episode this
     step (``env_ids`` is the resetting-envs index list — the
@@ -918,6 +972,14 @@ def log_success_metrics(
         "success_rate": success_rate,
         "n_episodes_ended": float(n_ended),
     }
+
+    # PDF-strict SR (in_xy ∧ low ∧ opened, no safety latches). See the
+    # ``strict_indicator`` block in :func:`release_in_bowl` for why we
+    # log this in parallel.
+    strict_latch = getattr(env, "_task_success_latch_strict", None)
+    if strict_latch is not None:
+        metrics["success_rate_strict"] = strict_latch[env_ids].float().mean().item()
+        strict_latch[env_ids] = False
 
     # Diagnostic: fraction of ended episodes that ever satisfied the
     # over-bowl-above-rim precondition. If success_rate stays low while

@@ -124,8 +124,8 @@ class PickPlaceBowlSceneCfg(InteractiveSceneCfg):
     # (5 cm clearance for the ~9 cm base footprint), front edge at x=0.55
     # (≥25 cm beyond the max reach of 0.30, plenty of visual context).
     # y unchanged at 1 m — the side bezels aren't a sim-to-real issue.
-    # Workspace dependencies (bowl ranges [0.15, 0.28] × ±0.12, block init
-    # x=0.20) are all comfortably inside the new table.
+    # Workspace dependencies (bowl ranges [0.10, 0.30] × ±0.15, block init
+    # x=0.20 ± 0.10) are all comfortably inside the new table.
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
         init_state=AssetBaseCfg.InitialStateCfg(pos=[0.25, 0.0, -0.01]),
@@ -173,26 +173,38 @@ class CommandsCfg:
         # length so it never resamples mid-episode).
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
-        # Rejection sampling keeps the bowl ≥ 10 cm from the block at xy.
+        # Rejection sampling keeps the bowl ≥ 15 cm from the block at xy.
         # Without this, ~10–20 % of resets put the block inside r_safe of
         # the bowl, which lets a stationary block farm the place reward
         # without ever being grasped (observed at iter 99 of the smoke run).
+        # Bumped 0.12 → 0.15 (2026-05-20): the prior 12 cm still allowed
+        # block/bowl pairs that visually overlap from the wrist-cam standoff
+        # (~20 cm), leaving ambiguity about which one the policy should
+        # reach for. 15 cm is roughly half the bowl x-range (0.15–0.28),
+        # so the two assets reliably land in clearly different parts of the
+        # workspace and "transport" is the only path to reward.
+        # max_attempts bumped 8 → 16 so the tighter constraint has enough
+        # budget to converge (rejection rate is higher with min_distance up).
         target_asset_name="object",
-        min_distance=0.10,
-        max_attempts=8,
+        min_distance=0.15,
+        max_attempts=16,
         ranges=mdp.BowlPoseCommandCfg.Ranges(
-            # Tightened from (0.10, 0.30) × (-0.15, 0.15) to the
-            # actually-reachable comfortable workspace for SO-ARM101 at
-            # table level. Per URDF joint limits + EE_HOME=(0.24, 0,
-            # 0.08), the arm can reach 0.10-0.30 in x and ±0.15 in y at
-            # the limit, but the *comfortable* range (no awkward folding
-            # or full extension) is x∈(0.15, 0.28), y∈±0.12. With the
-            # wider range, ~10-20% of episodes had unreachable goals
-            # which added gradient noise and pushed the policy toward
-            # weird wrist postures attempting to satisfy unreachable
-            # targets.
-            pos_x=(0.15, 0.28),
-            pos_y=(-0.12, 0.12),
+            # 2026-05-20: re-expanded back to the URDF-reachable limits
+            # x∈[0.10, 0.30], y∈±0.15 as an experiment. Background:
+            # we'd previously tightened to x∈(0.15, 0.28), y∈±0.12
+            # because ~10-20 % of episodes hit unreachable goals at the
+            # limit and added gradient noise. Re-trying the wider range
+            # now because (a) the upstream MuammerBay/isaac_so_arm101
+            # lift task uses even wider (y∈±0.20) without trouble,
+            # (b) we have a converged teacher + critic warm-start now
+            # (vs the cold-start runs where unreachable goals hurt
+            # most), and (c) wider workspace forces the vision policy
+            # to generalize over the full reachable set rather than a
+            # convenience subset. If success_rate stalls / σ inflates
+            # in the first ~500 PPO iters at Stage 3, revert to the
+            # comfortable band (x∈[0.15, 0.28], y∈±0.12).
+            pos_x=(0.10, 0.30),
+            pos_y=(-0.15, 0.15),
             # Goal z = 0 (table level). After release, the 2 cm cube sits
             # on the bowl floor (which sits on the table) → cube center
             # at z = 0.01. With std=0.20 in transport's tanh, the 1 cm
@@ -301,7 +313,8 @@ class ObservationsCfg:
         Channels: RGB (0–2) + binary cube mask (3). All in ``[0, 1]``. Sim
         and real-side deploy feed the same shape into the same CNN; on
         real, channel 3 comes from HSV thresholding (``cv2.inRange``). See
-        :func:`mdp.wrist_image` for per-step DR (brightness, noise) and
+        :func:`mdp.wrist_image` for per-step DR (RGB brightness + noise;
+        mask morphology jitter + dropout) and
         :func:`mdp.randomize_wrist_image_tint` for per-episode color tint
         (sampled at reset).
 
@@ -368,17 +381,14 @@ class EventCfg:
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            # Full workspace ±10×±15 cm relative to the cube's default
-            # init pos (0.2, 0, 0.01). Matches stock Franka's range
-            # philosophy (their ranges are ±0.1, ±0.25 in their
-            # coordinate scale; ours are scaled to SO-ARM workspace).
-            # Tightened from x±0.10/y±0.15 to match the reachable
-            # workspace defined in CommandsCfg.bowl_pose. Block default
-            # is (0.2, 0, 0.01); deltas of x∈(-0.07, 0.08) → absolute
-            # x∈(0.13, 0.28), y∈(-0.12, 0.12) — same comfortable reach
-            # band as the bowl goal so all (block, goal) pairs are
-            # solvable.
-            "pose_range": {"x": (-0.07, 0.08), "y": (-0.12, 0.12), "z": (0.0, 0.0)},
+            # 2026-05-20: re-expanded to URDF-reachable limits to
+            # match CommandsCfg.bowl_pose. Block default is
+            # (0.2, 0, 0.01); deltas x∈(-0.10, 0.10), y∈(-0.15, 0.15)
+            # → absolute x∈[0.10, 0.30], y∈[-0.15, 0.15] — same band
+            # as the bowl goal so all (block, goal) pairs remain
+            # solvable. See the bowl ranges docstring for the rollback
+            # plan if Stage-3 training degrades.
+            "pose_range": {"x": (-0.10, 0.10), "y": (-0.15, 0.15), "z": (0.0, 0.0)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object"),
         },
@@ -501,6 +511,19 @@ class RewardsCfg:
         func=mdp.joint_vel_l2, weight=-1e-4, params={"asset_cfg": SceneEntityCfg("robot")}
     )
 
+    # Soft standoff penalty protecting the real wrist camera from crashing
+    # into the table. ``margin=0.03`` (3 cm) chosen to clear plausible grasp
+    # postures (gripper_link sits ~9 cm above the EE tip; with the cam
+    # offset along gripper +y/-z, world cam_z at typical grasp height
+    # stays well above 3 cm). Weight -50 puts max single-step penalty at
+    # ~-1.5 (cam right on the table) — same order as ``reaching_object``
+    # but well below the post-grasp terms, so it steers without dominating.
+    wrist_cam_clearance = RewTerm(
+        func=mdp.wrist_cam_table_clearance,
+        params={"margin": 0.03, "table_top_z": 0.0},
+        weight=-50.0,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Terminations
@@ -541,7 +564,7 @@ class CurriculumCfg:
 
     * Warm-up: ±3 cm × ±3 cm for the first 5 000 env-steps (~150 PPO iters
       at 2048 envs × 16 steps).
-    * Expand: linearly to the live full width (±7 cm × ±12 cm in
+    * Expand: linearly to the live full width (±10 cm × ±15 cm in
       reset_block_position) over the next 30 000 env-steps (~900 iters).
     * After ~35 000 env-steps the schedule is at its final width and the
       curriculum is effectively a no-op.
@@ -569,14 +592,14 @@ class CurriculumCfg:
         params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 10000},
     )
     # Stage-3-adapted block-xy expand. Ramps the reset_block_position event's
-    # pose_range from ±3 cm to the live full width (±7×±12). Live full-width
+    # pose_range from ±3 cm to the live full width (±10×±15). Live full-width
     # is set in EventCfg.reset_block_position above; if you tighten that,
     # tighten ``final_xy`` here to match.
     block_range_expand = CurrTerm(
         func=mdp.expand_block_xy_range,
         params={
             "initial_xy": (0.03, 0.03),
-            "final_xy":   (0.07, 0.12),
+            "final_xy":   (0.10, 0.15),
             "warmup_steps":  5_000,
             "expand_steps":  30_000,
             "event_term_name": "reset_block_position",

@@ -14,7 +14,7 @@ Goal-conditioned PPO on SO-ARM101 → zero-shot real-arm deploy. Task: `Isaac-SO
 | Terminations | `time_out`, `block_off_table` |
 | Table | `0.6 × 1.0 × 0.02 m` at `(0.25, 0, −0.01)`; top `z=0`, back edge `x=−0.05` |
 
-Block: 2 cm DexCube USD (scale 0.4), xy randomized. Bowl: 2-D goal from `BowlPoseCommandCfg`, **no scene prim**; rejection-sampled with `‖block − bowl‖ ≥ 0.10 m`. Same `(x, y)` frame at deploy.
+Block: 2 cm DexCube USD (scale 0.4), xy randomized. Bowl: 2-D goal from `BowlPoseCommandCfg`, **no scene prim**; rejection-sampled with `‖block − bowl‖ ≥ 0.15 m` (up to 16 attempts) so block and bowl reliably land in clearly different parts of the workspace. Same `(x, y)` frame at deploy.
 
 ## 2. Observations (asymmetric A-C)
 
@@ -65,12 +65,12 @@ No `task_success` termination — would let "hover and hold" beat "release and s
 ## 5. Curriculum & DR (`mdp/events.py`, `CurriculumCfg`)
 
 Both stages:
-- `reset_block_position` ±7 × ±12 cm at `(0.20, 0)`; bowl rejection-sampled in the same band.
+- `reset_block_position` ±10 × ±15 cm at `(0.20, 0)`; bowl rejection-sampled in the same band.
 - Action-rate / joint-vel penalty ramp −1e-4 → −1e-2 at 10 k env-steps.
 - `log_success` TB metric.
 
 Stage 3 adds:
-- `expand_block_xy_range`: ±3 × ±3 cm for 5 k env-steps, then linearly → ±7 × ±12 cm over 30 k.
+- `expand_block_xy_range`: ±3 × ±3 cm for 5 k env-steps, then linearly → ±10 × ±15 cm over 30 k.
 - DrQ ±4 px (in CNN, see §3).
 - `mdp.wrist_image` per-step photometric jitter: brightness ±15 %, RGB noise σ=5/255.
 
@@ -140,7 +140,7 @@ Teacher task variants:
 - `…-Teacher-Fast-v0` — `SoArm101PickPlaceBowlTeacherFastEnvCfg` nulls the camera spawn AND the `wrist_image` obs group. Skips RTX rendering entirely. **No `--enable_cameras` needed.**
 - `…-Teacher-v0` — shared env cfg with the vision task; camera rendered each step but output discarded. Use only for diagnostic comparison or when an existing teacher run resumes; requires `--enable_cameras`.
 
-Stages 2 and 3 need `--enable_cameras` — they actually read the wrist image. The `from_teacher` symlink dance is in `RUNNING.md` §5.1.
+Stages 2 and 3 need `--enable_cameras` — they actually read the wrist image. The `from_teacher` symlink is `ln -s <teacher_run_dir> logs/rsl_rl/pickplace_bowl_student/from_teacher` so `--load_run from_teacher` resolves to the Stage-1 teacher's run when starting distill.
 
 ## 8. Visual modality — RGB + mask
 
@@ -149,13 +149,13 @@ Stages 2 and 3 need `--enable_cameras` — they actually read the wrist image. T
 | Ch | Sim | Real |
 |---|---|---|
 | 0–2 | TiledCamera `rgb` → `/255` | USB cam → `cv2.undistort` → resize → `/255` |
-| 3 | `semantic_segmentation` filtered to `class:block` | `cv2.inRange` on HSV (calibrated to block color) |
+| 3 | `semantic_segmentation` filtered to `class:block` | `cv2.inRange` on HSV (default, calibrated to block color) **or** Florence-2 referring-expression segmentation via `--mask-source florence` (robust to clutter; see `deploy/cube_detector.py`) |
 
 Block ID looked up once from `info["idToLabels"]` and cached on the camera object.
 
 ## References
 
-- **Code:** `tasks/pickplace/{pickplace_env_cfg,joint_pos_env_cfg}.py`, `mdp/{observations,rewards,events,terminations,commands}.py`, `agents/{vision_actor_critic,vision_student_teacher,rsl_rl_ppo_cfg,teacher_ppo_cfg,distill_cfg}.py`, `camera_intrinsics.yaml`. Run/deploy: [`RUNNING.md`](./RUNNING.md), [`DEPLOY.md`](./DEPLOY.md).
+- **Code:** `tasks/pickplace/{pickplace_env_cfg,joint_pos_env_cfg}.py`, `mdp/{observations,rewards,events,terminations,commands}.py`, `agents/{vision_actor_critic,vision_student_teacher,rsl_rl_ppo_cfg,teacher_ppo_cfg,distill_cfg}.py`, `camera_intrinsics.yaml`. Real-robot deploy: [`../deploy/README.md`](../deploy/README.md).
 - **Pinto et al.**, *Asymmetric Actor Critic*, RSS 2018. <https://arxiv.org/abs/1710.06542>
 - **Levine et al.**, *End-to-End Visuomotor Policies*, JMLR 2016 — spatial softmax.
 - **Kostrikov et al.**, *DrQ*, ICLR 2021. <https://arxiv.org/abs/2004.13649>

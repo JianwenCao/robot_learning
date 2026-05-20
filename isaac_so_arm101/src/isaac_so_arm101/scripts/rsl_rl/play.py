@@ -34,7 +34,7 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-# Sim-side debug dump — mirrors bc/deploy_real.py --debug-dump output layout so
+# Sim-side debug dump — mirrors deploy/deploy_real.py --debug-dump output layout so
 # a sim rollout and a real rollout can be diffed step-by-step.
 parser.add_argument("--debug-dump", action="store_true",
                     help="Save per-step wrist image (RGB+mask composite) + a state/action JSONL "
@@ -98,7 +98,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
-# Sim-side mirror of bc.deploy_real constants. Must match exactly — the action
+# Sim-side mirror of deploy.deploy_real constants. Must match exactly — the action
 # decoding here only exists to log ``target_sim_rad`` for diffing; the env's
 # action manager still does the real decode internally.
 _JOINT_DEFAULTS_RAD = [0.0, 0.0, 0.0, 1.57, 0.0, 0.5]
@@ -108,7 +108,7 @@ _GRIPPER_CLOSE_RAD = 0.0
 
 
 def _force_bowl_xy(env, xy):
-    """Overwrite the active bowl_pose command for env 0 (matches bc/deploy_sim.py)."""
+    """Overwrite the active bowl_pose command for env 0 to pin a fixed eval xy."""
     cmd_mgr = env.unwrapped.command_manager
     if "bowl_pose" not in cmd_mgr._terms:
         raise RuntimeError("command term 'bowl_pose' not found")
@@ -119,7 +119,7 @@ def _force_bowl_xy(env, xy):
 
 
 def _decode_target(action6):
-    """Same arm/gripper decode as bc.deploy_real._decode_action — for log parity."""
+    """Same arm/gripper decode as deploy.deploy_real._decode_action — for log parity."""
     import numpy as np
     arm = [_JOINT_DEFAULTS_RAD[i] + _ARM_ACTION_SCALE * float(action6[i]) for i in range(5)]
     grip = _GRIPPER_OPEN_RAD if float(action6[5]) > 0.0 else _GRIPPER_CLOSE_RAD
@@ -129,7 +129,7 @@ def _decode_target(action6):
 def _run_debug_dump(env, policy, args_cli, ckpt_path, log_dir, dt):
     """Run a fixed-length episode, dumping wrist image + state/action per step.
 
-    Layout matches ``bc/deploy_real.py`` ``--debug-dump``:
+    Layout matches ``deploy/deploy_real.py`` ``--debug-dump``:
         <out>/step_XXXX.png   RGB|mask composite, 72×256
         <out>/log.jsonl       per-step: t, state, action, q_sim_rad, ee_xy, target_sim_rad,
                               plus critic-only ground truth (block_xy, is_grasped)
@@ -342,7 +342,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     timestep = 0
 
     # ------------------------------------------------------------------ debug dump
-    # Sim-side counterpart to bc/deploy_real.py --debug-dump. Same file layout
+    # Sim-side counterpart to deploy/deploy_real.py --debug-dump. Same file layout
     # (step_XXXX.png composite + log.jsonl + meta.json) so the two folders can
     # be diffed image-by-image / row-by-row to characterise the sim↔real gap.
     if args_cli.debug_dump:

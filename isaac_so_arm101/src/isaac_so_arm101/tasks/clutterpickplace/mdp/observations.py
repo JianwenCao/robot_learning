@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.sensors import FrameTransformer, TiledCamera
 from isaaclab.managers import SceneEntityCfg
@@ -211,6 +212,211 @@ def wrist_rgb_dr(
     if corrupt and rgb_noise_std > 0.0:
         rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
     return rgb
+
+
+# ---------------------------------------------------------------------------
+# Per-color semantic-seg → target-keyed instance mask + Florence-mimic DR
+# ---------------------------------------------------------------------------
+
+
+def _resolve_color_class_ids(cam: TiledCamera) -> torch.Tensor | None:
+    """Look up the per-color semantic class IDs and cache on ``cam``.
+
+    Returns ``(NUM_COLORS,)`` long tensor mapping palette idx → seg class
+    id, or ``None`` if the info dict isn't populated yet (first call
+    before the camera has rendered). Once resolved, the tensor is cached
+    as ``cam._cube_class_ids`` so subsequent calls are O(1).
+    """
+    cached = getattr(cam, "_cube_class_ids", None)
+    if cached is not None:
+        return cached
+    info = cam.data.info.get("semantic_segmentation", {}) or {}
+    id_map = info.get("idToLabels", {}) if isinstance(info, dict) else {}
+    if not id_map:
+        return None
+    # Build a name → id dict by parsing each label entry.
+    name_to_id: dict[str, int] = {}
+    for k, v in id_map.items():
+        try:
+            id_int = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(v, dict):
+            cls = v.get("class")
+            if isinstance(cls, str):
+                name_to_id[cls] = id_int
+    ids = []
+    for name in COLOR_NAMES:
+        cid = name_to_id.get(f"cube_{name}")
+        if cid is None:
+            # Info dict is partial — wait for next call.
+            return None
+        ids.append(cid)
+    tensor = torch.tensor(ids, dtype=torch.long, device=cam.data.output["rgb"].device)
+    cam._cube_class_ids = tensor
+    return tensor
+
+
+def _binary_mask_for_palette_idx(
+    seg: torch.Tensor, class_ids: torch.Tensor, palette_idx: torch.Tensor
+) -> torch.Tensor:
+    """Per-env binary mask for the palette idx in ``palette_idx``.
+
+    Args:
+        seg: ``(N, H, W)`` long seg-id image.
+        class_ids: ``(NUM_COLORS,)`` long, palette idx → seg class id.
+        palette_idx: ``(N,)`` long ∈ [0, NUM_COLORS).
+    Returns: ``(N, 1, H, W)`` float in {0, 1}.
+    """
+    per_env_id = class_ids[palette_idx].view(-1, 1, 1)  # (N, 1, 1)
+    return (seg == per_env_id).float().unsqueeze(1)
+
+
+def _morph_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    """Erode (radius < 0) or dilate (radius > 0) a (N, 1, H, W) binary mask.
+
+    Uses max-pool: dilate = max-pool, erode = -max-pool(-mask). Radius 0
+    is identity. Kernel size = 2|r|+1, stride=1, padding=|r|.
+    """
+    if radius == 0:
+        return mask
+    k = 2 * abs(radius) + 1
+    pad = abs(radius)
+    if radius > 0:
+        return F.max_pool2d(mask, kernel_size=k, stride=1, padding=pad)
+    return 1.0 - F.max_pool2d(1.0 - mask, kernel_size=k, stride=1, padding=pad)
+
+
+def wrist_rgb_mask_dr(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    corrupt: bool = True,
+    rgb_brightness_jitter: float = 0.15,
+    rgb_noise_std: float = 5.0 / 255.0,
+    hue_microjitter_deg: float = 3.0,
+    mask_dropout_prob: float = 0.10,
+    mask_wrong_swap_prob: float = 0.03,
+    mask_morph_max_radius: int = 2,
+    mask_min_pixel_area: int = 8,
+) -> torch.Tensor:
+    """4-channel wrist obs: ``[R, G, B, target_mask]``.
+
+    Channels 0–2 are RGB with the same DR pipeline as :func:`wrist_rgb_dr`
+    (per-episode tint + HSV jitter, per-step brightness/hue/noise). Channel
+    3 is a binary instance mask of the **target cube only**, filtered from
+    the TiledCamera's ``semantic_segmentation`` output via per-color class
+    IDs (each :class:`CuboidCfg` is tagged ``class:cube_<color>`` in
+    :mod:`joint_pos_env_cfg`).
+
+    The mask channel is corrupted to **mimic Florence-2's failure modes
+    at deploy** (gated by ``corrupt`` — Play cfgs disable):
+
+    * **Mask-area dropout** (``mask_min_pixel_area``): if the GT mask has
+      fewer pixels than this threshold, zero it out. Models Florence-2's
+      "cube too small in frame → no detection" behaviour the user
+      observed at the wrist-cam working distance.
+    * **Morphological jitter** (``mask_morph_max_radius``): per-env
+      erode-or-dilate by a radius uniformly sampled in
+      ``[-R, R]``. Models edge-pixel noise in the detector output.
+    * **Full-frame dropout** (``mask_dropout_prob``): per-env Bernoulli
+      probability the mask is entirely zeroed for this step. Models
+      Florence-2's occasional total miss under bad lighting.
+    * **Wrong-color swap** (``mask_wrong_swap_prob``): per-env Bernoulli
+      probability the mask is the *distractor* cube's mask instead of the
+      target's. This is the load-bearing term for sim2real robustness on
+      multi-cube scenes — a single Florence misfire that masks the wrong
+      colour is otherwise a catastrophic single-step failure.
+
+    Notes:
+      * The per-color class IDs aren't known until the first render
+        populates the info dict; until then the mask channel is zeros
+        (one transient frame at startup; identical pattern to Eval-1).
+      * ``corrupt=False`` (the Play cfg path) returns the GT target mask
+        with no DR — useful for eyeballing the channel in a viewer.
+    """
+    cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
+    out = cam.data.output
+
+    # ---- RGB (verbatim from wrist_rgb_dr) ----------------------------------
+    rgb = _normalize_rgb(out["rgb"])  # (N, 3, H, W) in [0, 1]
+    n, _, h, w = rgb.shape
+
+    dr = getattr(env, "_wrist_image_dr", None)
+    if dr is not None:
+        scale = dr[:, :3].view(-1, 3, 1, 1)
+        bright = dr[:, 3].view(-1, 1, 1, 1)
+        rgb = (rgb * scale + bright).clamp_(0.0, 1.0)
+    hsv_dr = getattr(env, "_wrist_hsv_dr", None)
+    if hsv_dr is not None:
+        rgb = apply_color_jitter(rgb, hsv_dr[:, 0], hsv_dr[:, 1], hsv_dr[:, 2])
+    if corrupt and rgb_brightness_jitter > 0.0:
+        bscale = 1.0 + (torch.rand(n, 1, 1, 1, device=rgb.device) * 2 - 1) * rgb_brightness_jitter
+        rgb = (rgb * bscale).clamp_(0.0, 1.0)
+    if corrupt and hue_microjitter_deg > 0.0:
+        import math as _math
+        micro = (torch.rand(n, device=rgb.device) * 2 - 1) * hue_microjitter_deg * (_math.pi / 180.0)
+        rgb = apply_color_jitter(
+            rgb, micro,
+            torch.ones(n, device=rgb.device),
+            torch.ones(n, device=rgb.device),
+        )
+    if corrupt and rgb_noise_std > 0.0:
+        rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
+
+    # ---- Target instance mask ---------------------------------------------
+    class_ids = _resolve_color_class_ids(cam)
+    if class_ids is None:
+        # First-frame transient — info dict not populated yet.
+        mask = torch.zeros((n, 1, h, w), device=rgb.device, dtype=rgb.dtype)
+        return torch.cat([rgb, mask], dim=1)
+
+    seg = out["semantic_segmentation"]
+    if seg.dim() == 4 and seg.shape[-1] == 1:
+        seg = seg.squeeze(-1)
+    seg = seg.long()
+
+    target_palette = env._target_cube_idx
+    mask = _binary_mask_for_palette_idx(seg, class_ids, target_palette)  # (N, 1, H, W)
+
+    if corrupt:
+        # 1) Wrong-color swap — replace target mask with the distractor's.
+        if mask_wrong_swap_prob > 0.0:
+            cmd = env.command_manager.get_term("target_color")
+            distractor_palette = cmd.active_indices.gather(
+                1, (1 - cmd.target_idx_in_pair).view(-1, 1)
+            ).squeeze(1)
+            distractor_mask = _binary_mask_for_palette_idx(seg, class_ids, distractor_palette)
+            swap = (torch.rand(n, device=rgb.device) < mask_wrong_swap_prob).view(-1, 1, 1, 1)
+            mask = torch.where(swap, distractor_mask, mask)
+
+        # 2) Morphological jitter — per-env erode or dilate by [-R, R].
+        if mask_morph_max_radius > 0:
+            radii = torch.randint(
+                -mask_morph_max_radius, mask_morph_max_radius + 1,
+                (n,), device=rgb.device,
+            )
+            # Apply per radius value (small radius set, so loop is cheap).
+            for r in torch.unique(radii).tolist():
+                r_int = int(r)
+                if r_int == 0:
+                    continue
+                sel = (radii == r_int)
+                if not sel.any():
+                    continue
+                mask[sel] = _morph_mask(mask[sel], r_int)
+
+        # 3) Small-area dropout — model "cube too small for Florence."
+        if mask_min_pixel_area > 0:
+            area = mask.sum(dim=(1, 2, 3))  # (N,)
+            small = (area < float(mask_min_pixel_area)).view(-1, 1, 1, 1)
+            mask = torch.where(small, torch.zeros_like(mask), mask)
+
+        # 4) Full-frame dropout — model occasional total miss.
+        if mask_dropout_prob > 0.0:
+            drop = (torch.rand(n, device=rgb.device) < mask_dropout_prob).view(-1, 1, 1, 1)
+            mask = torch.where(drop, torch.zeros_like(mask), mask)
+
+    return torch.cat([rgb, mask.to(rgb.dtype)], dim=1)
 
 
 def target_is_grasped(

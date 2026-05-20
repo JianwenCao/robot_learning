@@ -2,14 +2,14 @@
 
 This is the Eval-1 PPO real-robot loop. The checkpoint is the asymmetric
 vision actor-critic from training; the actor side is reimplemented locally
-in :mod:`bc.ppo_actor` so this PC does not need ``rsl_rl`` / ``isaaclab``
+in :mod:`deploy.ppo_actor` so this PC does not need ``rsl_rl`` / ``isaaclab``
 installed.
 
 Usage::
 
-    python -m bc.deploy_real --bowl-xy 0.20,-0.05
+    python -m deploy.deploy_real --bowl-xy 0.20,-0.05
     # validate everything except the arm + camera:
-    python -m bc.deploy_real --bowl-xy 0.20,-0.05 --dry-run
+    python -m deploy.deploy_real --bowl-xy 0.20,-0.05 --dry-run
 
 Observation pipeline (must match what training saw):
 
@@ -21,14 +21,20 @@ Observation pipeline (must match what training saw):
 * image (4, 72, 128) — RGB + binary block mask in ``[0, 1]``.
     * RGB from the wrist USB cam, undistorted with ``camera_intrinsics.yaml``,
       resized to 128×72.
-    * Mask via HSV ``cv2.inRange``. For Task 1 the target cube can be any
-      color (red / orange / yellow / green / blue / purple), so the default
-      bound is a **saturation gate** (H ∈ [0, 180], S ≥ ~90) that fires on
-      any colored object and rejects the near-white table. The largest
-      connected component is then kept, mimicking the single-block semantic
-      mask the sim policy was trained with and dropping distractors like
-      cables or a tool handle in the corner. Override per-scene with
-      ``--hsv-low`` / ``--hsv-high`` if lighting shifts a lot.
+    * Mask source is selectable via ``--mask-source``:
+        * ``florence`` (default): Florence-2 referring-expression
+          segmentation with a fixed text prompt (Eval-1 is single-cube;
+          color-aware prompts are an Eval-2/3 concern). Polygons are
+          rasterized + largest-CC-picked to a binary mask. Robust to
+          clutter / lighting / shadows but ~2–5 s/frame on CPU.
+        * ``hsv``: ``cv2.inRange`` saturation gate (H ∈ [0, 180],
+          S ≥ ~90) + largest-CC pick. Fast (~ms), but fails when an in-FOV
+          distractor is more saturated than the cube — the largest-CC pick
+          latches onto the wrong blob. Tune with ``--hsv-low`` /
+          ``--hsv-high`` per scene. Kept for sim↔real A/B tests on clean
+          scenes only.
+      See :mod:`deploy.cube_detector` for the ``Detector`` interface and
+      the drop-in slot for swapping in GroundedSAM / SAM-3 later.
 
 Action pipeline (must match training):
 
@@ -89,12 +95,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from bc.config import PROJECT_ROOT
-from bc.ppo_actor import PPOActor
+from deploy.cube_detector import Detector, build_detector
+from deploy.ppo_actor import PPOActor
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ====================================================================== config
 CKPT_CANDIDATES = [
-    PROJECT_ROOT / "bc" / "runs" / "deploy" / "model.pt",
+    PROJECT_ROOT / "deploy" / "runs" / "model.pt",
 ]
 URDF_PATH      = PROJECT_ROOT / "isaac_so_arm101" / "src" / "isaac_so_arm101" / "robots" / "trs_so101" / "urdf" / "so_arm101.urdf"
 INTRINSICS_YAML = PROJECT_ROOT / "camera_intrinsics.yaml"
@@ -430,7 +438,7 @@ def _open_debug_dir(args, bowl_xy: np.ndarray, ckpt_path: Path) -> Path | None:
         return None
     import json
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    out = PROJECT_ROOT / "bc" / "runs" / "deploy" / "debug" / stamp
+    out = PROJECT_ROOT / "deploy" / "runs" / "debug" / stamp
     out.mkdir(parents=True, exist_ok=True)
     meta = {
         "ckpt": str(ckpt_path),
@@ -476,14 +484,34 @@ def _debug_dump_step(out: Path, t: int, image: np.ndarray, state: np.ndarray,
         f.write(json.dumps(row) + "\n")
 
 
-def _build_image(rgb_hwc, K, dist, hsv_low, hsv_high) -> np.ndarray:
+def _build_image(rgb_hwc, K, dist, hsv_low, hsv_high,
+                 detector: Detector | None = None) -> np.ndarray:
+    """Compose the 4-channel wrist tensor the policy expects.
+
+    The RGB half is always undistorted full-res → resize to (IMG_W, IMG_H).
+    The mask half comes from one of two paths:
+
+    * ``detector is None`` (default) — built-in HSV gate on the *downsized*
+      RGB, same code path as before.
+    * ``detector is not None`` — model runs on the *full-res* undistorted
+      RGB (small cubes are easier to localize at native resolution), and
+      the resulting binary mask is nearest-neighbour resized to the policy
+      grid. Stays binary, no anti-aliased grey edges.
+    """
     import cv2
     if K is not None and dist is not None:
         rgb_hwc = cv2.undistort(rgb_hwc, K, dist)
+
+    if detector is not None:
+        mask_full = detector.mask(rgb_hwc)                           # (H_full, W_full) in [0, 1]
+        mask = cv2.resize(mask_full, (IMG_W, IMG_H),
+                          interpolation=cv2.INTER_NEAREST).astype(np.float32)
+
     rgb_hwc = cv2.resize(rgb_hwc, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
     rgb_chw = rgb_hwc.transpose(2, 0, 1).astype(np.float32) / 255.0  # (3, H, W)
 
-    mask = _hsv_mask(rgb_hwc, hsv_low, hsv_high)                     # (H, W)
+    if detector is None:
+        mask = _hsv_mask(rgb_hwc, hsv_low, hsv_high)                 # (H, W)
 
     return np.concatenate(
         [rgb_chw, mask[None]], axis=0
@@ -496,7 +524,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
         raise FileNotFoundError(
             "PPO checkpoint not found. Looked at:\n  "
             + "\n  ".join(str(p) for p in CKPT_CANDIDATES)
-            + "\nFetch the Drive zip per bc/readme.md."
+            + "\nFetch the Drive zip per deploy/README.md."
         )
     policy = PPOActor.from_checkpoint(ckpt_path, map_location=DEVICE).to(DEVICE)
     print(f"[ppo] loaded {ckpt_path}")
@@ -505,6 +533,15 @@ def run(bowl_xy: np.ndarray, args) -> None:
     K_mat, dist = _load_intrinsics()
     if K_mat is None:
         warnings.warn("camera_intrinsics.yaml missing — skipping undistort.")
+
+    # Mask source. ``hsv`` keeps the original code path; anything else loads
+    # a model via deploy.cube_detector.build_detector and routes the mask
+    # channel through ``Detector.mask(rgb)``. Model load happens *once* here,
+    # not per-step.
+    # Eval-1 is single-cube, so the prompt is fixed in code. Color-aware
+    # prompts ("red cube", "blue cube", ...) are an Eval-2/3 concern where
+    # the task carries a target color.
+    detector = build_detector(args.mask_source, prompt="small wooden cube")
 
     if args.dry_run:
         print("[ppo] --dry-run: skipping hardware, doing a single forward with synthetic inputs.")
@@ -516,6 +553,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
         image = _build_image(
             synth_rgb, K_mat, dist,
             tuple(args.hsv_low), tuple(args.hsv_high),
+            detector=detector,
         )
         with torch.no_grad():
             a = policy(
@@ -562,6 +600,7 @@ def run(bowl_xy: np.ndarray, args) -> None:
             image = _build_image(
                 rgb, K_mat, dist,
                 tuple(args.hsv_low), tuple(args.hsv_high),
+                detector=detector,
             )
 
             with torch.no_grad():
@@ -611,14 +650,24 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="Skip hardware; load model + run one forward with synthetic obs.")
     p.add_argument("--hsv-low",  type=_parse_hsv, default=HSV_LOW_DEFAULT,
-                   help=f"HSV lower bound for block mask, default {HSV_LOW_DEFAULT}")
+                   help=f"HSV lower bound for block mask, default {HSV_LOW_DEFAULT}. "
+                        "Ignored when --mask-source is not 'hsv'.")
     p.add_argument("--hsv-high", type=_parse_hsv, default=HSV_HIGH_DEFAULT,
-                   help=f"HSV upper bound for block mask, default {HSV_HIGH_DEFAULT}")
+                   help=f"HSV upper bound for block mask, default {HSV_HIGH_DEFAULT}. "
+                        "Ignored when --mask-source is not 'hsv'.")
+    p.add_argument("--mask-source", choices=["hsv", "florence"], default="florence",
+                   help="Source of the wrist-image mask channel. 'florence' "
+                        "(default) uses Florence-2 referring-expression "
+                        "segmentation (~2-5 s/frame on CPU, robust to clutter / "
+                        "lighting / shadows); the prompt is fixed in code since "
+                        "Eval-1 is single-cube. 'hsv' uses the built-in HSV gate "
+                        "(~50 Hz, no model load) for sim↔real A/B tests on clean "
+                        "scenes only.")
     p.add_argument("--no-confirm", action="store_true",
                    help="Skip the pre-rollout <enter> prompt and start immediately.")
     p.add_argument("--debug-dump", action="store_true",
                    help="Save the wrist image (rgb+mask) and a state/action JSONL "
-                        "per step under bc/runs/deploy/debug/<timestamp>/, so the "
+                        "per step under deploy/runs/debug/<timestamp>/, so the "
                         "real rollout can be diffed against a sim play render.")
     args = p.parse_args()
 

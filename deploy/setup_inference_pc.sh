@@ -20,7 +20,7 @@
 # https://pytorch.org/get-started/previous-versions/.
 #
 # Usage:
-#   bash bc/setup_inference_pc.sh
+#   bash deploy/setup_inference_pc.sh
 
 set -euo pipefail
 
@@ -43,7 +43,7 @@ Install miniconda3 first (one-time, ~5 min):
   conda init bash
   exec bash    # restart the shell
 
-Then re-run: bash bc/setup_inference_pc.sh
+Then re-run: bash deploy/setup_inference_pc.sh
 EOF
   exit 1
 fi
@@ -101,6 +101,17 @@ else
   pip install --quiet --upgrade 'transformers<5'
 fi
 
+# 6. Off-the-shelf cube segmenter deps (only needed for --mask-source florence).
+#    Florence-2 ships custom modeling code that imports einops + timm; Pillow
+#    is needed to feed PIL.Image into the AutoProcessor. accelerate is used
+#    by transformers' device_map machinery and silences a runtime warning.
+#    We install eagerly so first-run of --mask-source florence isn't held up
+#    by a 1-minute pip resolve on the inference PC.
+python -c "import timm"       2>/dev/null || pip install --quiet timm
+python -c "import einops"     2>/dev/null || pip install --quiet einops
+python -c "import accelerate" 2>/dev/null || pip install --quiet accelerate
+python -c "import PIL"        2>/dev/null || pip install --quiet Pillow
+
 # ============================================================ verify ===
 echo
 echo "[verify] importing the modules real-robot PPO inference needs ..."
@@ -108,7 +119,8 @@ python - <<'PY'
 import importlib, sys
 mods = [
     "torch", "torchvision", "numpy", "cv2", "yaml", "kinpy",
-    "bc.config", "bc.ppo_actor", "bc.deploy_real",
+    "PIL", "transformers", "timm", "einops",
+    "deploy.ppo_actor", "deploy.deploy_real", "deploy.cube_detector",
 ]
 fails = []
 for m in mods:
@@ -127,7 +139,7 @@ PY
 
 # ============================================================ artifacts ===
 echo
-CKPT="bc/runs/deploy/model.pt"
+CKPT="deploy/runs/model.pt"
 
 if [[ -f "$CKPT" ]]; then
   echo "[verify] PPO checkpoint present at $CKPT."
@@ -136,7 +148,7 @@ else
 [verify] WARNING: PPO checkpoint missing at:
    $CKPT
 
-Drop a trained vision-PPO checkpoint there (see bc/readme.md step 3).
+Drop a trained vision-PPO checkpoint there (see deploy/README.md step 3).
 EOF
 fi
 
@@ -149,6 +161,6 @@ fi
 echo
 echo "[setup] DONE."
 echo "Validate the pipeline without hardware:"
-echo "   python -m bc.deploy_real --bowl-xy 0.20,-0.05 --dry-run"
+echo "   python -m deploy.deploy_real --bowl-xy 0.20,-0.05 --dry-run"
 echo "Then run on real hardware:"
-echo "   python -m bc.deploy_real --bowl-xy 0.20,-0.05"
+echo "   python -m deploy.deploy_real --bowl-xy 0.20,-0.05"
