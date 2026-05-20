@@ -101,7 +101,7 @@ else
   pip install --quiet --upgrade 'transformers<5'
 fi
 
-# 6. Off-the-shelf cube segmenter deps (only needed for --mask-source florence).
+# 6. Off-the-shelf cube segmenter deps (florence is the default --mask-source).
 #    Florence-2 ships custom modeling code that imports einops + timm; Pillow
 #    is needed to feed PIL.Image into the AutoProcessor. accelerate is used
 #    by transformers' device_map machinery and silences a runtime warning.
@@ -112,6 +112,27 @@ python -c "import einops"     2>/dev/null || pip install --quiet einops
 python -c "import accelerate" 2>/dev/null || pip install --quiet accelerate
 python -c "import PIL"        2>/dev/null || pip install --quiet Pillow
 
+# 6b. Pre-download Florence-2 weights (~1 GB) into the HF cache so the first
+#     real-robot run isn't blocked on a model download. Florence is the
+#     default --mask-source for both deploy_real and deploy_real_clutter.
+FLORENCE_ID="microsoft/Florence-2-base"
+if python - <<PY 2>/dev/null
+from huggingface_hub import snapshot_download
+from pathlib import Path
+p = Path(snapshot_download("$FLORENCE_ID", local_files_only=True))
+# Sanity-check that weights (not just the config) are present.
+assert any(p.glob("*.safetensors")) or any(p.glob("pytorch_model*.bin")), "weights missing"
+PY
+then
+  echo "[setup] Florence-2 weights already cached — skipping download."
+else
+  echo "[setup] downloading Florence-2 weights ($FLORENCE_ID, ~1 GB) ..."
+  python - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download("$FLORENCE_ID")
+PY
+fi
+
 # ============================================================ verify ===
 echo
 echo "[verify] importing the modules real-robot PPO inference needs ..."
@@ -119,7 +140,7 @@ python - <<'PY'
 import importlib, sys
 mods = [
     "torch", "torchvision", "numpy", "cv2", "yaml", "kinpy",
-    "PIL", "transformers", "timm", "einops",
+    "PIL", "transformers", "timm", "einops", "accelerate",
     "deploy.ppo_actor", "deploy.deploy_real", "deploy.cube_detector",
 ]
 fails = []
@@ -134,6 +155,20 @@ for m in mods:
 import torch
 print(f"  torch                     = {torch.__version__}")
 print(f"  torch.cuda.is_available() = {torch.cuda.is_available()}  (CPU is fine for this model)")
+
+# Florence-2 load smoke-test: catches bad cache / trust_remote_code issues
+# now rather than at the start of the first real-robot run.
+try:
+    from transformers import AutoProcessor, AutoModelForCausalLM
+    AutoProcessor.from_pretrained("microsoft/Florence-2-base", trust_remote_code=True)
+    AutoModelForCausalLM.from_pretrained(
+        "microsoft/Florence-2-base", trust_remote_code=True, torch_dtype=torch.float32
+    )
+    print("  ok   microsoft/Florence-2-base (processor + weights load)")
+except Exception as e:
+    fails.append(("microsoft/Florence-2-base", e))
+    print(f"  FAIL microsoft/Florence-2-base: {e}")
+
 sys.exit(1 if fails else 0)
 PY
 
