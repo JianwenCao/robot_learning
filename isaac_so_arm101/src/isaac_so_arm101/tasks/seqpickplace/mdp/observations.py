@@ -177,6 +177,57 @@ def current_target_block_to_bowl_xy(
 # ---------------------------------------------------------------------------
 
 
+def target_cube_pos_xy_noisy(
+    env: "ManagerBasedRLEnv",
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+) -> torch.Tensor:
+    """``(N, 2)`` noisy xy of the *current sub-goal* target cube only.
+
+    Mirrors :func:`clutterpickplace.mdp.observations.target_cube_pos_xy_noisy`
+    except the target palette idx is read via :func:`_current_target_palette_idx`,
+    so the slot tracked here re-keys automatically when the env advances
+    ``_seq_step_idx`` on sub-goal release. Deploy reproduces this by calling
+    ``AprilTagDetector.set_target_id(new_id)`` between sub-goals.
+    """
+    target = _current_target_palette_idx(env)
+    pos, _ = _compute_apriltag_obs(
+        env, target,
+        sigma_m=sigma_m, dropout_p=dropout_p, swap_prob=swap_prob, corrupt=corrupt,
+    )
+    idx = target.view(-1, 1, 1).expand(-1, 1, 2)
+    return pos.gather(1, idx).squeeze(1)
+
+
+def bowl_xy(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """``(N, 2)`` — the single per-episode bowl xy in robot frame.
+
+    Eval-3 has ``N_BOWLS = 1``; the bowl is shared across all 3 sub-goals,
+    so this is constant within an episode (and equal to the bowl slot of
+    the ``seq_goal`` command — kept as a separate function for parity with
+    the Eval-2 / Eval-1 ``bowl_xy`` shape contract).
+    """
+    return env._seq_bowl_positions[:, 0, :]
+
+
+def ee_to_bowl_xy(
+    env: "ManagerBasedRLEnv",
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """``(N, 2)`` — vector from EE projected xy to bowl xy in robot frame.
+
+    Parity with Eval-1 / Eval-2's ``ee_to_bowl_xy``; bowl is the single
+    per-episode bowl (``_seq_bowl_positions[:, 0]``).
+    """
+    from isaac_so_arm101.tasks.pickplace.mdp.observations import ee_proj_xy as _ee_proj_xy
+    ee_xy = _ee_proj_xy(env, ee_frame_cfg=ee_frame_cfg, robot_cfg=robot_cfg)
+    bowl = env._seq_bowl_positions[:, 0, :]
+    return bowl - ee_xy
+
+
 def cube_positions_xy_noisy(
     env: "ManagerBasedRLEnv",
     sigma_m: float = 0.002,

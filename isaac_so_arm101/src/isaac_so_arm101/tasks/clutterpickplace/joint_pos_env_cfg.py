@@ -294,17 +294,21 @@ class SoArm101ClutterPickPlaceStateAprilTagEnvCfg(SoArm101ClutterPickPlaceTeache
     and:
 
     * Swaps in :class:`ClutterStateAprilTagObservationsCfg` so ``PolicyCfg``
-      gains ``cube_positions_xy_noisy`` ``(N, 12)`` and ``cube_visible_flags``
-      ``(N, 6)``. Goal group (``target_color`` one-hot) is inherited.
+      gains ``target_cube_pos_xy_noisy`` ``(N, 2)`` — single-target xy
+      mirroring the deploy AprilTag stream (one tag at a time, re-keyed
+      via ``AprilTagDetector.set_target_id``). The goal group
+      (``target_color`` one-hot) stays in the obs cfg for the critic's
+      benefit but is dropped from the actor's stream via ``obs_groups``.
     * Adds ``reset_cube_positions_bias`` event listed **after**
       ``place_clutter_blocks`` so ``_cube_pos_last`` is seeded against
       the freshly-placed cube positions.
 
-    See ``docs/STATE_APRILTAG_PLAN.md`` for the deploy-side mirror. The
+    See ``docs/EVAL2_PLAN.md`` for the deploy-side mirror. The
     accompanying runner cfg uses
-    ``obs_groups = {"policy": ["policy", "goal"], "critic": ["policy", "goal", "critic"]}``
-    — actor consumes deployable obs only; critic sees privileged GT cube
-    positions for stable value estimation.
+    ``obs_groups = {"policy": ["policy"], "critic": ["policy", "goal", "critic"]}``
+    — actor sees only the 27-D color-blind policy stream; critic gets
+    the goal one-hot + privileged GT cube positions for stable value
+    estimation.
     """
 
     observations: ClutterStateAprilTagObservationsCfg = ClutterStateAprilTagObservationsCfg()
@@ -332,5 +336,4 @@ class SoArm101ClutterPickPlaceStateAprilTagEnvCfg_PLAY(SoArm101ClutterPickPlaceS
         self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
         self.scene.env_spacing = _multicube_sim.ENV_SPACING
         self.observations.policy.enable_corruption = False
-        self.observations.policy.cube_positions_xy_noisy.params = {"corrupt": False}
-        self.observations.policy.cube_visible_flags.params = {"corrupt": False}
+        self.observations.policy.target_cube_pos_xy_noisy.params = {"corrupt": False}

@@ -43,6 +43,7 @@ from .events import (  # noqa: F401
 )
 from .observations import (  # noqa: F401
     all_active_block_positions,
+    bowl_xy,
     cube_positions_xy_noisy,
     cube_visible_flags,
     current_step_onehot,
@@ -51,7 +52,9 @@ from .observations import (  # noqa: F401
     current_target_bowl_xy,
     current_target_color_onehot,
     current_target_gripper_to_block,
+    ee_to_bowl_xy,
     seq_goal_vector,
+    target_cube_pos_xy_noisy,
     wrist_rgb_dr,
     wrist_rgb_mask_dr,
 )

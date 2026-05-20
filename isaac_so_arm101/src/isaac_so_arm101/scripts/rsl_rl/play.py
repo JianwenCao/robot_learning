@@ -53,6 +53,19 @@ parser.add_argument("--diag-rollouts", type=int, default=0,
                     help="Run N episodes with detailed behaviour logging. 0 = disabled (default).")
 parser.add_argument("--diag-out", type=str, default=None,
                     help="Output directory for diagnosis. Default: <ckpt_dir>/diag/<timestamp>/")
+# Cross-task actor reuse: load actor.* weights from --checkpoint with strict=False,
+# leaving critic + normalizer fresh-init. Used to deploy an Eval-1 checkpoint on
+# Eval-2/3 envs where the policy obs (27-D) matches but the critic obs differs.
+parser.add_argument("--actor-only", action="store_true",
+                    help="Load only actor.* keys from --checkpoint (strict=False). For cross-task "
+                         "actor reuse when policy obs matches but critic obs differs.")
+# Headless success-rate eval — run N full episodes, count terminal successes via
+# env._target_task_success_latch (Eval-2/3) or env._was_grasped/_was_over_bowl
+# (Eval-1). Prints aggregate SR + per-stage rates. Forces a fixed env reset cadence.
+parser.add_argument("--n-episodes", type=int, default=0,
+                    help="Run N full episodes per env and print aggregate success metrics. "
+                         "0 = disabled (interactive play loop). Compatible with --num_envs > 1 "
+                         "for parallel eval (e.g., --num_envs 16 --n-episodes 4 = 64 episodes).")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -254,6 +267,95 @@ def _run_debug_dump(env, policy, args_cli, ckpt_path, log_dir, dt):
             obs = next_obs
 
     print(f"[play] debug dump written to {out}")
+
+
+def _run_n_episodes(env, policy, args_cli, ckpt_path):
+    """Run ``n_episodes`` per env and print aggregate success metrics.
+
+    Samples the per-episode latches *just before* an env resets (when ``dones``
+    fires), then accumulates counts across all envs and all episodes. The
+    target-* latch names are tried first (Eval-2/3); falls back to the
+    Eval-1 single-cube names if those aren't present on the env.
+
+    No per-step logs — just the aggregate. For per-step traces use ``--diag-rollouts``.
+    """
+    import numpy as np
+
+    base = env.unwrapped
+    n_envs = int(base.num_envs)
+    target_n = int(args_cli.n_episodes) * n_envs
+
+    # Probe which latch names this env exposes.
+    has_target = hasattr(base, "_target_task_success_latch")
+    if has_target:
+        latch_lift = "_target_was_grasped"
+        latch_bowl = "_target_was_over_bowl_above_rim"
+        latch_succ = "_target_task_success_latch"
+        latch_succ_strict = "_target_task_success_latch_strict"
+    else:
+        latch_lift = "_was_grasped"
+        latch_bowl = "_was_over_bowl_above_rim"
+        latch_succ = None  # Eval-1 has no terminal success latch; falls back to (lift ∧ bowl)
+        latch_succ_strict = None
+
+    counts = {"episodes": 0, "lift": 0, "bowl": 0, "succ": 0, "succ_strict": 0}
+    print(f"[n-episodes] target {target_n} eps ({args_cli.n_episodes}/env × {n_envs} envs) "
+          f"on {args_cli.task}")
+    print(f"[n-episodes] ckpt: {ckpt_path}")
+    print(f"[n-episodes] latches: lift={latch_lift}, bowl={latch_bowl}, "
+          f"succ={latch_succ or '(lift∧bowl fallback)'}")
+
+    obs = env.get_observations()
+    step = 0
+    while counts["episodes"] < target_n:
+        with torch.inference_mode():
+            actions = policy(obs)
+            next_obs, _rewards, dones, _extras = env.step(actions)
+
+        dones_np = dones.detach().cpu().numpy().astype(bool) if hasattr(dones, "detach") else np.asarray(dones, bool)
+        if dones_np.any():
+            done_idx = np.where(dones_np)[0]
+            lift = getattr(base, latch_lift, None)
+            bowl = getattr(base, latch_bowl, None)
+            succ = getattr(base, latch_succ, None) if latch_succ else None
+            succ_s = getattr(base, latch_succ_strict, None) if latch_succ_strict else None
+
+            for i in done_idx:
+                counts["episodes"] += 1
+                if lift is not None and bool(lift[i].item()):
+                    counts["lift"] += 1
+                if bowl is not None and bool(bowl[i].item()):
+                    counts["bowl"] += 1
+                if succ is not None:
+                    if bool(succ[i].item()):
+                        counts["succ"] += 1
+                else:
+                    # Eval-1 fallback: success = lift_latch ∧ bowl_latch
+                    if lift is not None and bowl is not None \
+                       and bool(lift[i].item()) and bool(bowl[i].item()):
+                        counts["succ"] += 1
+                if succ_s is not None and bool(succ_s[i].item()):
+                    counts["succ_strict"] += 1
+
+            if counts["episodes"] % max(1, n_envs) == 0 or counts["episodes"] >= target_n:
+                n = counts["episodes"]
+                print(f"  [{n:4d}/{target_n}]  "
+                      f"lift={counts['lift']/n:.3f}  "
+                      f"bowl={counts['bowl']/n:.3f}  "
+                      f"succ={counts['succ']/n:.3f}"
+                      + (f"  succ_strict={counts['succ_strict']/n:.3f}" if latch_succ_strict else ""))
+        obs = next_obs
+        step += 1
+
+    n = max(counts["episodes"], 1)
+    print()
+    print(f"=== Aggregate ({n} episodes, {step} steps, {args_cli.task}) ===")
+    print(f"  ckpt:        {ckpt_path}")
+    print(f"  lift_rate:   {counts['lift']}/{n} = {counts['lift']/n:.3f}")
+    print(f"  bowl_rate:   {counts['bowl']}/{n} = {counts['bowl']/n:.3f}")
+    print(f"  succ_rate:   {counts['succ']}/{n} = {counts['succ']/n:.3f}")
+    if latch_succ_strict:
+        print(f"  succ_strict: {counts['succ_strict']}/{n} = {counts['succ_strict']/n:.3f}")
 
 
 def _run_diag(env, policy, args_cli, ckpt_path, log_dir, dt):
@@ -640,7 +742,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    if args_cli.actor_only:
+        import torch.nn as _nn
+        sd = torch.load(resume_path, weights_only=False, map_location="cpu")["model_state_dict"]
+        actor_keys = {k: v for k, v in sd.items() if k.startswith("actor") or k == "std"}
+        # ``PickPlaceVisionActorCritic.load_state_dict`` is overridden to handle
+        # distill warm-start and returns a bool. We bypass that path here —
+        # we just want plain nn.Module key-matched loading.
+        result = _nn.Module.load_state_dict(runner.alg.policy, actor_keys, strict=False)
+        missing, unexpected = result.missing_keys, result.unexpected_keys
+        n_critic_missing = sum(1 for k in missing if k.startswith("critic"))
+        print(f"[INFO]: --actor-only load from {resume_path}")
+        print(f"        loaded {len(actor_keys)} keys ({sum(1 for k in actor_keys if k.startswith('actor'))} actor.*"
+              f", std={'std' in actor_keys})")
+        print(f"        skipped {n_critic_missing} critic.* (fresh-init), "
+              f"{len(missing) - n_critic_missing} other missing, {len(unexpected)} unexpected")
+    else:
+        runner.load(resume_path)
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -688,6 +806,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # "spike latches then drop". See _run_diag.
     if args_cli.diag_rollouts > 0:
         _run_diag(env, policy, args_cli, resume_path, log_dir, dt)
+        env.close()
+        return 0
+
+    # --------------------------------------------------------------- n-episodes
+    # Headless success-rate eval. Runs N episodes per env in parallel, samples
+    # the env's per-episode success latches at done, and prints aggregate rates.
+    # Works for both Eval-1 (_was_grasped / _was_over_bowl_above_rim) and
+    # Eval-2/3 (_target_was_grasped / _target_was_over_bowl_above_rim /
+    # _target_task_success_latch) by probing which attributes exist.
+    if args_cli.n_episodes > 0:
+        _run_n_episodes(env, policy, args_cli, resume_path)
         env.close()
         return 0
 

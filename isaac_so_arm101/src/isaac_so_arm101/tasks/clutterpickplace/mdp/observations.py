@@ -626,6 +626,32 @@ def _compute_apriltag_obs(
     return pub_xy, visible_f
 
 
+def target_cube_pos_xy_noisy(
+    env: "ManagerBasedRLEnv",
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    swap_prob: float = 0.01,
+    corrupt: bool = True,
+) -> torch.Tensor:
+    """``(N, 2)`` noisy xy of the *target* cube only — AprilTag surrogate.
+
+    Deploy path: ``pupil-apriltags`` is keyed to the single target tag via
+    ``AprilTagDetector.set_target_id``; this obs mirrors that one-tag-only
+    stream. Reads the full ``_compute_apriltag_obs`` output (so the
+    post-grasp freeze logic, hand-eye bias, mount offset, and per-cube
+    dropout still run identically to the previous all-cube term) and
+    gathers the target slot. The freeze still re-keys on the target
+    palette idx, which is exactly what the deploy side will do via
+    ``set_target_id`` per sub-goal.
+    """
+    pos, _ = _compute_apriltag_obs(
+        env, env._target_cube_idx,
+        sigma_m=sigma_m, dropout_p=dropout_p, swap_prob=swap_prob, corrupt=corrupt,
+    )
+    idx = env._target_cube_idx.view(-1, 1, 1).expand(-1, 1, 2)
+    return pos.gather(1, idx).squeeze(1)
+
+
 def cube_positions_xy_noisy(
     env: "ManagerBasedRLEnv",
     sigma_m: float = 0.002,

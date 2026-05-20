@@ -59,6 +59,7 @@ from .observations import (  # noqa: F401
     target_block_position,
     target_block_to_bowl_xy,
     target_color_onehot,
+    target_cube_pos_xy_noisy,
     target_gripper_to_block,
     target_is_grasped,
     wrist_rgb_dr,

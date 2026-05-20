@@ -49,7 +49,12 @@ from __future__ import annotations
 
 
 # Recommended num_envs — knobs the train script can override per run.
-DEFAULT_TRAIN_NUM_ENVS = 2048
+# Bumped 2048 → 4096 (2026-05-20) to match Eval-1's sample budget after
+# Eval-2 v2 stalled at ~770 iters with no consistent lift. At 2048 envs,
+# Eval-2's 6-cube physics used only ~4.5 GB / 32 GB VRAM; doubling to
+# 4096 lands at ~9 GB and halves wall-clock per env-step of training
+# signal. Matches what Eval-1's working state-AprilTag baseline used.
+DEFAULT_TRAIN_NUM_ENVS = 4096
 DEFAULT_PLAY_NUM_ENVS = 16
 
 # Shared physics step parameters — match Eval-1 so action dynamics

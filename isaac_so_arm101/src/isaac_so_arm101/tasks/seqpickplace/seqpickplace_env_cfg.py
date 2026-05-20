@@ -167,25 +167,47 @@ class ObservationsCfg:
 class SeqStateAprilTagObservationsCfg(ObservationsCfg):
     """Eval-3 obs variant for the state-only + AprilTag deploy path.
 
-    Adds two terms to ``PolicyCfg``:
+    Mirrors EVAL3_PLAN.md §3: the policy obs is **target-only**, identical
+    layout to :class:`ClutterStateAprilTagObservationsCfg.PolicyCfg`. Both
+    Eval-2 and Eval-3 deploy use the same one-tag-at-a-time AprilTag
+    stream; the only difference is that Eval-3's sub-goal advancement
+    re-keys the tag ID (via ``AprilTagDetector.set_target_id``) between
+    sub-goals. In sim that re-key is automatic: the env advances
+    ``_seq_step_idx`` on release and
+    :func:`mdp.target_cube_pos_xy_noisy` reads the current sub-goal
+    target palette idx via :func:`_current_target_palette_idx`, so the
+    post-grasp freeze and the published xy both retarget without any
+    additional plumbing.
 
-    * ``cube_positions_xy_noisy`` ``(N, NUM_COLORS*2=12)`` — per-cube noisy
-      xy in robot frame, mirroring the per-frame pupil-apriltags output
-      on the real arm. Re-keys the post-grasp freeze on every sub-goal
-      transition (current target palette idx read via
-      :func:`_current_target_palette_idx`).
-    * ``cube_visible_flags`` ``(N, NUM_COLORS=6)`` — 1 if the tag was
-      detected this step (cube active + on table + not dropped), else 0.
+    Crucially, ``seq_goal_vector`` (target color one-hot + bowl xy + step
+    one-hot) is **dropped** from the policy stream — the policy doesn't
+    need to know which colour or step is active, only where the current
+    target cube is and where the (single, shared) bowl is. The 11-D
+    ``seq_goal`` is still computed for the critic + reward functions; it
+    just doesn't reach the actor. This makes the Eval-3 actor *identical*
+    in shape and semantics to Eval-2's, so a trained checkpoint can in
+    principle initialise either run.
 
-    The seq_goal vector already exposes the current sub-goal target color
-    one-hot, current bowl xy, and step idx — those stay in the policy
-    obs group via the existing ``seq_goal`` term.
+    Episode structure (15 s rollout, env-internal sub-goal advancement)
+    is preserved from the base ``ObservationsCfg`` because it gives the
+    policy training-time exposure to 4-cube, 3-cube, and 2-cube states
+    naturally (one cube is removed per successful sub-goal).
     """
 
     @configclass
-    class PolicyCfg(ObservationsCfg.PolicyCfg):
-        cube_positions_xy_noisy = ObsTerm(func=mdp.cube_positions_xy_noisy)
-        cube_visible_flags = ObsTerm(func=mdp.cube_visible_flags)
+    class PolicyCfg(ObsGroup):
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        gripper_state = ObsTerm(func=mdp.gripper_state)
+        bowl_xy = ObsTerm(func=mdp.bowl_xy)
+        ee_proj_xy = ObsTerm(func=mdp.ee_proj_xy)
+        ee_to_bowl_xy = ObsTerm(func=mdp.ee_to_bowl_xy)
+        target_cube_pos_xy_noisy = ObsTerm(func=mdp.target_cube_pos_xy_noisy)
+        last_action = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
 

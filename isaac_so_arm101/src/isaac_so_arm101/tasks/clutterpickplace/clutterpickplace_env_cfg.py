@@ -273,29 +273,34 @@ class ObservationsCfg:
 
 @configclass
 class ClutterStateAprilTagObservationsCfg(ObservationsCfg):
-    """Obs variant for the state-only + AprilTag deploy path (Eval-2/3).
+    """Obs variant for the state-only + AprilTag deploy path (Eval-2).
 
-    Extends :class:`ObservationsCfg` by adding two terms to ``PolicyCfg``:
+    Mirrors EVAL2_PLAN.md §2: the policy obs is **target-only** — the
+    deploy script keys ``pupil-apriltags`` to a single tag ID via
+    ``AprilTagDetector.set_target_id``, so the sim obs is one 2-D slot
+    matching that one-tag stream (``target_cube_pos_xy_noisy``). The full
+    AprilTag noise pipeline still runs under the hood inside
+    :func:`mdp.target_cube_pos_xy_noisy` (shared hand-eye bias + per-cube
+    mount + per-step Gaussian + Bernoulli dropout + post-grasp freeze
+    keyed on the target palette idx); the policy just consumes the
+    target slot.
 
-    * ``cube_positions_xy_noisy`` ``(N, NUM_COLORS*2)`` — sim-side mirror
-      of the pupil-apriltags pose pipeline (noisy xy per palette cube,
-      shared hand-eye bias + per-cube mount + per-step Gaussian + dropout
-      + tag-ID swap + post-grasp target freeze; inactive/parked cubes
-      publish zeros).
-    * ``cube_visible_flags`` ``(N, NUM_COLORS)`` — 1 if the tag was
-      detected this step, 0 if dropped / off-table / inactive.
+    The previous variant exposed all-cubes (``cube_positions_xy_noisy``,
+    12-D) + per-cube visibility flags (6-D) without any explicit target
+    identifier — the policy had to infer which slot was the target from
+    masking dynamics. That made the obs harder to learn and didn't match
+    the deploy stream. The target-only design also generalises to the
+    Eval-3 sub-goal advancement (just re-key the tag ID; see
+    :class:`SeqStateAprilTagObservationsCfg`).
 
-    Goal group (target_color_onehot) is inherited unchanged — the policy
-    still needs the goal-conditioning signal to know which cube is the
-    target. The env cfg that wires this in typically also nulls
+    The env cfg that wires this in typically also nulls
     ``scene.wrist_cam`` + ``observations.wrist_image`` (no rendering
     needed for the state-only PPO path).
     """
 
     @configclass
     class PolicyCfg(ObservationsCfg.PolicyCfg):
-        cube_positions_xy_noisy = ObsTerm(func=mdp.cube_positions_xy_noisy)
-        cube_visible_flags = ObsTerm(func=mdp.cube_visible_flags)
+        target_cube_pos_xy_noisy = ObsTerm(func=mdp.target_cube_pos_xy_noisy)
 
     policy: PolicyCfg = PolicyCfg()
 
@@ -476,20 +481,26 @@ class CurriculumCfg:
     from the start to learn target-color discrimination.
     """
 
-    # Curriculum num_steps stretched 10000 → 30000 after Stage-1 v2: at
-    # 10k, the ramp completed between iter 200-400, just as reach reward
-    # was emerging (+0.16). The action_rate penalty (-0.20 at full weight)
-    # then exceeded reach, and the policy retreated to "stay still" —
-    # reach reward dropped 0.16 → 0.04 across iter 200-400. 30k delays
-    # full ramp to ~iter 900, giving the policy room to lock in grasp +
-    # transport before penalties dominate.
+    # Curriculum num_steps walked 10000 → 30000 → 15000.
+    #   v1 (10k): ramp completed iter 200-400 just as reach (+0.16) emerged;
+    #     full-weight action penalty (-0.20) exceeded reach → "stay still"
+    #     attractor.
+    #   v2 (30k): pushed ramp to ~iter 900. In v3 with desired_kl=0.005,
+    #     policy still couldn't escape "stay still" and stalled at iter
+    #     770 with lift=0.05, release=0.0.
+    #   v3 (15k, current): with desired_kl relaxed back to 0.01 (see
+    #     state_apriltag_ppo_cfg.py) PPO has the gradient bandwidth to
+    #     escape stay-still even under earlier action penalty. 15k splits
+    #     the difference (full ramp at ~iter 460 vs Eval-1's iter 150);
+    #     gives reach time to lock in but doesn't let action energy
+    #     drift unchecked through the whole run.
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 30000},
+        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 15000},
     )
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 30000},
+        params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 15000},
     )
     log_success = CurrTerm(func=mdp.log_target_success_metrics, params={})
 
@@ -503,10 +514,10 @@ class CurriculumCfg:
 class ClutterPickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     """SO-ARM101 targeted-pick-and-place in 2-cube clutter."""
 
-    # num_envs default = 2048 (vs Eval-1's 4096) — 6 cubes/env makes
-    # physics ~3-4× heavier; halve env count to keep step throughput
-    # comparable. Override in your train script via env_cfg.scene.num_envs
-    # if VRAM allows more.
+    # num_envs default = 4096 (matches Eval-1) — bumped from 2048 after
+    # the v3 stall, since GPU usage at 2048 envs was only ~4.5 GB / 32 GB
+    # despite the 6-cube physics. Override in your train script via
+    # env_cfg.scene.num_envs if VRAM is tight.
     scene: ClutterSceneCfg = ClutterSceneCfg(
         num_envs=_multicube_sim.DEFAULT_TRAIN_NUM_ENVS,
         env_spacing=_multicube_sim.ENV_SPACING,

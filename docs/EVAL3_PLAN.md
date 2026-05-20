@@ -27,14 +27,14 @@ The previous draft claimed a fixed `place_four_attached_cluster` at `half_separa
 
 ## 3. Observations
 
-Two-group asymmetric A-C as Eval 2.
+Two-group asymmetric A-C as Eval 2. Policy obs shape and semantics are **bitwise identical** to Eval-2's (`SeqStateAprilTagObservationsCfg.PolicyCfg`) — the only Eval-3-specific behaviour lives in :func:`mdp.target_cube_pos_xy_noisy`, which reads the *current sub-goal* target palette idx (via `_current_target_palette_idx`, gated by `_seq_step_idx`) so the published xy + post-grasp freeze re-key automatically when the env advances on sub-goal release.
 
-| Group | Fields |
-|---|---|
-| `policy` (27-D) | identical to Eval 2 |
-| `critic` | `policy` + `all_active_block_positions` (4×3 = 12), `target_block_position` (3), `target_gripper_to_block` (3), `target_block_to_bowl_xy` (2), `target_is_grasped` (1) |
+| Group | Fields | Shape |
+|---|---|---|
+| `policy` | `joint_pos_rel`, `joint_vel_rel`, `gripper_state`, `bowl_xy`, `ee_proj_xy`, `ee_to_bowl_xy`, **`target_cube_pos_xy_noisy`** (2 — current sub-goal target), `last_action` | 27-D |
+| `critic` | `policy` + `seq_goal_vector` (11 — full schedule), `all_active_block_positions` (4×3 = 12), `current_target_block_position` (3), `current_target_gripper_to_block` (3), `current_target_block_to_bowl_xy` (2) | wider |
 
-No `target_color_onehot`, no image, no step one-hot, no `seq_goal_vector`. Multi-step semantics live in the deploy scheduler.
+No `target_color_onehot`, no `cube_positions_xy_noisy` for distractors, no `cube_visible_flags`, no step one-hot, no `seq_goal_vector` in the policy stream. The deploy scheduler re-keys the AprilTag detector per sub-goal; the sim env mirrors that re-keying via `_seq_step_idx` advancement on release — both paths drive the same single-target obs into the actor.
 
 ## 4. Network
 
@@ -81,23 +81,22 @@ Within-episode step advancement handles the 4 → 3 → 2 cube count progression
 | `experiment_name` | `eval3clutter_state_apriltag` |
 | `obs_groups` | `{"policy": ["policy"], "critic": ["policy", "critic"]}` |
 
-## 8. Outer sequencing loop
+## 8. Sub-goal sequencing
 
-Per sub-goal `k ∈ {0, 1, 2}`:
+Sim training and real deploy share the same per-sub-goal contract — the only difference is *who* advances the step counter (env in sim, deploy script on real).
 
-1. `detector.set_target_id(id_for(colors[k]))` (real) or set `target_color_onehot` in `TargetColorCommand` buffer (sim).
-2. Set `target_bowl_xy` to the rollout's bowl xy.
-3. Reset per-episode latches (`env._was_grasped[:] = False`, `env._was_over_bowl_above_rim[:] = False`).
-4. Roll policy up to `sub_goal_budget_s = 5.0 s` (250 ticks).
-5. Advance on detected release (lift latch ∧ over-bowl latch ∧ gripper open ∧ target in bowl xy < 6 cm ∧ z < 6 cm).
-6. Optionally home to `JOINT_DEFAULTS_RAD` for 0.5 s between sub-goals.
-7. Score: `4·𝟙[k=0 done] + 4·𝟙[k=1 done] + 2·𝟙[k=2 done]`.
+**Sim (training, env-internal):** the env owns `_seq_step_idx`. The seq command samples the 3-step schedule + bowl at reset; reward terms gate off `_current_target_palette_idx`; `release_current_target_in_bowl` increments `_seq_step_idx` once the strict release predicate fires (lift latch ∧ over-bowl-above-rim latch ∧ gripper-open ∧ in-bowl). Episode runs 15 s = 750 steps total so the policy sees all three sub-goals back-to-back; per-step bonus `(4, 4, 2)` aligns the value function with the human grading rubric. Cube count drops 4 → 3 → 2 across sub-goals; the policy trains on all three regimes.
 
-Cubes and bowl are sampled once at env reset (start of sub-goal 0); world state persists between sub-goals.
+**Real deploy, per sub-goal `k ∈ {0, 1, 2}`:**
 
-Release-detect modes on real: `manual` (operator Enter on bowl landing), `vision` (target AprilTag pose `‖tag_xy − bowl_xy‖ < 6 cm ∧ tag_z < 6 cm`), `timed` (5-s budget, unconditional).
+1. `detector.set_target_id(tag_id_for(colors[k]))` — re-key the AprilTag pipeline to the new target. The actor obs slot is the *same* `target_cube_pos_xy_noisy` either way; only the source ID changes.
+2. Reset per-sub-goal latches on the deploy state mirror (`_was_grasped`, `_was_over_bowl_above_rim`) so the lift / over-rim gates start fresh.
+3. Roll the policy up to `sub_goal_budget_s = 5.0 s` (250 ticks).
+4. Advance on release detection — same predicate as sim: lift latch ∧ over-bowl latch ∧ gripper-open ∧ target tag `‖xy − bowl_xy‖ < 0.06 m ∧ z < 0.06 m`. Configurable via `--release-detect {manual,vision,timed}` (operator Enter, AprilTag pose check, or 5-s budget).
+5. Optionally home to `JOINT_DEFAULTS_RAD` for ~0.5 s between sub-goals (`--no-home-between-subgoals` to skip for the Speed bonus).
+6. Score: `4·𝟙[k=0 done] + 4·𝟙[k=1 done] + 2·𝟙[k=2 done]`.
 
-Same policy weights drive all 3 sub-goals — "switching" is re-keying of the perception input, not a checkpoint swap.
+The cubes and bowl are physical (one reset per rollout, world state persists between sub-goals). **Same policy weights drive all 3 sub-goals** — the only state that changes between sub-goals is the AprilTag detector's target ID (real) or `_seq_step_idx` (sim).
 
 ## 9. Bonus options
 

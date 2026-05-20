@@ -84,7 +84,7 @@ Download a known-good state-only + AprilTag PPO checkpoint to `deploy/runs/model
 ```bash
 pip install --quiet gdown
 mkdir -p deploy/runs
-gdown "https://drive.google.com/uc?id=1ixXvEX-JmKj9aODik-4Mw9UqJ0yKi_cp" -O deploy/runs/model.pt
+gdown "https://drive.google.com/uc?id=1dUobpj8qXZc4PL7ASod_kWhum0y_xwwq" -O deploy/runs/model.pt
 ```
 
 ## Step 6 — real-arm rollout

@@ -194,20 +194,24 @@ class SoArm101SeqPickPlaceStateAprilTagEnvCfg(SoArm101SeqPickPlaceTeacherFastEnv
 
     Inherits Teacher-Fast (camera-free, no wrist_image) and:
 
-    * Swaps in :class:`SeqStateAprilTagObservationsCfg` so ``PolicyCfg``
-      gains ``cube_positions_xy_noisy`` ``(N, 12)`` and
-      ``cube_visible_flags`` ``(N, 6)``. The existing ``seq_goal`` term
-      (current target color one-hot + current bowl xy + step idx) stays
-      — it's the sub-goal switching signal the outer deploy loop changes
-      between picks.
+    * Swaps in :class:`SeqStateAprilTagObservationsCfg` so the actor's
+      ``PolicyCfg`` is **bitwise identical** to Eval-2's (27-D, target-only
+      AprilTag stream via ``target_cube_pos_xy_noisy``). ``seq_goal``
+      stays in the *critic* obs (privileged) but is dropped from the
+      policy stream — the env advances ``_seq_step_idx`` internally on
+      release, and :func:`mdp.target_cube_pos_xy_noisy` reads the
+      current sub-goal target via ``_current_target_palette_idx`` so the
+      published xy + post-grasp freeze re-key automatically.
     * Adds a ``reset_cube_positions_bias`` event after ``place_blocks`` so
       the per-episode hand-eye bias + per-cube mount + last-value seed
       live alongside the placement.
 
     Same actor as Eval-1/Eval-2 StateAprilTag (plain MLP via
     :class:`PickPlaceVisionActorCritic` auto-disabling its CNN). The
-    sub-goal switching is realised entirely through the ``seq_goal``
-    obs and the post-grasp freeze keyed on the current target.
+    sub-goal switching is realised purely through the env-side
+    ``_seq_step_idx`` advancement; on real, the deploy script re-keys
+    the AprilTag detector ID to mirror that advancement (see EVAL3_PLAN.md
+    §8).
     """
 
     observations: SeqStateAprilTagObservationsCfg = SeqStateAprilTagObservationsCfg()
@@ -229,5 +233,4 @@ class SoArm101SeqPickPlaceStateAprilTagEnvCfg_PLAY(SoArm101SeqPickPlaceStateApri
         self.scene.num_envs = _multicube_sim.DEFAULT_PLAY_NUM_ENVS
         self.scene.env_spacing = _multicube_sim.ENV_SPACING
         self.observations.policy.enable_corruption = False
-        self.observations.policy.cube_positions_xy_noisy.params = {"corrupt": False}
-        self.observations.policy.cube_visible_flags.params = {"corrupt": False}
+        self.observations.policy.target_cube_pos_xy_noisy.params = {"corrupt": False}

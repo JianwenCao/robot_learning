@@ -60,11 +60,14 @@ class ClutterPickPlaceStateAprilTagPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "clutterpickplace_state_apriltag"
     empirical_normalization = False
 
-    # Asymmetric A-C: actor sees deployable (policy) + goal one-hot;
-    # critic additionally sees privileged GT cube positions / distances /
-    # grasp flag for stable value estimation.
+    # Asymmetric A-C: actor sees only the deployable policy stream
+    # (27-D = base + target_cube_pos_xy_noisy; color-blind per
+    # EVAL2_PLAN.md §2). The target is keyed externally by re-keying
+    # the AprilTag detector ID at deploy, so the policy never needs the
+    # ``target_color_onehot`` goal vector. Critic keeps "goal" for the
+    # extra inductive bias; it's privileged and only used at training.
     obs_groups = {
-        "policy": ["policy", "goal"],
+        "policy": ["policy"],
         "critic": ["policy", "goal", "critic"],
     }
 
@@ -86,10 +89,15 @@ class ClutterPickPlaceStateAprilTagPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         schedule="adaptive",
         gamma=0.98,
         lam=0.95,
-        # Tightened to 0.005 like the Eval-2 teacher cfg — wider obs +
-        # wrong_block_in_bowl penalty make value gradient noisier than
-        # stock; loose desired_kl let σ blow up in the first Eval-2 run.
-        desired_kl=0.005,
+        # Back to 0.01 (matches Eval-1's working baseline) after Eval-2 v3
+        # stalled at iter 770 with reach=0.07, lift=0.05, release=0.0.
+        # The 0.005 over-tightening (chosen in v2 to prevent σ inflation)
+        # throttled PPO's per-iter learning to the point that the policy
+        # couldn't escape the "stay still" local optimum. The per-dim
+        # ``std_max=0.2`` gripper cap below already prevents the binary-
+        # gripper σ blowup that originally motivated tightening desired_kl,
+        # so we can safely loosen the trust region back to stock.
+        desired_kl=0.01,
         max_grad_norm=1.0,
     )
 
