@@ -71,7 +71,9 @@ from .rewards import (  # noqa: F401
     reach_target_block,
     release_target_in_bowl,
     target_grasp_event,
+    target_gripper_open_above_bowl_lure,
     target_in_bowl,
+    target_still_grasped_above_bowl_penalty,
     target_transport_to_bowl,
     wrong_block_in_bowl,
 )

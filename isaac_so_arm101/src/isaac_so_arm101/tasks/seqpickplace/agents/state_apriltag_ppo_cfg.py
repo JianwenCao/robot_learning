@@ -78,7 +78,13 @@ class SeqPickPlaceStateAprilTagPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         schedule="adaptive",
         gamma=0.98,
         lam=0.95,
-        desired_kl=0.005,
+        # 0.005 → 0.01 (2026-05-20): Eval-2 cfg documented 0.005 as the cause
+        # of v3's stay-still stall — over-tight trust region throttles per-iter
+        # learning before reach can lock in. Eval-3 inherits the same arch +
+        # an even harder long-horizon MDP, so use the working 0.01 instead.
+        # std_max=0.2 gripper cap below still prevents the binary-gripper σ
+        # blow-up that originally motivated the tightening.
+        desired_kl=0.01,
         max_grad_norm=1.0,
     )
 

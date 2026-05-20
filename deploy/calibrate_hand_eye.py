@@ -2,8 +2,9 @@
 
 Computes ``T_ee_cam`` (rigid transform: end-effector frame → wrist-cam
 frame) via Tsai-Lenz hand-eye calibration and writes
-``deploy/hand_eye.yaml``. See ``docs/STATE_APRILTAG_PLAN.md`` §3 for the
-canonical procedure and ``deploy/README.md`` Step 4 for context.
+``deploy/hand_eye.yaml``. See ``deploy/README.md`` Step 4 for the
+end-to-end walk-through and ``docs/EVAL1_PLAN.md`` for the foundational
+AprilTag pipeline spec.
 
 Workflow
 --------
@@ -265,7 +266,7 @@ def main() -> int:
     print(
         "Next: verify physically by commanding the EE to the projected tag "
         "(x, y) and confirming ≤ 5 mm offset with a ruler. See "
-        "docs/STATE_APRILTAG_PLAN.md §3 step 6."
+        "deploy/README.md Step 4 §6."
     )
     return 0
 

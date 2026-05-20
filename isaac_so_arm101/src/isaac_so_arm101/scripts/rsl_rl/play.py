@@ -285,9 +285,12 @@ def _run_n_episodes(env, policy, args_cli, ckpt_path):
     n_envs = int(base.num_envs)
     target_n = int(args_cli.n_episodes) * n_envs
 
-    # Probe which latch names this env exposes.
-    has_target = hasattr(base, "_target_task_success_latch")
-    if has_target:
+    # Pick latch names by task family. The target_* latches on Eval-2/3 envs
+    # are allocated lazily on the first call to ``release_target_in_bowl``,
+    # which only happens after the first env.step(). A pre-loop hasattr probe
+    # therefore always misses on Eval-2/3 — name by task instead.
+    is_multi_cube = ("ClutterPickPlace" in args_cli.task) or ("SeqPickPlace" in args_cli.task)
+    if is_multi_cube:
         latch_lift = "_target_was_grasped"
         latch_bowl = "_target_was_over_bowl_above_rim"
         latch_succ = "_target_task_success_latch"
@@ -295,7 +298,7 @@ def _run_n_episodes(env, policy, args_cli, ckpt_path):
     else:
         latch_lift = "_was_grasped"
         latch_bowl = "_was_over_bowl_above_rim"
-        latch_succ = None  # Eval-1 has no terminal success latch; falls back to (lift ∧ bowl)
+        latch_succ = None  # Eval-1 has no terminal latch; success = lift ∧ bowl fallback
         latch_succ_strict = None
 
     counts = {"episodes": 0, "lift": 0, "bowl": 0, "succ": 0, "succ_strict": 0}
@@ -305,6 +308,19 @@ def _run_n_episodes(env, policy, args_cli, ckpt_path):
     print(f"[n-episodes] latches: lift={latch_lift}, bowl={latch_bowl}, "
           f"succ={latch_succ or '(lift∧bowl fallback)'}")
 
+    # Per-env "ever fired this episode" accumulators. We can't read the latches
+    # at the done step because the env's reset_*_latches events fire inside
+    # env.step() and clear them before we see the result. So we OR-accumulate
+    # the current latch state into ever_* every step (for non-done envs),
+    # and sample ever_* at done.
+    device = base.device
+    ever = {k: torch.zeros(n_envs, dtype=torch.bool, device=device)
+            for k in ("lift", "bowl", "succ", "succ_strict")}
+
+    def _read_latch(name):
+        t = getattr(base, name, None) if name else None
+        return t if (t is not None and t.shape[0] == n_envs and t.dtype == torch.bool) else None
+
     obs = env.get_observations()
     step = 0
     while counts["episodes"] < target_n:
@@ -312,30 +328,39 @@ def _run_n_episodes(env, policy, args_cli, ckpt_path):
             actions = policy(obs)
             next_obs, _rewards, dones, _extras = env.step(actions)
 
-        dones_np = dones.detach().cpu().numpy().astype(bool) if hasattr(dones, "detach") else np.asarray(dones, bool)
-        if dones_np.any():
-            done_idx = np.where(dones_np)[0]
-            lift = getattr(base, latch_lift, None)
-            bowl = getattr(base, latch_bowl, None)
-            succ = getattr(base, latch_succ, None) if latch_succ else None
-            succ_s = getattr(base, latch_succ_strict, None) if latch_succ_strict else None
+        dones_bool = dones.to(dtype=torch.bool, device=device) if hasattr(dones, "to") \
+            else torch.as_tensor(dones, dtype=torch.bool, device=device)
+        not_done = ~dones_bool
 
+        # OR-accumulate post-step latch state into ever_* for envs that are
+        # still mid-episode. (For done envs, the latch was just cleared by the
+        # reset event; we rely on what we already accumulated up to this step.)
+        lift = _read_latch(latch_lift)
+        bowl = _read_latch(latch_bowl)
+        succ = _read_latch(latch_succ)
+        succ_s = _read_latch(latch_succ_strict)
+        if lift is not None:
+            ever["lift"] |= lift & not_done
+        if bowl is not None:
+            ever["bowl"] |= bowl & not_done
+        if succ is not None:
+            ever["succ"] |= succ & not_done
+        elif lift is not None and bowl is not None:
+            # Eval-1 fallback: declare success = ever_lift ∧ ever_bowl
+            ever["succ"] |= ever["lift"] & ever["bowl"]
+        if succ_s is not None:
+            ever["succ_strict"] |= succ_s & not_done
+
+        if dones_bool.any():
+            done_idx = torch.nonzero(dones_bool, as_tuple=True)[0].tolist()
             for i in done_idx:
                 counts["episodes"] += 1
-                if lift is not None and bool(lift[i].item()):
-                    counts["lift"] += 1
-                if bowl is not None and bool(bowl[i].item()):
-                    counts["bowl"] += 1
-                if succ is not None:
-                    if bool(succ[i].item()):
-                        counts["succ"] += 1
-                else:
-                    # Eval-1 fallback: success = lift_latch ∧ bowl_latch
-                    if lift is not None and bowl is not None \
-                       and bool(lift[i].item()) and bool(bowl[i].item()):
-                        counts["succ"] += 1
-                if succ_s is not None and bool(succ_s[i].item()):
-                    counts["succ_strict"] += 1
+                if bool(ever["lift"][i].item()):       counts["lift"] += 1
+                if bool(ever["bowl"][i].item()):       counts["bowl"] += 1
+                if bool(ever["succ"][i].item()):       counts["succ"] += 1
+                if bool(ever["succ_strict"][i].item()): counts["succ_strict"] += 1
+                for k in ever:
+                    ever[k][i] = False
 
             if counts["episodes"] % max(1, n_envs) == 0 or counts["episodes"] >= target_n:
                 n = counts["episodes"]

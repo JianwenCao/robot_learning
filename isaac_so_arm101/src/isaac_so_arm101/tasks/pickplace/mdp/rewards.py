@@ -79,7 +79,13 @@ def _bowl_xy_w(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 def _episode_over_bowl_high_mask(
     env: ManagerBasedRLEnv,
     r_safe: float = 0.06,
-    rim_clearance: float = 0.12,
+    # 2026-05-20: rim_clearance walked 0.12 → 0.08 across all eval tasks.
+    # The 12 cm threshold (= 6 cm rim + 6 cm safety) was over-aggressive
+    # and forced near-vertical arm poses for close-to-base bowls. 8 cm
+    # (= 6 cm rim + 1 cm cube-half-size + 1 cm margin) still keeps the
+    # cube fully clear of the rim during the over-bowl latch fire while
+    # letting the policy approach more horizontally.
+    rim_clearance: float = 0.08,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
@@ -592,7 +598,7 @@ def place_in_bowl(
     r_safe: float = 0.06,
     bowl_height: float = 0.06,
     minimal_height: float = 0.025,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08 (see _episode_over_bowl_high_mask docstring)
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
@@ -746,7 +752,7 @@ def release_proximity(
 
 def gripper_open_above_bowl_lure(
     env: ManagerBasedRLEnv,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
     r_safe: float = 0.06,
     command_name: str = "bowl_pose",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
@@ -776,7 +782,7 @@ def gripper_open_above_bowl_lure(
 
 def still_grasped_above_bowl_penalty(
     env: ManagerBasedRLEnv,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
     r_safe: float = 0.06,
     minimal_height: float = 0.07,
     command_name: str = "bowl_pose",
@@ -820,7 +826,7 @@ def release_in_bowl(
     gripper_open_threshold: float = 0.2,
     block_speed_threshold: float = 0.05,
     minimal_height: float = 0.07,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
     command_name: str = "bowl_pose",
     gripper_joint_name: str = "gripper",
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),

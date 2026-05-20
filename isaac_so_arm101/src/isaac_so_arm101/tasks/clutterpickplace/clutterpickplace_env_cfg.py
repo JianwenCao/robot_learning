@@ -151,8 +151,12 @@ class CommandsCfg:
         min_distance=0.15,
         max_attempts=16,
         ranges=UniformPoseCommandCfg.Ranges(
-            pos_x=(0.15, 0.28),
-            pos_y=(-0.12, 0.12),
+            # 2026-05-20: unified to (0.18, 0.30) × (-0.15, 0.15) across
+            # Eval-1/2/3 — see EVAL1 docstring for the reach-envelope
+            # rationale (close-to-base bowls were forcing near-vertical
+            # arm poses).
+            pos_x=(0.18, 0.30),
+            pos_y=(-0.15, 0.15),
             pos_z=(0.0, 0.0),
             roll=(0.0, 0.0),
             pitch=(0.0, 0.0),
@@ -421,19 +425,37 @@ class RewardsCfg:
 
     release_in_bowl = RewTerm(func=mdp.release_target_in_bowl, weight=30.0)
 
+    # Anti-hover lures — target-keyed port of Eval-1's 2026-05-20 fix.
+    # Without these, two consecutive Eval-2 v3 runs (2026-05-20_08-41-24,
+    # 09-00-17) stalled in a "reach-and-camp" basin: reach saturated near
+    # 0.7/step but lift never fired, release stayed 0. Eval-1's fix was to
+    # add a small open-jaws-over-bowl lure (+3) and a hover-with-grasp
+    # penalty (-1); replicating that target-keyed version here removes
+    # the local maximum at "park EE on cube without closing gripper".
+    # Same weight ratios as Eval-1; max ~3/step lure is well below
+    # release(30) so full release still strictly dominates.
+    gripper_open_above_bowl_lure = RewTerm(
+        func=mdp.target_gripper_open_above_bowl_lure, weight=3.0,
+    )
+    still_grasped_above_bowl_penalty = RewTerm(
+        func=mdp.target_still_grasped_above_bowl_penalty, weight=-1.0,
+    )
+
     # Distractor-aware shaping (Eval-2 specific).
     distractor_disturb = RewTerm(
         func=mdp.distractor_disturb_penalty, weight=-0.5,
         params={"threshold_speed": 0.05},
     )
-    # Reduced -20 → -5 after Stage-1 v2 (logs/...2026-05-19_21-47-10):
-    # weight -20 at iter 200 fired -0.30 per episode (≈ 1.5 % of steps
-    # the random-policy distractor lands in the bowl xy) while reach
-    # was only +0.16 — net negative reward incentivized the policy to
-    # "stay still" before reach gradient could lock in. -5 keeps the
-    # signal directional (correct release +30 > wrong-block penalty)
-    # without making the early-exploration MDP unsolvable.
-    wrong_block_in_bowl = RewTerm(func=mdp.wrong_block_in_bowl, weight=-5.0)
+    # Start at 0 and ramp to -5 over 20k env-steps (see CurriculumCfg).
+    # Reason: prior runs showed the distractor drifting into the bowl
+    # during random-policy exploration (run 09-00-17: ramped to -1.06
+    # weighted/episode = 21% of steps firing). Penalising that before the
+    # policy has learned to reach + lift creates a "stay still" attractor
+    # — the policy can't tell what motion caused the penalty so safest
+    # response is no motion. Ramping in once reach + lift are established
+    # preserves the directional signal (correct release +30 > wrong-block
+    # -5) without poisoning early exploration.
+    wrong_block_in_bowl = RewTerm(func=mdp.wrong_block_in_bowl, weight=0.0)
 
     # Penalties — ramped via curriculum, same as Eval-1.
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
@@ -501,6 +523,14 @@ class CurriculumCfg:
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-2, "num_steps": 15000},
+    )
+    # Ramp wrong_block_in_bowl 0 → -5 over 20k env-steps. See RewardsCfg
+    # docstring for the rationale (early -5 was poisoning exploration).
+    # 20k > 15k action ramp so reach + lift consolidate before the
+    # distractor penalty turns on.
+    wrong_block_in_bowl = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "wrong_block_in_bowl", "weight": -5.0, "num_steps": 20000},
     )
     log_success = CurrTerm(func=mdp.log_target_success_metrics, params={})
 

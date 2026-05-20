@@ -64,7 +64,7 @@ def place_seq_blocks(
     env_ids: torch.Tensor,
     block_x: tuple[float, float] = (0.13, 0.28),
     block_y: tuple[float, float] = (-0.15, 0.15),
-    min_block_separation: float = 0.08,
+    min_block_separation: float = 0.12,
     table_z: float = 0.01,
     max_attempts: int = 80,
     bowl_x: tuple[float, float] = (0.15, 0.28),

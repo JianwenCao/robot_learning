@@ -92,7 +92,7 @@ def _target_lifted_mask(
 def _target_over_bowl_high_mask(
     env: "ManagerBasedRLEnv",
     r_safe: float = 0.06,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08 (see Eval-1 _episode_over_bowl_high_mask)
     command_name: str = "bowl_pose",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
@@ -177,7 +177,7 @@ def target_in_bowl(
     r_safe: float = 0.06,
     bowl_height: float = 0.06,
     minimal_height: float = 0.025,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
     command_name: str = "bowl_pose",
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
@@ -208,7 +208,7 @@ def release_target_in_bowl(
     gripper_open_threshold: float = 0.2,
     block_speed_threshold: float = 0.05,
     minimal_height: float = 0.07,
-    rim_clearance: float = 0.12,
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
     command_name: str = "bowl_pose",
     gripper_joint_name: str = "gripper",
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -254,6 +254,66 @@ def release_target_in_bowl(
         env._target_task_success_latch_strict = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     env._target_task_success_latch_strict |= strict_indicator
     return indicator.float()
+
+
+# ---------------------------------------------------------------------------
+# Anti-hover terms — target-keyed port of Eval-1's
+# ``gripper_open_above_bowl_lure`` / ``still_grasped_above_bowl_penalty``.
+# Without these, the Eval-2 dense reward stack settles into a
+# "reach-and-camp" basin (reach ≈ 0.7/step, lift = 0): the policy parks
+# the EE on the target cube without ever closing the gripper. The two
+# terms make "trying to release" locally rewarding and cancel the
+# steady-state credit of hover-with-grasp. Same shape as Eval-1's
+# 2026-05-20 fix, indexed against the target cube's per-episode latch
+# (``env._target_was_over_bowl_above_rim``) and the target cube's z.
+# ---------------------------------------------------------------------------
+
+
+def target_gripper_open_above_bowl_lure(
+    env: "ManagerBasedRLEnv",
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
+    r_safe: float = 0.06,
+    command_name: str = "bowl_pose",
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """+1/step when the target's over-bowl-above-rim latch is set AND policy commands gripper open.
+
+    Target-aware mirror of :func:`pickplace.mdp.rewards.gripper_open_above_bowl_lure`.
+    Gated on :func:`_target_over_bowl_high_mask` so the lure can only be
+    farmed after the policy has actually transported the target above the
+    rim — opening the gripper at home doesn't pay.
+    """
+    was_over_high = _target_over_bowl_high_mask(
+        env, r_safe=r_safe, rim_clearance=rim_clearance,
+        command_name=command_name, cube_prefix=cube_prefix,
+    )
+    gripper_open_cmd = env.action_manager.action[:, 5] > 0.0
+    return (was_over_high & gripper_open_cmd).float()
+
+
+def target_still_grasped_above_bowl_penalty(
+    env: "ManagerBasedRLEnv",
+    rim_clearance: float = 0.08,  # 2026-05-20: 0.12 → 0.08
+    r_safe: float = 0.06,
+    minimal_height: float = 0.07,
+    command_name: str = "bowl_pose",
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """+1/step (negative-weight in cfg) while hovering the target above the bowl.
+
+    Target-aware mirror of :func:`pickplace.mdp.rewards.still_grasped_above_bowl_penalty`.
+    Three conditions:
+      * episode target-lift latch (target was lifted ≥ ``minimal_height``),
+      * target *currently* above ``rim_clearance`` AND within ``r_safe`` of bowl xy,
+      * gripper command ≤ 0 (closed).
+    """
+    target_w = _target_pos_w(env, cube_prefix)
+    bowl_w = _bowl_xy_w(env, command_name)
+    was_lifted = _target_lifted_mask(env, minimal_height, cube_prefix)
+    currently_above_rim = target_w[:, 2] > rim_clearance
+    currently_near_bowl = torch.norm(target_w[:, :2] - bowl_w, dim=1) < r_safe
+    gripper_closed_cmd = env.action_manager.action[:, 5] <= 0.0
+    return (was_lifted & currently_above_rim & currently_near_bowl & gripper_closed_cmd).float()
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,15 @@ from isaaclab.utils import configclass
 
 from .events import N_ACTIVE_BLOCKS, N_BOWLS, N_GOAL_STEPS, NUM_COLORS
 
+# Per-sub-goal step budget. 250 steps = 5 s @ 50 Hz, matching the
+# Eval-1 / Eval-2 single-shot episode length the zero-shot actor was
+# trained for. If a sub-goal isn't released within this budget, the
+# command term auto-advances to the next sub-goal (after arm return-
+# to-home) so the rollout can still attempt the remaining sub-goals.
+# Total rollout budget should be ≥ N_GOAL_STEPS × MAX_STEPS_PER_SUBGOAL
+# (= 3 × 250 = 750 = the env's 15 s ``episode_length_s``).
+MAX_STEPS_PER_SUBGOAL = 250
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -70,6 +79,12 @@ class SequentialGoalCommand(CommandTerm):
             env._seq_bowl_positions = torch.zeros((N, N_BOWLS, 2), dtype=torch.float32, device=device)
         if not hasattr(env, "_seq_step_idx"):
             env._seq_step_idx = torch.zeros(N, dtype=torch.long, device=device)
+        # Per-sub-goal step counter — incremented every env step in
+        # _update_command, reset on advance. Used to enforce a per-sub-
+        # goal timeout so a failed sub-goal doesn't consume the whole
+        # 15 s rollout and starve later sub-goals.
+        if not hasattr(env, "_seq_sub_step_count"):
+            env._seq_sub_step_count = torch.zeros(N, dtype=torch.long, device=device)
         # Hot-path lookup buffers used by observations and rewards. Must be
         # allocated here (before the first reset) because the obs manager
         # probes obs shapes at env construction, which calls obs functions
@@ -159,24 +174,48 @@ class SequentialGoalCommand(CommandTerm):
     # ---------------------------------------------------------- per-step update
 
     def _update_command(self) -> None:
-        """Advance step idx whenever the reward indicator latches True.
+        """Advance step idx on release-success OR per-sub-goal timeout.
 
-        The reward term :func:`mdp.rewards.release_current_target_in_bowl`
-        sets ``env._seq_step_release_indicator`` to True for envs that
-        satisfied the release predicate this step. We advance those envs'
-        step counters and clear the per-step latches so the next sub-goal
-        starts fresh.
+        Two advance triggers:
+
+        * **Success** — the reward term
+          :func:`mdp.rewards.release_current_target_in_bowl` sets
+          ``env._seq_step_release_indicator`` True for envs that
+          satisfied the release predicate this step.
+        * **Timeout** — ``env._seq_sub_step_count`` reached
+          ``MAX_STEPS_PER_SUBGOAL`` without a release. Without this,
+          a failed first sub-goal consumes the whole 15 s rollout and
+          sub-goals 2/3 never get attempted (the Eval-1 zero-shot
+          actor is a single-shot "from home, grasp + place" policy —
+          if its first attempt misses, no recovery in-place is
+          possible without explicit retraction).
+
+        On advance, we also **teleport the arm back to its home pose**
+        (zero velocity, default joint positions including gripper
+        open at 0.5). This matches what the deploy script must do
+        between sub-goals — re-key the AprilTag target ID and start
+        the next reach from a known clean state. Without it, the next
+        sub-goal would start from "above the (previous) bowl with
+        gripper open" which is out-of-distribution for the policy
+        and tanks subsequent SR.
         """
         env = self._env
+        not_done = env._seq_step_idx < N_GOAL_STEPS
+
+        # Tick per-sub-goal counter for envs still working.
+        env._seq_sub_step_count[not_done] += 1
+
         ind = getattr(env, "_seq_step_release_indicator", None)
         if ind is None:
-            return
-        # Only advance envs that haven't finished yet.
-        not_done = env._seq_step_idx < N_GOAL_STEPS
-        advance = ind & not_done
+            ind = torch.zeros_like(not_done)
+        timeout = env._seq_sub_step_count >= MAX_STEPS_PER_SUBGOAL
+        advance = (ind | timeout) & not_done
         if not advance.any():
             return
+
         env._seq_step_idx[advance] += 1
+        env._seq_sub_step_count[advance] = 0
+
         # Clear per-step gating latches for the envs advancing — the
         # next step's target is a different cube + bowl, so the
         # was-lifted / was-over-rim semantics don't carry over.
@@ -184,8 +223,22 @@ class SequentialGoalCommand(CommandTerm):
             env._seq_was_grasped[advance] = False
         if hasattr(env, "_seq_was_over_bowl_above_rim"):
             env._seq_was_over_bowl_above_rim[advance] = False
-        # Consume the indicator so we don't double-advance next step.
-        env._seq_step_release_indicator[advance] = False
+        # Consume the indicator (if it was the trigger) so we don't
+        # double-advance next step.
+        if ind is not None:
+            env._seq_step_release_indicator[advance] = False
+
+        # Arm return-to-home for envs that just advanced — only those
+        # still inside the rollout (skip envs that finished all sub-
+        # goals; their idx is now ≥ N_GOAL_STEPS and they'll be reset
+        # by the episode-level pipeline anyway).
+        still_running = env._seq_step_idx < N_GOAL_STEPS
+        retract = advance & still_running
+        if retract.any():
+            retract_ids = torch.nonzero(retract, as_tuple=True)[0]
+            home_q = self.robot.data.default_joint_pos[retract_ids].clone()
+            home_qvel = torch.zeros_like(home_q)
+            self.robot.write_joint_state_to_sim(home_q, home_qvel, env_ids=retract_ids)
 
     def _update_metrics(self) -> None:
         pass

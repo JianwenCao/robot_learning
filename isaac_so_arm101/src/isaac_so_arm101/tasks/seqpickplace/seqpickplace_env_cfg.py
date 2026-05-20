@@ -196,14 +196,21 @@ class SeqStateAprilTagObservationsCfg(ObservationsCfg):
 
     @configclass
     class PolicyCfg(ObsGroup):
+        # Field order is LOAD-BEARING: must match Eval-1 / Eval-2's
+        # StateAprilTag policy obs exactly so the Eval-1 actor (which
+        # both Eval-2 and Eval-3 reuse zero-shot) reads each dim with
+        # the same semantic meaning. Eval-1 / Eval-2 order is:
+        #   joint_pos, joint_vel, gripper_state, bowl_xy, ee_proj_xy,
+        #   ee_to_bowl_xy, last_action, <cube_xy_noisy>
+        # (i.e. last_action BEFORE the noisy xy slot). Don't swap.
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
         gripper_state = ObsTerm(func=mdp.gripper_state)
         bowl_xy = ObsTerm(func=mdp.bowl_xy)
         ee_proj_xy = ObsTerm(func=mdp.ee_proj_xy)
         ee_to_bowl_xy = ObsTerm(func=mdp.ee_to_bowl_xy)
-        target_cube_pos_xy_noisy = ObsTerm(func=mdp.target_cube_pos_xy_noisy)
         last_action = ObsTerm(func=mdp.last_action)
+        target_cube_pos_xy_noisy = ObsTerm(func=mdp.target_cube_pos_xy_noisy)
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -221,22 +228,30 @@ class EventCfg:
         mode="reset",
         params={
             # 4 cubes spread independently with pairwise rejection.
-            # Workspace 0.15×0.30 m² is enough to fit 4 cubes at
-            # ≥ 8 cm pairwise separation (≥ 6 cm edge gap for 2 cm
-            # cubes — comfortably wider than the SO-ARM gripper finger
-            # span). Bumped from 6 cm per EVAL3_PLAN.md §2 to give
-            # more grasp margin. If rejection sampling stops fitting
-            # the 4th cube reliably (max_attempts warnings), widen
-            # block_x / block_y rather than dropping back.
+            # Walked 0.06 → 0.08 → 0.12 (2026-05-20): 8 cm wasn't
+            # enough margin for the zero-shot Eval-1 actor (trained on
+            # single-cube scenes), which tended to clip distractor
+            # neighbours during the reach when they were within 8 cm.
+            # 12 cm matches Eval-2's spacing — same gripper-finger
+            # tolerance as the env the Eval-1 ckpt already handles
+            # cleanly. Workspace 0.15×0.30 m² + ``max_attempts=80`` still
+            # fits 4 cubes reliably at this spacing. If rejection
+            # sampling stops fitting, widen block_x / block_y first.
             "block_x": (0.13, 0.28),
             "block_y": (-0.15, 0.15),
-            "min_block_separation": 0.08,
+            "min_block_separation": 0.12,
             "table_z": 0.01,
             "max_attempts": 80,
-            # Bowl in a tighter range than blocks → cubes can spill into
-            # the y-edges where the bowl can't spawn (better separation chance).
-            "bowl_x": (0.18, 0.26),
-            "bowl_y": (-0.08, 0.08),
+            # 2026-05-20: unified to (0.18, 0.30) × (-0.15, 0.15) across
+            # Eval-1/2/3 — see EVAL1 docstring for the reach-envelope
+            # rationale. Eval-3 previously used a tighter (0.18, 0.26) × ±0.08
+            # bowl window to give the 4-cube cluster room around the edges;
+            # widening to match the other tasks lets the Eval-1 ckpt see
+            # the same bowl distribution it was trained on. Cube workspace
+            # is independent (block_x/block_y above) so cubes can still
+            # spread to the edges where the bowl excludes them.
+            "bowl_x": (0.18, 0.30),
+            "bowl_y": (-0.15, 0.15),
             # Bumped 0.08 → 0.15 (2026-05-20) to match Eval-1/Eval-3's
             # spacing so cubes land clearly away from the bowl. NOTE:
             # the bowl excludes ~π·15² ≈ 707 cm² (clipped to the 450 cm²

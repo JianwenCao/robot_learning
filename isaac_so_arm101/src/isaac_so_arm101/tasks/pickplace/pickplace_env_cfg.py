@@ -203,7 +203,16 @@ class CommandsCfg:
             # convenience subset. If success_rate stalls / σ inflates
             # in the first ~500 PPO iters at Stage 3, revert to the
             # comfortable band (x∈[0.15, 0.28], y∈±0.12).
-            pos_x=(0.10, 0.30),
+            # 2026-05-20 (later): tightened pos_x lower bound 0.10 → 0.18
+            # because close-to-base bowls (x < 0.18) require a near-vertical
+            # arm pose to satisfy the over-bowl-above-rim latch — the policy
+            # learned to "point straight up" instead of doing a natural
+            # excavator-style lateral approach. 0.18 lower bound keeps every
+            # bowl pose inside the SO-ARM101's natural reach envelope.
+            # Unified to (0.18, 0.30) × (-0.15, 0.15) across Eval-1/2/3 so
+            # the same Eval-1 checkpoint sees identical bowl distributions
+            # at deploy regardless of which eval task is running.
+            pos_x=(0.18, 0.30),
             pos_y=(-0.15, 0.15),
             # Goal z = 0 (table level). After release, the 2 cm cube sits
             # on the bowl floor (which sits on the table) → cube center
@@ -437,8 +446,9 @@ class RewardsCfg:
       * ``reaching_object``  — dense ee→cube tanh, w=1.0, std=0.10.
       * ``lifting_object``   — sparse indicator block_z > 0.04, w=15.0.
       * ``object_goal_tracking`` — dense cube→goal_xyz tanh, **lift-gated
-        per-step**, w=16.0, std=0.30. Goal is bowl_xy at z=0.10 (set in
-        ``CommandsCfg.bowl_pose.ranges.pos_z``).
+        per-step**, w=16.0, std=0.30. Goal is bowl_xy at z=0.0 (set in
+        ``CommandsCfg.bowl_pose.ranges.pos_z`` — the bowl floor sits on
+        the table, so cube-in-bowl ≈ cube_z = 0.01).
       * ``object_goal_tracking_fine_grained`` — same fn at std=0.05, w=5.0.
 
     Penalties:
