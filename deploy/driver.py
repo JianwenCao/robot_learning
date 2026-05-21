@@ -24,7 +24,7 @@ match what the policy was trained against:
 * EWMA on the finite-difference joint velocity, since the sim's
   ``joint_vel_rel`` is a clean PhysX read and the servo FD is encoder-quantized
   + bus-jittered noise that lives outside the policy's training distribution;
-* pre-rollout homing to the sim reset pose ``(0, 0, 0, 1.57, 0, gripper=open)``
+* pre-rollout homing to the sim reset pose ``JOINT_DEFAULTS_RAD``
   by commanding the full home target directly (slew cap bypassed) so the t=0
   obs has ``joint_pos_rel ≈ 0`` (matches the sim reset distribution; otherwise
   the slew cap silently clips the policy's early actions while the arm catches
@@ -50,21 +50,16 @@ INTRINSICS_YAML = PROJECT_ROOT / "camera_intrinsics.yaml"
 
 # Joint order must match LeRobot's SO101 follower obs / action keys.
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-# FK end link. We use ``gripper_link`` (not ``gripper_frame_link``) so the
-# real ``ee_xyz`` matches the sim ``ee_frame`` exactly — sim's
-# ``FrameTransformer`` is ``gripper_link + offset(0.01, 0, -0.09)`` in the
-# link's local frame, while ``gripper_frame_link`` adds a different URDF
-# offset (-0.0079, ~0, -0.0981) plus a 180° y-rotation. The position
-# discrepancy is ~1.8 cm in x — small but shifts ``ee_proj_xy`` and
-# ``ee_to_bowl_xy`` out of the trained state distribution.
+# FK end link used by the legacy ``ee_proj_xy`` observation. Relative
+# cube/target vectors are computed from the URDF ``gripper_frame_link``
+# separately via :meth:`FK.gripper_frame_xyz`.
 EE_LINK_NAME = "gripper_link"
 EE_LOCAL_OFFSET = np.array([0.01, 0.0, -0.09], dtype=np.float64)
+GRIPPER_FRAME_LINK_NAME = "gripper_frame_link"
 
-# Joint defaults the sim's ``joint_pos_rel`` subtracts. Sim's articulation
-# default_joint_pos (set in ``joint_pos_env_cfg.py``) is
-# (0, 0, 0, 1.57, 0, 0.5) — gripper home is OPEN at 0.5 rad. Keep this in
-# lockstep with that override; otherwise ``joint_pos_rel[5]`` is off by 0.5
-# every step.
+# Joint defaults the sim's ``joint_pos_rel`` subtracts. Keep this in lockstep
+# with the pickplace robot init_state override in ``joint_pos_env_cfg.py`` and
+# the real pre-rollout HOME pose.
 JOINT_DEFAULTS_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, 0.5], dtype=np.float32)
 ARM_ACTION_SCALE = 0.5                  # JointPositionActionCfg.scale
 GRIPPER_OPEN_RAD = 0.5                  # sim "open" gripper joint position
@@ -94,12 +89,9 @@ def _gripper_sim_rad_from_pct(pct: float) -> float:
     return pct / 100.0 * GRIPPER_JAW_RAD_SPAN + GRIPPER_JAW_RAD_MIN
 
 
-# Pre-rollout homing target. Arm joints match the sim reset pose
-# (``SO_ARM101_CFG.init_state.joint_pos`` overridden in ``joint_pos_env_cfg.py``
-# with ``gripper=0.5``). The home target is commanded directly (no slew cap,
-# see ``_slew_to_home``) so gravity-loaded joints actually reach it before
-# the timeout fires.
-HOME_POSE_RAD = np.array([0.0, 0.0, 0.0, 1.57, 0.0, GRIPPER_OPEN_RAD], dtype=np.float32)
+# Pre-rollout homing target. Matches ``JOINT_DEFAULTS_RAD`` so rollout starts
+# at the same joint-relative zero pose used during training.
+HOME_POSE_RAD = JOINT_DEFAULTS_RAD.copy()
 HOME_TOLERANCE_RAD = 0.03               # ~1.7° — wider than Feetech deadband
 HOMING_TIMEOUT_S = 6.0                  # raw servo response; one or two PID cycles per joint
 
@@ -113,6 +105,11 @@ MAX_RAD_PER_STEP = SIM_VEL_LIMIT / FPS
 # trailing average at 50 Hz — fast enough to track real motion, slow enough
 # to attenuate per-step encoder quantization noise.
 QDOT_EWMA_ALPHA = 0.3
+
+
+def _wrap_angle_near(value: float, reference: float) -> float:
+    return float(reference + ((value - reference + np.pi) % (2.0 * np.pi) - np.pi))
+
 
 SERVO_PORT  = "/dev/tty.usbmodem5B140335911"
 # Capture at the calibration resolution (camera_intrinsics.yaml is 1280×720).
@@ -137,8 +134,13 @@ class FK:
             ) from e
         self._kp = kp
         with open(urdf_path, "rb") as f:
-            self.chain = kp.build_serial_chain_from_urdf(f.read(), end_link_name=ee_link)
+            urdf_bytes = f.read()
+        self.chain = kp.build_serial_chain_from_urdf(urdf_bytes, end_link_name=ee_link)
+        self.gripper_frame_chain = kp.build_serial_chain_from_urdf(
+            urdf_bytes, end_link_name=GRIPPER_FRAME_LINK_NAME
+        )
         self._joint_names = self.chain.get_joint_parameter_names()  # 5 arm joints
+        self._gripper_frame_joint_names = self.gripper_frame_chain.get_joint_parameter_names()
 
     def ee_xyz(self, joint_pos_rad: np.ndarray) -> np.ndarray:
         """Compute ee xyz in the robot base frame, matching sim's ee_frame.
@@ -153,6 +155,13 @@ class FK:
         T = self.chain.forward_kinematics(th)
         ee = np.asarray(T.pos, dtype=np.float64) + T.rot_mat @ EE_LOCAL_OFFSET
         return ee.astype(np.float32)
+
+    def gripper_frame_xyz(self, joint_pos_rad: np.ndarray) -> np.ndarray:
+        """Compute URDF ``gripper_frame_link`` xyz in the robot base frame."""
+        arm_vals = {n: float(v) for n, v in zip(JOINT_NAMES[:5], joint_pos_rad[:5])}
+        th = [arm_vals[n] for n in self._gripper_frame_joint_names]
+        T = self.gripper_frame_chain.forward_kinematics(th)
+        return np.asarray(T.pos, dtype=np.float32)
 
 
 # ============================================================== camera + undistort
@@ -223,6 +232,7 @@ class LerobotSO101Driver:
         out = np.empty(6, dtype=np.float32)
         for i, n in enumerate(JOINT_NAMES[:5]):
             out[i] = float(obs[f"{n}.pos"]) * (np.pi / 180.0)
+        out[4] = _wrap_angle_near(float(out[4]), float(JOINT_DEFAULTS_RAD[4]))
         out[5] = _gripper_sim_rad_from_pct(float(obs["gripper.pos"]))
         return out
 

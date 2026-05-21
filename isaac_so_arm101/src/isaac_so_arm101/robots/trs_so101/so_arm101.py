@@ -42,7 +42,7 @@ SO_ARM101_CFG = ArticulationCfg(
             "wrist_roll": -0.0,
             "gripper": 0.0,
         },
-        # Set initial joint velocities to zero
+        # Set initial joint velocities to zero [0, -0.43799999356269836, 0.35899999737739563, 1.4329999685287476, -7.880000114440918+2pi, 0.2160000056028366]
         joint_vel={".*": 0.0},
     ),
     actuators={

@@ -91,7 +91,7 @@ class SeqSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     seq_goal = mdp.SequentialGoalCommandCfg(
         asset_name="robot",
-        resampling_time_range=(15.0, 15.0),
+        resampling_time_range=(5.0, 5.0),
         # Render the single per-rollout bowl as a red sphere in the
         # viewer (matches Eval-1/2's bowl marker pattern). All 3
         # sequential placements target this one bowl — only its position
@@ -223,6 +223,20 @@ class SeqStateAprilTagObservationsCfg(ObservationsCfg):
 class EventCfg:
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
     reset_latches = EventTerm(func=mdp.reset_seq_latches, mode="reset")
+    randomize_robot_initial_pose = EventTerm(
+        func=mdp.randomize_robot_initial_joint_pos,
+        mode="reset",
+        params={
+            "joint_delta_ranges": {
+                "shoulder_pan": (-0.15, 0.15),
+                "shoulder_lift": (-0.12, 0.12),
+                "elbow_flex": (-0.12, 0.12),
+                "wrist_flex": (-0.15, 0.15),
+                "wrist_roll": (-0.20, 0.20),
+            },
+            "gripper_open_pos": 0.5,
+        },
+    )
     place_blocks = EventTerm(
         func=mdp.place_seq_blocks,
         mode="reset",
@@ -242,6 +256,7 @@ class EventCfg:
             "min_block_separation": 0.12,
             "table_z": 0.01,
             "max_attempts": 80,
+            "active_count_choices": (2, 3, 4),
             # 2026-05-20: unified to (0.18, 0.30) × (-0.15, 0.15) across
             # Eval-1/2/3 — see EVAL1 docstring for the reach-envelope
             # rationale. Eval-3 previously used a tighter (0.18, 0.26) × ±0.08
@@ -286,15 +301,7 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward stack — dense reach/lift/transport on the current target,
-    sparse release + per-step bonus on completion.
-
-    The per-step weights ``(4.0, 4.0, 2.0)`` mirror the Eval-3 grading
-    (4/4/2 pts) so the value function aligns with the score the human
-    grader will write down. ``release_current_target_in_bowl`` weight=30
-    matches Eval-1; ``step_completion_bonus`` weight=1.0 then scales the
-    per-step (4, 4, 2) values directly.
-    """
+    """Task-1/2 reward stack, indexed to the current target cube."""
 
     reaching_object = RewTerm(func=mdp.reach_current_target, params={"std": 0.05}, weight=1.0)
     lifting_object = RewTerm(
@@ -310,13 +317,35 @@ class RewardsCfg:
         params={"std": 0.05, "minimal_height": 0.025, "command_name": "seq_goal"},
         weight=5.0,
     )
+    ee_release_pose_over_bowl = RewTerm(
+        func=mdp.current_ee_release_pose_over_bowl,
+        params={
+            "ee_height": 0.08,
+            "xy_std": 0.06,
+            "z_std": 0.04,
+            "r_safe": 0.06,
+            "bowl_height": 0.06,
+            "minimal_height": 0.07,
+            "command_name": "seq_goal",
+        },
+        weight=20.0,
+    )
     release_in_bowl = RewTerm(func=mdp.release_current_target_in_bowl, weight=30.0)
+    gripper_open_above_bowl_lure = RewTerm(
+        func=mdp.current_gripper_open_above_bowl_lure, weight=3.0,
+    )
+    still_grasped_above_bowl_penalty = RewTerm(
+        func=mdp.current_still_grasped_above_bowl_penalty, weight=-2.0,
+    )
     step_bonus = RewTerm(
         func=mdp.step_completion_bonus,
         params={"weight_per_step": (4.0, 4.0, 2.0)},
-        weight=1.0,
+        weight=0.0,
     )
-    wrong_in_bowl = RewTerm(func=mdp.wrong_cube_in_current_bowl, weight=-15.0)
+    # Diagnostic only: wrong-object-in-bowl gets no reward and no penalty.
+    # This avoids training against already-completed sub-goals in the
+    # sequential task while still logging the event.
+    wrong_in_bowl = RewTerm(func=mdp.wrong_cube_in_current_bowl, weight=0.0)
 
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(
@@ -373,7 +402,7 @@ class SeqPickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
-        # 15 s = 750 steps @ 50 Hz, enough for 3 sub-goals × 5 s each.
-        self.episode_length_s = 15.0
+        # 5 s = 250 steps @ 50 Hz, matching the single-shot Task-1/2 skill.
+        self.episode_length_s = 5.0
         self.viewer.eye = (2.5, 2.5, 1.5)
         _multicube_sim.apply_multicube_sim_settings(self)

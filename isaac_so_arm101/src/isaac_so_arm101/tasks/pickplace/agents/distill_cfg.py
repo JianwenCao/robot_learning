@@ -33,6 +33,7 @@ time, which happens when the gym task is loaded.
 """
 
 import rsl_rl.runners.distillation_runner as _distillation_runner
+from rsl_rl.algorithms import Distillation
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
@@ -42,6 +43,90 @@ from isaaclab_rl.rsl_rl import (
 )
 
 from .vision_student_teacher import PickPlaceVisionStudentTeacher
+
+
+class PickPlaceBCDistillation(Distillation):
+    """Distillation with selectable rollout policy.
+
+    ``rollout_policy="student"`` keeps RSL-RL's default DAgger-style
+    behavior: student actions step the env, teacher actions are labels.
+    ``rollout_policy="teacher"`` runs simple behavior cloning rollouts:
+    teacher actions step the env and the student regresses to those same
+    teacher actions.
+    """
+
+    def __init__(self, *args, rollout_policy: str = "student", **kwargs):
+        super().__init__(*args, **kwargs)
+        if rollout_policy not in {"student", "teacher"}:
+            raise ValueError(
+                f"rollout_policy={rollout_policy!r}; expected 'student' or 'teacher'"
+            )
+        self.rollout_policy = rollout_policy
+        self.cnn_input_dump_dir: str | None = None
+        self.cnn_input_dump_interval = 200
+        self.cnn_input_dump_max_envs = 4
+        self.cnn_input_dump_env = None
+        self._cnn_input_dump_step = 0
+
+    def _maybe_dump_cnn_inputs(self, obs) -> None:
+        if not self.cnn_input_dump_dir:
+            return
+        if self._cnn_input_dump_step % max(int(self.cnn_input_dump_interval), 1) != 0:
+            self._cnn_input_dump_step += 1
+            return
+        if "wrist_image" not in obs:
+            self._cnn_input_dump_step += 1
+            return
+
+        import os
+        import json
+        import cv2
+        import numpy as np
+
+        os.makedirs(self.cnn_input_dump_dir, exist_ok=True)
+        img = obs["wrist_image"].detach()
+        n = min(int(self.cnn_input_dump_max_envs), int(img.shape[0]))
+        for env_i in range(n):
+            frame = img[env_i]
+            if frame.shape[0] < 3:
+                continue
+            rgb = frame[:3].clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+            rgb_u8 = (rgb * 255.0).round().astype(np.uint8)
+            path = os.path.join(
+                self.cnn_input_dump_dir,
+                f"step_{self._cnn_input_dump_step:06d}_env_{env_i:03d}.png",
+            )
+            cv2.imwrite(path, cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2BGR))
+        env = self.cnn_input_dump_env
+        if env is not None:
+            meta_path = os.path.join(self.cnn_input_dump_dir, "metadata.jsonl")
+            record = {"step": int(self._cnn_input_dump_step), "envs": []}
+            for env_i in range(n):
+                item = {"env": int(env_i)}
+                for attr, key in (
+                    ("_vision_block_rgb", "cube_rgb"),
+                    ("_vision_table_rgb", "table_rgb"),
+                    ("_vision_background_rgb", "background_rgb"),
+                    ("_vision_robot_rgb", "robot_mean_rgb"),
+                ):
+                    value = getattr(env.unwrapped if hasattr(env, "unwrapped") else env, attr, None)
+                    if value is not None:
+                        item[key] = [float(x) for x in value[env_i].detach().cpu().tolist()]
+                record["envs"].append(item)
+            with open(meta_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        self._cnn_input_dump_step += 1
+
+    def act(self, obs):
+        self._maybe_dump_cnn_inputs(obs)
+        student_actions = self.policy.act(obs).detach()
+        teacher_actions = self.policy.evaluate(obs).detach()
+        self.transition.actions = (
+            teacher_actions if self.rollout_policy == "teacher" else student_actions
+        )
+        self.transition.privileged_actions = teacher_actions
+        self.transition.observations = obs
+        return self.transition.actions
 
 
 def _register_class() -> None:
@@ -55,9 +140,20 @@ def _register_class() -> None:
         PickPlaceVisionStudentTeacher.__name__,
         PickPlaceVisionStudentTeacher,
     )
+    setattr(
+        _distillation_runner,
+        PickPlaceBCDistillation.__name__,
+        PickPlaceBCDistillation,
+    )
 
 
 _register_class()
+
+
+@configclass
+class PickPlaceDistillationAlgorithmCfg(RslRlDistillationAlgorithmCfg):
+    class_name: str = "PickPlaceBCDistillation"
+    rollout_policy: str = "student"
 
 
 @configclass
@@ -96,12 +192,12 @@ class PickPlaceBowlDistillRunnerCfg(RslRlDistillationRunnerCfg):
     experiment_name = "pickplace_bowl_student"
     empirical_normalization = False
 
-    # Student reads deployable obs (proprio + image); teacher reads
-    # privileged state. ``policy + wrist_image`` matches the live env's
-    # actor obs group (see ObservationsCfg in pickplace_env_cfg.py).
+    # Student reads deployable obs (proprio + RGB image); teacher reads the
+    # same 27-D StateAprilTag policy vector used by the robust teacher
+    # checkpoint.
     obs_groups = {
         "policy": ["policy", "wrist_image"],
-        "teacher": ["policy", "critic"],
+        "teacher": ["state_apriltag_policy"],
     }
 
     # ------------------------------------------------------------------
@@ -126,7 +222,7 @@ class PickPlaceBowlDistillRunnerCfg(RslRlDistillationRunnerCfg):
     # ------------------------------------------------------------------
     # Algorithm (Distillation)
     # ------------------------------------------------------------------
-    algorithm = RslRlDistillationAlgorithmCfg(
+    algorithm = PickPlaceDistillationAlgorithmCfg(
         num_learning_epochs=5,
         learning_rate=1.0e-4,
         # gradient_length: number of env steps the gradient flows back

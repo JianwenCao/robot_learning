@@ -57,6 +57,63 @@ def object_position_in_robot_root_frame(
     return pos_b
 
 
+def body_position_in_robot_root_frame(
+    env: ManagerBasedRLEnv,
+    body_name: str,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Body xyz expressed in the robot root frame."""
+    robot: Articulation = env.scene[robot_cfg.name]
+    body_idx = robot.find_bodies(body_name)[0][0]
+    pos_w = robot.data.body_pos_w[:, body_idx, :3]
+    pos_b, _ = subtract_frame_transforms(
+        robot.data.root_state_w[:, :3], robot.data.root_state_w[:, 3:7], pos_w
+    )
+    return pos_b
+
+
+def gripper_frame_xyz(
+    env: ManagerBasedRLEnv,
+    body_name: str = "gripper_frame_link",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """URDF ``gripper_frame_link`` xyz in the robot root frame."""
+    return body_position_in_robot_root_frame(env, body_name, robot_cfg)
+
+
+def gripper_frame_to_cube_xyz(
+    env: ManagerBasedRLEnv,
+    body_name: str = "gripper_frame_link",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Vector from URDF ``gripper_frame_link`` to cube center, in robot frame."""
+    cube_b = object_position_in_robot_root_frame(env, robot_cfg, object_cfg)
+    grip_b = gripper_frame_xyz(env, body_name, robot_cfg)
+    return cube_b - grip_b
+
+
+def cube_pos_xyz_noisy(
+    env: ManagerBasedRLEnv,
+    sigma_m: float = 0.002,
+    dropout_p: float = 0.10,
+    corrupt: bool = True,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    grasp_distance: float = 0.04,
+    minimal_height: float = 0.025,
+) -> torch.Tensor:
+    """Deterministic cube xyz in robot frame.
+
+    The historical name is kept for checkpoint/config compatibility. The
+    xyz path intentionally applies no Gaussian noise, bias, dropout, or
+    post-grasp freeze.
+    """
+    del sigma_m, dropout_p, corrupt, ee_frame_cfg, grasp_distance, minimal_height
+    return object_position_in_robot_root_frame(env, robot_cfg, object_cfg)
+
+
 def cube_pos_xy_noisy(
     env: ManagerBasedRLEnv,
     sigma_m: float = 0.002,
@@ -68,56 +125,22 @@ def cube_pos_xy_noisy(
     grasp_distance: float = 0.04,
     minimal_height: float = 0.025,
 ) -> torch.Tensor:
-    """Noisy 2-D block position in robot frame — *deployable* surrogate for
-    AprilTag pose estimation.
-
-    Mirrors the real-side AprilTag pipeline: GT cube xy + per-episode bias
-    (sampled by :func:`mdp.events.reset_cube_pos_bias`, models hand-eye
-    calibration residual) + per-step zero-mean Gaussian (models tag-corner
-    localization noise) + dropout (models momentary occlusion / motion blur)
-    + post-grasp deterministic freeze (models the gripper occluding the tag
-    once it has the cube — last value held for the rest of the episode).
-
-    Buffer convention (all lazy-allocated, reset by
-    :func:`mdp.events.reset_cube_pos_bias`):
-
-    * ``env._cube_pos_bias`` ``(N, 2)`` — per-episode (Δx, Δy) bias.
-    * ``env._cube_pos_frozen`` ``(N,)`` bool — sticky latch, flips True the
-      first step the kinematic grasp predicate fires, stays True for the
-      rest of the episode.
-    * ``env._cube_pos_last`` ``(N, 2)`` — last value published. Seeded at
-      reset to the post-reset cube xy so first-step dropout returns a
-      sensible value (not zeros).
-
-    Args:
-        sigma_m: Per-step Gaussian σ (m). 2 mm matches realistic AprilTag
-            corner localization at 15 cm range with a 1280×720 wrist cam.
-        dropout_p: Per-step Bernoulli probability of holding the last value
-            instead of publishing a new one (pre-grasp only).
-        corrupt: Master toggle for noise / bias / dropout. ``False`` zeros
-            them all out (set by the play cfg via ``params={"corrupt": False}``)
-            but the post-grasp freeze still applies — that's a physical
-            occlusion, not corruption.
-        grasp_distance, minimal_height: Match the privileged ``is_grasped``
-            heuristic. Don't change without updating that too.
-    """
+    """Cube xy in robot frame, optionally with AprilTag-style corruption."""
     robot: Articulation = env.scene[robot_cfg.name]
     obj: RigidObject = env.scene[object_cfg.name]
 
-    # 1. Ground-truth cube xy in robot root frame.
     pos_w = obj.data.root_pos_w[:, :3]
     pos_b, _ = subtract_frame_transforms(
         robot.data.root_state_w[:, :3], robot.data.root_state_w[:, 3:7], pos_w
     )
     gt_xy = pos_b[:, :2]
+    if not corrupt:
+        return gt_xy
 
     n = env.num_envs
     device = env.device
-
-    # 2. Lazy-allocate buffers. Reset event seeds these properly; this is
-    #    the safety net for the very first call before any reset has run.
     bias = getattr(env, "_cube_pos_bias", None)
-    if bias is None or bias.shape[0] != n:
+    if bias is None or bias.shape[0] != n or bias.shape[1] != 2:
         bias = torch.zeros(n, 2, device=device)
         env._cube_pos_bias = bias
     frozen = getattr(env, "_cube_pos_frozen", None)
@@ -125,42 +148,26 @@ def cube_pos_xy_noisy(
         frozen = torch.zeros(n, dtype=torch.bool, device=device)
         env._cube_pos_frozen = frozen
     last = getattr(env, "_cube_pos_last", None)
-    if last is None or last.shape[0] != n:
+    if last is None or last.shape[0] != n or last.shape[1] != 2:
         last = gt_xy.clone()
         env._cube_pos_last = last
 
-    # 3. Apply per-step Gaussian + per-episode bias (only if corrupting).
-    if corrupt:
-        noisy_now = gt_xy + bias + torch.randn_like(gt_xy) * sigma_m
-    else:
-        noisy_now = gt_xy
+    noisy_now = gt_xy + bias + torch.randn_like(gt_xy) * sigma_m if corrupt else gt_xy
 
-    # 4. Kinematic grasp predicate — match :func:`is_grasped` exactly.
     ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
     ee_w = ee_frame.data.target_pos_w[..., 0, :]
     dist = torch.norm(pos_w - ee_w, dim=1)
     lifted = pos_w[:, 2] > minimal_height
     close = dist < grasp_distance
-    grasped_now = lifted & close  # (N,)
+    grasped_now = lifted & close
 
-    # 5. Decide what to publish this step. Hold last when frozen (post-grasp)
-    #    OR when a pre-grasp dropout fires.
-    if corrupt and dropout_p > 0.0:
-        dropout = torch.rand(n, device=device) < dropout_p
-    else:
-        dropout = torch.zeros(n, dtype=torch.bool, device=device)
+    dropout = torch.rand(n, device=device) < dropout_p if corrupt and dropout_p > 0.0 else torch.zeros(
+        n, dtype=torch.bool, device=device
+    )
     hold = frozen | dropout
     out = torch.where(hold.unsqueeze(-1), last, noisy_now)
-
-    # 6. Update buffers. ``_cube_pos_last`` only advances for envs that
-    #    actually published a new value (hold == False). ``_cube_pos_frozen``
-    #    is updated AFTER reading so the freeze takes effect from *next*
-    #    step — current step still publishes the in-flight detection,
-    #    mirroring "the tag is visible at the moment the gripper closes,
-    #    then occluded".
     env._cube_pos_last = torch.where(hold.unsqueeze(-1), last, noisy_now)
     env._cube_pos_frozen = frozen | grasped_now
-
     return out
 
 
@@ -218,6 +225,16 @@ def bowl_xyz(
 ) -> torch.Tensor:
     """Full (x, y, z) bowl goal in the robot frame."""
     return env.command_manager.get_command(command_name)[:, :3]
+
+
+def gripper_frame_to_bowl_xyz(
+    env: ManagerBasedRLEnv,
+    command_name: str = "bowl_pose",
+    body_name: str = "gripper_frame_link",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Backward-compatible target vector from gripper frame to bowl target xyz."""
+    return bowl_xyz(env, command_name) - gripper_frame_xyz(env, body_name, robot_cfg)
 
 
 def ee_to_bowl_xy(
@@ -324,6 +341,8 @@ def is_grasped(
 #  parents[5] isaac_so_arm101/         (outer extension dir)
 #  parents[6] project3/                (project root — has camera_intrinsics.yaml)
 _PROJECT_ROOT = Path(__file__).resolve().parents[6]
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[7]
+_EVA_FOLLOWER_ROOT = _WORKSPACE_ROOT / "eva_follower"
 
 
 def load_wrist_cam_intrinsics(
@@ -367,7 +386,8 @@ def load_wrist_cam_intrinsics(
         coefficients so real frames match the perfect-pinhole sim render.
     """
     if yaml_path is None:
-        yaml_path = _PROJECT_ROOT / "camera_intrinsics.yaml"
+        eva_intrinsics = _EVA_FOLLOWER_ROOT / "intrinsics.yaml"
+        yaml_path = eva_intrinsics if eva_intrinsics.exists() else _PROJECT_ROOT / "camera_intrinsics.yaml"
     yaml_path = Path(yaml_path)
     if not yaml_path.exists():
         raise FileNotFoundError(
@@ -529,6 +549,37 @@ def wrist_rgb(
     """
     cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
     return _normalize_rgb(cam.data.output["rgb"])
+
+
+def wrist_rgb_dr(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_cam"),
+    corrupt: bool = True,
+    rgb_brightness_jitter: float = 0.12,
+    rgb_noise_std: float = 4.0 / 255.0,
+) -> torch.Tensor:
+    """RGB-only wrist-camera observation for the lightweight vision student.
+
+    Returns ``(N, 3, H, W)`` floats in ``[0, 1]``. The observation never
+    exposes depth or a mask. Visual randomization is applied at USD
+    material/light level in :func:`mdp.events.randomize_vision_rgb_dr`;
+    this function only normalizes the rendered RGB image.
+    """
+    cam: TiledCamera = env.scene.sensors[sensor_cfg.name]
+    out = cam.data.output
+    rgb = _normalize_rgb(out["rgb"])
+
+    hsv_dr = getattr(env, "_wrist_hsv_dr", None)
+    if hsv_dr is not None:
+        rgb = apply_color_jitter(rgb, hsv_dr[:, 0], hsv_dr[:, 1], hsv_dr[:, 2])
+
+    if corrupt and rgb_brightness_jitter > 0.0:
+        n = rgb.shape[0]
+        scale = 1.0 + (torch.rand(n, 1, 1, 1, device=rgb.device) * 2 - 1) * rgb_brightness_jitter
+        rgb = (rgb * scale).clamp_(0.0, 1.0)
+    if corrupt and rgb_noise_std > 0.0:
+        rgb = (rgb + torch.randn_like(rgb) * rgb_noise_std).clamp_(0.0, 1.0)
+    return rgb.clamp_(0.0, 1.0)
 
 
 def wrist_image(

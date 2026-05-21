@@ -1,0 +1,228 @@
+{
+  "created_wall_time": 1779322193.8097317,
+  "board": {
+    "squares_x": 5,
+    "squares_y": 7,
+    "square_length_m": 0.0285,
+    "marker_length_m": 0.017,
+    "dictionary": "DICT_5X5_50"
+  },
+  "samples": [
+    {
+      "index": 0,
+      "path": "deploy/charuco_calib_session/accepted/charuco_003_1779322055003.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 0.6234162561367129
+    },
+    {
+      "index": 1,
+      "path": "deploy/charuco_calib_session/accepted/charuco_004_1779322055851.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.9450850271955072
+    },
+    {
+      "index": 2,
+      "path": "deploy/charuco_calib_session/accepted/charuco_005_1779322056704.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.598621665257499
+    },
+    {
+      "index": 3,
+      "path": "deploy/charuco_calib_session/accepted/charuco_006_1779322057543.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5274713131911093
+    },
+    {
+      "index": 4,
+      "path": "deploy/charuco_calib_session/accepted/charuco_007_1779322058360.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5435662169589837
+    },
+    {
+      "index": 5,
+      "path": "deploy/charuco_calib_session/accepted/charuco_008_1779322059208.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6384728775961445
+    },
+    {
+      "index": 6,
+      "path": "deploy/charuco_calib_session/accepted/charuco_010_1779322060832.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5365260239345042
+    },
+    {
+      "index": 7,
+      "path": "deploy/charuco_calib_session/accepted/charuco_012_1779322062461.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8423409162766688
+    },
+    {
+      "index": 8,
+      "path": "deploy/charuco_calib_session/accepted/charuco_013_1779322065277.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.6974781630381708
+    },
+    {
+      "index": 9,
+      "path": "deploy/charuco_calib_session/accepted/charuco_014_1779322067142.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.6166961035702843
+    },
+    {
+      "index": 10,
+      "path": "deploy/charuco_calib_session/accepted/charuco_015_1779322067952.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6456637165135471
+    },
+    {
+      "index": 11,
+      "path": "deploy/charuco_calib_session/accepted/charuco_017_1779322069884.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6731751681542922
+    },
+    {
+      "index": 12,
+      "path": "deploy/charuco_calib_session/accepted/charuco_018_1779322070968.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.662922515690399
+    },
+    {
+      "index": 13,
+      "path": "deploy/charuco_calib_session/accepted/charuco_019_1779322071784.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6524461243628101
+    },
+    {
+      "index": 14,
+      "path": "deploy/charuco_calib_session/accepted/charuco_020_1779322072597.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6454891988660619
+    },
+    {
+      "index": 15,
+      "path": "deploy/charuco_calib_session/accepted/charuco_022_1779322074292.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6661877725738796
+    },
+    {
+      "index": 16,
+      "path": "deploy/charuco_calib_session/accepted/charuco_023_1779322075105.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.6730112700373369
+    },
+    {
+      "index": 17,
+      "path": "deploy/charuco_calib_session/accepted/charuco_024_1779322075952.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6869022116752866
+    },
+    {
+      "index": 18,
+      "path": "deploy/charuco_calib_session/accepted/charuco_025_1779322076801.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6151948839880476
+    },
+    {
+      "index": 19,
+      "path": "deploy/charuco_calib_session/accepted/charuco_026_1779322077647.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.744911783056691
+    },
+    {
+      "index": 20,
+      "path": "deploy/charuco_calib_session/accepted/charuco_027_1779322078461.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.9092611329757948
+    },
+    {
+      "index": 21,
+      "path": "deploy/charuco_calib_session/accepted/charuco_028_1779322079277.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5544713565509344
+    },
+    {
+      "index": 22,
+      "path": "deploy/charuco_calib_session/accepted/charuco_029_1779322080091.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7985891235436339
+    },
+    {
+      "index": 23,
+      "path": "deploy/charuco_calib_session/accepted/charuco_030_1779322080901.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.9210509149098707
+    },
+    {
+      "index": 24,
+      "path": "deploy/charuco_calib_session/accepted/charuco_032_1779322083172.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.7452794540809635
+    },
+    {
+      "index": 25,
+      "path": "deploy/charuco_calib_session/accepted/charuco_033_1779322084020.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8147981677431099
+    },
+    {
+      "index": 26,
+      "path": "deploy/charuco_calib_session/accepted/charuco_034_1779322084831.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.784205717648658
+    }
+  ]
+}

@@ -43,20 +43,20 @@ Eval-1 skeleton + two clutter terms (`mdp/rewards.py`):
 | `release_in_bowl` | 30.0 | target near bowl ∧ `z < BOWL_RIM_Z` (= 0.06 m) ∧ gripper open ∧ settled, gated on lift (z ≥ 0.07 m) + over-bowl-above-rim (z ≥ 0.12 m within 6 cm xy) latches — see Eval-1 §4 |
 | `gripper_open_above_bowl_lure` | +3.0 | target-aware port of Eval-1's lure: target currently over bowl and above release height ∧ `action[5] > 0` |
 | `still_grasped_above_bowl_penalty` | −2.0 | target-aware port of Eval-1's anti-smash: target lifted ∧ near bowl ∧ gripper closed |
-| `distractor_disturb` | −0.5 | continuous, proportional to distractor speed once `> 0.05 m/s` |
-| `wrong_block_in_bowl` | **0 → −5** (20 k env-step ramp) | distractor settled in bowl |
+| `distractor_disturb` | 0.0 | diagnostic only; continuous signal when distractor speed is `> 0.05 m/s` |
+| `wrong_block_in_bowl` | 0.0 | diagnostic only; distractor settled in bowl |
 | `action_rate`, `joint_vel` | −1e-4 → −1e-1 | 10 k env-step ramp, matched to Eval-1 |
 
 γ = 0.98.
 
-**Anti-hover / anti-smash terms + `wrong_block_in_bowl` ramp (2026-05-20 fix).** Two consecutive runs (`08-41-24`, `09-00-17`) of the pre-fix recipe stalled in a "reach-and-camp" basin: reach saturated near 0.7/step but `lifting_object = 0` for the entire 408-iter run, while `wrong_block_in_bowl` ramped to −1.06 weighted/episode (the distractor was drifting into the bowl during random exploration and the −5 fired before the policy had learned to discriminate "what I did" vs "ambient drift"). The current recipe ports Eval-1's latest release shaping target-keyed: EE-high-over-bowl reward stays active after release, open lure pays only when the target is currently high over the bowl, and closed-gripper penalty (w=−2) applies throughout the near-bowl zone to suppress low pressing. `wrong_block_in_bowl` still ramps 0 → −5 over 20 k env-steps so reach+lift consolidate before the distractor penalty turns on. 20 k > the 10 k action-rate ramp so the policy has cleared all reward shaping consolidation before the wrong-block penalty becomes load-bearing.
+**Anti-hover / anti-smash terms; wrong-cube terms are diagnostics only (2026-05-20 fix).** Two consecutive runs (`08-41-24`, `09-00-17`) of the pre-fix recipe stalled in a "reach-and-camp" basin: reach saturated near 0.7/step but `lifting_object = 0` for the entire 408-iter run, while `wrong_block_in_bowl` ramped to −1.06 weighted/episode (the distractor was drifting into the bowl during random exploration and the −5 fired before the policy had learned to discriminate "what I did" vs "ambient drift"). The current recipe ports Eval-1's latest release shaping target-keyed: EE-high-over-bowl reward stays active after release, open lure pays only when the target is currently high over the bowl, and closed-gripper penalty (w=−2) applies throughout the near-bowl zone to suppress low pressing. `distractor_disturb` and `wrong_block_in_bowl` are logged at zero weight: a wrong cube gets no reward and no penalty.
 
 ## 4. Curriculum & DR
 
 - `place_clutter_blocks` per §1 (static `min_block_separation = 0.12 m`, rejection-sampled).
 - `reset_cube_positions_bias`: per-episode shared hand-eye bias U[−5, +5] mm + per-cube tape offset U[−2, +2] mm on `target_cube_pos_xy_noisy`; clears the post-grasp freeze latch.
 - `reset_target_latches`: clears per-episode lift / over-bowl / success latches.
-- Action-rate / joint-vel ramp at 10 k env-steps; `wrong_block_in_bowl` ramp 0 → −5 at 20 k env-steps (see §3).
+- Action-rate / joint-vel ramp at 10 k env-steps; `wrong_block_in_bowl` remains zero-weight diagnostic only (see §3).
 - `log_target_success_metrics` TB metric (TC.success rate + sub-rates).
 
 No image DR. Tightening curriculum (`min_block_separation: 0.12 → 0.08 m` over 20 k env-steps) is available as a one-line `events.py` change if the policy needs harder distributions; do not drop below 0.08 m without a corresponding reward-shaping pass — the SO-ARM gripper geometry constrains how close the distractor can be without contact during the approach.

@@ -292,11 +292,13 @@ def reset_cube_pos_bias(
     device = env.device
 
     # Lazy-allocate. Same buffer layout as cube_pos_xy_noisy expects.
-    if not hasattr(env, "_cube_pos_bias"):
+    bias = getattr(env, "_cube_pos_bias", None)
+    if bias is None or bias.shape[0] != n_envs or bias.shape[1] != 2:
         env._cube_pos_bias = torch.zeros(n_envs, 2, device=device)
     if not hasattr(env, "_cube_pos_frozen"):
         env._cube_pos_frozen = torch.zeros(n_envs, dtype=torch.bool, device=device)
-    if not hasattr(env, "_cube_pos_last"):
+    last = getattr(env, "_cube_pos_last", None)
+    if last is None or last.shape[0] != n_envs or last.shape[1] != 2:
         env._cube_pos_last = torch.zeros(n_envs, 2, device=device)
 
     if isinstance(env_ids, torch.Tensor):
@@ -439,6 +441,330 @@ def randomize_wrist_image_tint(
     env._wrist_image_dr[env_ids] = new
 
 
+VISION_BLOCK_COLORS = {
+    "orange": (1.0, 0.45, 0.05),
+    "red": (0.90, 0.05, 0.05),
+    "purple": (0.50, 0.20, 0.85),
+    "green": (0.10, 0.65, 0.18),
+    "blue": (0.08, 0.25, 0.90),
+    "yellow": (1.0, 0.85, 0.05),
+}
+
+
+ROBOT_PART_COLORS = (
+    (0.92, 0.92, 0.86),  # warm white
+    (0.12, 0.12, 0.12),  # black
+    (0.38, 0.40, 0.42),  # dark gray
+    (0.72, 0.72, 0.68),  # light gray
+    (0.00, 0.62, 0.72),  # cyan/teal
+    (0.92, 0.35, 0.68),  # pink
+    (0.58, 0.92, 0.95),  # pale cyan
+)
+
+
+def _material_path(prefix: str, prim_path: str) -> str:
+    safe = prim_path.strip("/").replace("/", "_").replace("{", "_").replace("}", "_").replace(":", "_")
+    return f"/World/Looks/{prefix}_{safe}"
+
+
+def _bind_preview_surface_material(
+    env: ManagerBasedEnv,
+    prim,
+    mat_path: str,
+    rgb: tuple[float, float, float],
+    roughness: float,
+    metallic: float = 0.0,
+) -> None:
+    try:
+        from pxr import Gf, Sdf, UsdShade
+    except ImportError:
+        return
+
+    color = Gf.Vec3f(float(rgb[0]), float(rgb[1]), float(rgb[2]))
+    material = UsdShade.Material.Define(env.scene.stage, mat_path)
+    shader = UsdShade.Shader.Define(env.scene.stage, f"{mat_path}/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(color)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(metallic))
+    shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+    try:
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    except TypeError:
+        material.CreateSurfaceOutput().ConnectToSource(shader, "surface")
+    binding_api = UsdShade.MaterialBindingAPI(prim)
+    try:
+        binding_api.Bind(material, bindingStrength=UsdShade.Tokens.strongerThanDescendants)
+    except TypeError:
+        try:
+            binding_api.Bind(material, UsdShade.Tokens.strongerThanDescendants)
+        except TypeError:
+            binding_api.Bind(material)
+
+
+def _set_prim_material(
+    env: ManagerBasedEnv,
+    prim_path: str,
+    rgb: tuple[float, float, float],
+    roughness: float | None = None,
+    metallic: float | None = None,
+) -> None:
+    """Set preview-surface material properties for a prim subtree on the USD stage."""
+    try:
+        from pxr import Gf, UsdShade
+    except ImportError:
+        return
+
+    root_prim = env.scene.stage.GetPrimAtPath(prim_path)
+    if not root_prim.IsValid():
+        return
+
+    color = Gf.Vec3f(float(rgb[0]), float(rgb[1]), float(rgb[2]))
+    visited: set[str] = set()
+    _bind_preview_surface_material(
+        env,
+        root_prim,
+        _material_path("vision_dr_root", str(root_prim.GetPath())),
+        rgb,
+        roughness=0.5 if roughness is None else roughness,
+        metallic=0.0 if metallic is None else metallic,
+    )
+
+    def set_material_inputs(material_prim) -> None:
+        if not material_prim or not material_prim.IsValid():
+            return
+        for child in material_prim.GetChildren():
+            shader = UsdShade.Shader(child)
+            if not shader:
+                continue
+            for name in ("diffuseColor", "diffuse_color"):
+                inp = shader.GetInput(name)
+                if inp:
+                    inp.Set(color)
+            if roughness is not None:
+                inp = shader.GetInput("roughness")
+                if inp:
+                    inp.Set(float(roughness))
+            if metallic is not None:
+                inp = shader.GetInput("metallic")
+                if inp:
+                    inp.Set(float(metallic))
+
+    for prim in [root_prim, *list(root_prim.GetAllChildren())]:
+        type_name = prim.GetTypeName()
+        if type_name in {"Mesh", "Cube", "Sphere", "Capsule", "Cylinder"}:
+            _bind_preview_surface_material(
+                env,
+                prim,
+                _material_path("vision_dr", str(prim.GetPath())),
+                rgb,
+                roughness=0.5 if roughness is None else roughness,
+                metallic=0.0 if metallic is None else metallic,
+            )
+
+        binding = UsdShade.MaterialBindingAPI(prim)
+        material, _ = binding.ComputeBoundMaterial()
+        if material:
+            mat_path = str(material.GetPath())
+            if mat_path not in visited:
+                visited.add(mat_path)
+                set_material_inputs(material.GetPrim())
+
+        for name in ("inputs:diffuseColor", "inputs:diffuse_color", "diffuse_color"):
+            attr = prim.GetAttribute(name)
+            if attr:
+                attr.Set(color)
+        if roughness is not None:
+            for name in ("inputs:roughness", "roughness"):
+                attr = prim.GetAttribute(name)
+                if attr:
+                    attr.Set(float(roughness))
+        if metallic is not None:
+            for name in ("inputs:metallic", "metallic"):
+                attr = prim.GetAttribute(name)
+                if attr:
+                    attr.Set(float(metallic))
+
+
+def _set_prim_diffuse_color(env: ManagerBasedEnv, prim_path: str, rgb: tuple[float, float, float]) -> None:
+    _set_prim_material(env, prim_path, rgb)
+
+
+def _set_table_diffuse_color(env: ManagerBasedEnv, env_id: int, rgb: tuple[float, float, float]) -> None:
+    """Set the per-env table material color on the USD stage."""
+    _set_prim_material(env, f"{env.scene.env_prim_paths[int(env_id)]}/Table", rgb, roughness=0.65, metallic=0.0)
+
+
+def _set_cube_material(
+    env: ManagerBasedEnv,
+    env_id: int,
+    rgb: tuple[float, float, float],
+    roughness: float,
+) -> None:
+    _set_prim_material(env, f"{env.scene.env_prim_paths[int(env_id)]}/Object", rgb, roughness=roughness, metallic=0.0)
+
+
+def _color_luma(rgb: torch.Tensor) -> torch.Tensor:
+    weights = torch.tensor([0.2126, 0.7152, 0.0722], device=rgb.device, dtype=rgb.dtype)
+    return rgb @ weights
+
+
+def _sample_robot_part_color(
+    device: torch.device,
+    cube_rgb: torch.Tensor,
+    table_rgb: torch.Tensor,
+    background_rgb: torch.Tensor,
+) -> torch.Tensor:
+    palette = torch.tensor(ROBOT_PART_COLORS, device=device)
+    for _ in range(20):
+        idx = torch.randint(0, palette.shape[0], (1,), device=device)
+        color = (palette[idx][0] + (torch.rand(3, device=device) * 2.0 - 1.0) * 0.06).clamp(0.02, 0.98)
+        if torch.linalg.vector_norm(color - cube_rgb).item() < 0.35:
+            continue
+        luma = _color_luma(color)
+        if abs((luma - _color_luma(table_rgb)).item()) < 0.16:
+            continue
+        if abs((luma - _color_luma(background_rgb)).item()) < 0.16:
+            continue
+        return color
+    return torch.tensor((0.12, 0.12, 0.12), device=device)
+
+
+def _set_robot_materials(
+    env: ManagerBasedEnv,
+    env_id: int,
+    cube_rgb: torch.Tensor,
+    table_rgb: torch.Tensor,
+    background_rgb: torch.Tensor,
+    roughness_range: tuple[float, float],
+) -> torch.Tensor:
+    robot_path = f"{env.scene.env_prim_paths[int(env_id)]}/Robot"
+    robot_prim = env.scene.stage.GetPrimAtPath(robot_path)
+    if not robot_prim.IsValid():
+        return torch.tensor((0.0, 0.0, 0.0), device=env.device)
+    geom_prims = [
+        prim
+        for prim in robot_prim.GetAllChildren()
+        if prim.GetTypeName() in {"Mesh", "Cube", "Sphere", "Capsule", "Cylinder"}
+    ]
+    if not geom_prims:
+        geom_prims = [robot_prim]
+    colors = []
+    for part_i, prim in enumerate(geom_prims):
+        color = _sample_robot_part_color(env.device, cube_rgb, table_rgb, background_rgb)
+        colors.append(color)
+        roughness = torch.empty((), device=env.device).uniform_(*roughness_range).item()
+        _bind_preview_surface_material(
+            env,
+            prim,
+            f"/World/Looks/vision_dr_env_{int(env_id)}_robot_part_{part_i:03d}",
+            tuple(float(x) for x in color.detach().cpu().tolist()),
+            roughness=float(roughness),
+            metallic=0.0,
+        )
+    return torch.stack(colors, dim=0).mean(dim=0)
+
+
+def _set_dome_light_color(env: ManagerBasedEnv, rgb: tuple[float, float, float]) -> None:
+    try:
+        from pxr import Gf
+    except ImportError:
+        return
+    light_prim = env.scene.stage.GetPrimAtPath("/World/light")
+    if not light_prim.IsValid():
+        return
+    color_attr = light_prim.GetAttribute("inputs:color")
+    if color_attr:
+        color_attr.Set(Gf.Vec3f(float(rgb[0]), float(rgb[1]), float(rgb[2])))
+
+
+def randomize_vision_rgb_dr(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    block_jitter: float = 0.08,
+    table_base_rgb: tuple[float, float, float] = (0.561, 0.522, 0.502),
+    table_jitter: float = 0.22,
+    background_min_rgb: tuple[float, float, float] = (0.04, 0.04, 0.04),
+    background_max_rgb: tuple[float, float, float] = (0.95, 0.95, 0.95),
+    min_table_bg_luma_gap: float = 0.22,
+    cube_roughness_range: tuple[float, float] = (0.28, 0.65),
+    robot_roughness_range: tuple[float, float] = (0.45, 0.85),
+) -> None:
+    """Sample per-episode RGB-only visual DR for the vision student.
+
+    The cube is sampled from the requested six-color palette
+    ``[orange, red, purple, green, blue, yellow]`` plus a small per-channel
+    jitter and applied to the actual cube material. The table keeps its
+    mean but uses a wide material jitter. The robot receives a muted color
+    jitter. The global ground plane / dome light are sampled over a broad
+    range, then adjusted to keep a minimum luminance gap from every table
+    color in this reset batch.
+    """
+    if not hasattr(env, "_vision_block_rgb"):
+        env._vision_block_rgb = torch.ones(env.num_envs, 3, device=env.device)
+    if not hasattr(env, "_vision_table_rgb"):
+        env._vision_table_rgb = torch.tensor(table_base_rgb, device=env.device).repeat(env.num_envs, 1)
+    if not hasattr(env, "_vision_background_rgb"):
+        env._vision_background_rgb = torch.zeros(env.num_envs, 3, device=env.device)
+    if not hasattr(env, "_vision_robot_rgb"):
+        env._vision_robot_rgb = torch.zeros(env.num_envs, 3, device=env.device)
+
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+    elif len(env_ids) == 0:
+        return
+
+    n = env_ids.numel() if isinstance(env_ids, torch.Tensor) else len(env_ids)
+    palette = torch.tensor(list(VISION_BLOCK_COLORS.values()), device=env.device)
+    idx = torch.randint(0, palette.shape[0], (n,), device=env.device)
+    block = palette[idx]
+    block = (block + (torch.rand((n, 3), device=env.device) * 2.0 - 1.0) * block_jitter).clamp(0.0, 1.0)
+    cube_roughness = torch.empty(n, device=env.device).uniform_(*cube_roughness_range)
+
+    table_base = torch.tensor(table_base_rgb, device=env.device).view(1, 3)
+    table = (table_base + (torch.rand((n, 3), device=env.device) * 2.0 - 1.0) * table_jitter).clamp(0.15, 0.85)
+
+    bg_min = torch.tensor(background_min_rgb, device=env.device).view(1, 3)
+    bg_max = torch.tensor(background_max_rgb, device=env.device).view(1, 3)
+    background = bg_min + torch.rand((1, 3), device=env.device) * (bg_max - bg_min)
+    luma_weights = torch.tensor([0.2126, 0.7152, 0.0722], device=env.device)
+    table_luma = table @ luma_weights
+    bg_luma = (background[0] @ luma_weights).item()
+    min_gap = torch.min(torch.abs(table_luma - bg_luma)).item()
+    if min_gap < min_table_bg_luma_gap:
+        table_mid = torch.mean(table_luma).item()
+        target_luma = 0.08 if table_mid > 0.50 else 0.92
+        tint = 0.85 + 0.30 * torch.rand((1, 3), device=env.device)
+        background = (torch.full((1, 3), target_luma, device=env.device) * tint).clamp(
+            bg_min.min().item(), bg_max.max().item()
+        )
+
+    env._vision_block_rgb[env_ids] = block
+    env._vision_table_rgb[env_ids] = table
+    env._vision_background_rgb[env_ids] = background.expand(n, 3)
+    env_id_list = env_ids.detach().cpu().tolist() if isinstance(env_ids, torch.Tensor) else list(env_ids)
+    for i, env_id in enumerate(env_id_list):
+        _set_table_diffuse_color(env, int(env_id), tuple(float(x) for x in table[i].detach().cpu().tolist()))
+        _set_cube_material(
+            env,
+            int(env_id),
+            tuple(float(x) for x in block[i].detach().cpu().tolist()),
+            float(cube_roughness[i].item()),
+        )
+        env._vision_robot_rgb[int(env_id)] = _set_robot_materials(
+            env,
+            int(env_id),
+            block[i],
+            table[i],
+            background[0],
+            robot_roughness_range,
+        )
+    bg_rgb = tuple(float(x) for x in background[0].clamp_(0.0, 1.0).detach().cpu().tolist())
+    _set_prim_diffuse_color(env, "/World/GroundPlane", bg_rgb)
+    _set_dome_light_color(env, bg_rgb)
+
+
 def randomize_camera_uniform(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
@@ -472,13 +798,22 @@ def randomize_camera_uniform(
     """
     asset: Camera = env.scene[asset_cfg.name]
 
-    ori_pos_w = asset.data.pos_w[env_ids]
+    if not hasattr(asset, "_default_pos_w_for_dr"):
+        asset._default_pos_w_for_dr = asset.data.pos_w.clone()
+        if convention == "ros":
+            asset._default_quat_w_for_dr = asset.data.quat_w_ros.clone()
+        elif convention == "opengl":
+            asset._default_quat_w_for_dr = asset.data.quat_w_opengl.clone()
+        elif convention == "world":
+            asset._default_quat_w_for_dr = asset.data.quat_w_world.clone()
+
+    ori_pos_w = asset._default_pos_w_for_dr[env_ids]
     if convention == "ros":
-        ori_quat_w = asset.data.quat_w_ros[env_ids]
+        ori_quat_w = asset._default_quat_w_for_dr[env_ids]
     elif convention == "opengl":
-        ori_quat_w = asset.data.quat_w_opengl[env_ids]
+        ori_quat_w = asset._default_quat_w_for_dr[env_ids]
     elif convention == "world":
-        ori_quat_w = asset.data.quat_w_world[env_ids]
+        ori_quat_w = asset._default_quat_w_for_dr[env_ids]
     else:
         raise ValueError(f"Unknown camera convention: {convention!r}")
 

@@ -48,10 +48,13 @@ HIDDEN_PARK_XY: tuple[tuple[float, float], ...] = tuple(
     (-0.60, -0.25 + 0.10 * i) for i in range(NUM_COLORS)
 )
 
-# Eval-3 task constants
+# Eval-3 training task constants. The training MDP is a single-target
+# pick-place skill in variable clutter (2/3/4 active cubes). Deployment
+# sequences this skill externally by re-keying the target tag after each
+# successful release.
 N_ACTIVE_BLOCKS = 4
-N_GOAL_STEPS = 3
-N_BOWLS = 1  # Single bowl per rollout; all 3 sequential placements target it.
+N_GOAL_STEPS = 1
+N_BOWLS = 1  # Single bowl per rollout.
 
 
 # ---------------------------------------------------------------------------
@@ -67,13 +70,14 @@ def place_seq_blocks(
     min_block_separation: float = 0.12,
     table_z: float = 0.01,
     max_attempts: int = 80,
+    active_count_choices: tuple[int, ...] = (2, 3, 4),
     bowl_x: tuple[float, float] = (0.15, 0.28),
     bowl_y: tuple[float, float] = (-0.12, 0.12),
     min_bowl_block_separation: float = 0.10,
     command_name: str = "seq_goal",
     cube_prefix: str = "cube_",
 ) -> None:
-    """Sample the full per-episode schedule, then place 4 cubes spread + 1 bowl.
+    """Sample one target in variable clutter, then place 2/3/4 cubes + 1 bowl.
 
     Per-episode sampling is done here (not in
     :class:`SequentialGoalCommand`) because Isaac Lab's reset pipeline
@@ -81,18 +85,19 @@ def place_seq_blocks(
     a passive view onto the env buffers we write here:
 
     * ``env._seq_active_indices``    ``(N, 4)`` long — palette indices of
-      the 4 active cubes per env.
-    * ``env._seq_goal_color_pos``    ``(N, 3)`` long ∈ [0, 4) — for each
-      of the 3 steps, which slot inside ``active_indices`` is the target.
+      up to 4 active cubes per env.
+    * ``env._seq_active_count``      ``(N,)`` long ∈ {2, 3, 4}; slots at
+      index >= active_count are parked off-table and ignored by masks.
+    * ``env._seq_goal_color_pos``    ``(N, 1)`` long ∈ [0, active_count)
+      — the target slot inside ``active_indices``.
     * ``env._seq_bowl_positions``    ``(N, 1, 2)`` float — bowl xy in
       robot frame, rejection-sampled against the 4 placed cubes
-      (≥ ``min_bowl_block_separation``). All 3 sequential cube placements
-      target this single bowl.
-    * ``env._target_cube_idx_per_step`` ``(N, 3)`` long — derived
+      (≥ ``min_bowl_block_separation``).
+    * ``env._target_cube_idx_per_step`` ``(N, 1)`` long — derived
       ``active[step_color_pos[step]]`` per step, cached for hot-path
       reward access.
 
-    Cube placement: 4 cubes placed independently in the workspace
+    Cube placement: active cubes placed independently in the workspace
     with sequential rejection sampling — each new cube must be ≥
     ``min_block_separation`` from all previously-placed cubes. Default
     8 cm gives ~6 cm edge gap for 2 cm cubes — wider than the SO-ARM
@@ -114,19 +119,18 @@ def place_seq_blocks(
     device = env.device
 
     # -----------------------------------------------------------------
-    # Sample active cubes + 3-step schedule + bowl positions.
+    # Sample active cubes + single target + bowl positions.
     # -----------------------------------------------------------------
-    # 4 distinct palette indices.
+    choices = torch.tensor(active_count_choices, device=device, dtype=torch.long)
+    active_count = choices[torch.randint(0, choices.numel(), (n,), device=device)]
+
+    # Up to 4 distinct palette indices. Only slots < active_count are
+    # placed on the table; later slots stay parked.
     perms = torch.argsort(torch.rand((n, NUM_COLORS), device=device), dim=1)
     active = perms[:, :N_ACTIVE_BLOCKS]  # (n, 4)
 
-    # 3-step goal sequence: which slot-in-active is the target at each step.
-    # **Distinct** across the 3 steps — once a block is placed in the bowl
-    # it can't be re-picked, so targeting the same color twice in a row
-    # would be ill-defined. Sample a random permutation of the 4 active
-    # slots, take the first 3.
-    slot_perms = torch.argsort(torch.rand((n, N_ACTIVE_BLOCKS), device=device), dim=1)
-    goal_color_pos = slot_perms[:, :N_GOAL_STEPS]  # (n, 3) distinct in [0, 4)
+    # Single target slot, uniformly sampled among actually active cubes.
+    goal_color_pos = torch.floor(torch.rand((n, 1), device=device) * active_count.view(-1, 1)).long()
 
     # Single bowl per rollout — buffer kept ``(N, N_BOWLS=1, 2)`` for
     # uniformity with the existing observation/reward plumbing.
@@ -136,12 +140,14 @@ def place_seq_blocks(
     # __init__; lazy-init here as a safety net).
     for buf_name, default in (
         ("_seq_active_indices", torch.zeros((env.num_envs, N_ACTIVE_BLOCKS), dtype=torch.long, device=device)),
+        ("_seq_active_count", torch.full((env.num_envs,), N_ACTIVE_BLOCKS, dtype=torch.long, device=device)),
         ("_seq_goal_color_pos", torch.zeros((env.num_envs, N_GOAL_STEPS), dtype=torch.long, device=device)),
         ("_seq_bowl_positions", torch.zeros((env.num_envs, N_BOWLS, 2), dtype=torch.float32, device=device)),
     ):
         if not hasattr(env, buf_name):
             setattr(env, buf_name, default)
     env._seq_active_indices[env_ids_t] = active
+    env._seq_active_count[env_ids_t] = active_count
     env._seq_goal_color_pos[env_ids_t] = goal_color_pos
     # NOTE: ``_seq_bowl_positions`` is written below, AFTER bowl sampling
     # (which depends on the cube layout sampled in this function).
@@ -167,7 +173,7 @@ def place_seq_blocks(
     env._seq_bowl_positions[env_ids_t] = bowl_positions
 
     # -----------------------------------------------------------------
-    # Step 2: rejection-sampled spread layout for the 4 active cubes,
+    # Step 2: rejection-sampled spread layout for up to 4 active cubes,
     # checking each new cube against (a) all previously-placed cubes
     # (≥ ``min_block_separation``) AND (b) the bowl
     # (≥ ``min_bowl_block_separation``). Cubes thus always spawn
@@ -195,13 +201,14 @@ def place_seq_blocks(
             d_bowl = torch.norm(cand.unsqueeze(1) - bowl_positions, dim=2)
             ok_bowl = d_bowl.min(dim=1).values >= min_bowl_block_separation
             # vs previously-placed cubes
+            slot_active = slot < active_count
             if slot == 0:
                 ok_blk = torch.ones(n, dtype=torch.bool, device=device)
             else:
                 placed = pair_local_xy[:, :slot, :]
                 d_blk = torch.norm(cand.unsqueeze(1) - placed, dim=2)
                 ok_blk = d_blk.min(dim=1).values >= min_block_separation
-            ok = ok_bowl & ok_blk
+            ok = (ok_bowl & ok_blk) | (~slot_active)
             good = good | (need & ok)
         pair_local_xy[:, slot] = cand
 
@@ -214,7 +221,7 @@ def place_seq_blocks(
         # Is this cube active in this env? Find its slot (or None).
         # active is (n, 4); we want the slot index in [0, 4) where this k appears.
         slot_mask = (active == k)  # (n, 4) bool
-        is_active = slot_mask.any(dim=1)
+        slot_is_present = slot_mask.any(dim=1)
         # slot_idx: 0..3 for active envs, anything for inactive (we'll
         # gate writes below)
         slot_idx = slot_mask.float().argmax(dim=1)  # (n,) long-ish
@@ -223,10 +230,12 @@ def place_seq_blocks(
         park_x, park_y = HIDDEN_PARK_XY[k]
         target_xy[:, 0] = park_x
         target_xy[:, 1] = park_y
-        if is_active.any():
+        is_active = torch.zeros(n, dtype=torch.bool, device=device)
+        if slot_is_present.any():
             active_xy = pair_local_xy.gather(
                 1, slot_idx.view(-1, 1, 1).expand(-1, 1, 2)
             ).squeeze(1)
+            is_active = slot_is_present & (slot_idx < active_count)
             target_xy[is_active] = active_xy[is_active]
 
         z = torch.where(
@@ -252,6 +261,57 @@ def place_seq_blocks(
         )
     env._active_cube_indices[env_ids_t] = active
     env._target_cube_idx_per_step[env_ids_t] = active.gather(1, goal_color_pos)
+
+
+def randomize_robot_initial_joint_pos(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    joint_delta_ranges: dict[str, tuple[float, float]] | None = None,
+    gripper_open_pos: float = 0.5,
+    asset_name: str = "robot",
+) -> None:
+    """Reset the arm near home with joint-space domain randomization.
+
+    The sampled state is cached so the command term can hard-reset the arm
+    to the same per-episode initial pose after a successful release.
+    """
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        ids = env_ids.long()
+    else:
+        if len(env_ids) == 0:
+            return
+        ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    if joint_delta_ranges is None:
+        joint_delta_ranges = {
+            "shoulder_pan": (-0.15, 0.15),
+            "shoulder_lift": (-0.12, 0.12),
+            "elbow_flex": (-0.12, 0.12),
+            "wrist_flex": (-0.15, 0.15),
+            "wrist_roll": (-0.20, 0.20),
+        }
+
+    robot = env.scene[asset_name]
+    q = robot.data.default_joint_pos[ids].clone()
+    qd = torch.zeros_like(q)
+
+    for joint_name, (lo, hi) in joint_delta_ranges.items():
+        joint_idx = robot.find_joints(joint_name)[0][0]
+        q[:, joint_idx] += torch.empty(ids.numel(), device=env.device).uniform_(lo, hi)
+
+    gripper_idx = robot.find_joints("gripper")[0][0]
+    q[:, gripper_idx] = gripper_open_pos
+
+    if not hasattr(env, "_seq_initial_joint_pos"):
+        env._seq_initial_joint_pos = robot.data.default_joint_pos.clone()
+    if not hasattr(env, "_seq_initial_joint_vel"):
+        env._seq_initial_joint_vel = torch.zeros_like(robot.data.default_joint_pos)
+    env._seq_initial_joint_pos[ids] = q
+    env._seq_initial_joint_vel[ids] = qd
+
+    robot.write_joint_state_to_sim(q, qd, env_ids=ids)
 
 
 def reset_seq_latches(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:

@@ -18,13 +18,11 @@ and ``deploy/README.md`` for the print/calibration prerequisites.
 ``deploy/hand_eye.yaml`` — without it this script errors out.
 
 Per-step contract (mirroring the sim-side
-:func:`mdp.observations.cube_pos_xy_noisy` /
-``target_cube_pos_xy_noisy``):
+:func:`mdp.observations.cube_pos_xy_noisy`:
 
 * Detection valid this frame → publish ``(x, y)`` and store as
   ``last_cube_xy``.
-* No detection this frame **and** not yet grasped → hold ``last_cube_xy``
-  (matches sim's Bernoulli pre-grasp dropout, which also holds last).
+* No detection this frame **and** not yet grasped → hold ``last_cube_xy``.
 * Grasp latched (``is_grasped_now == True`` at any prior step) → skip
   detection entirely and hold ``last_cube_xy`` for the rest of the
   sub-goal rollout (matches sim's post-grasp deterministic freeze; the
@@ -142,8 +140,8 @@ def _build_state_27(
     """27-D state vector matching the sim policy obs (Eval-1/2/3 share schema).
 
     Field order matches the configclass declaration order — the
-    ``(target_)cube_pos_xy_noisy`` field is appended last, so it lands at
-    the trailing 2 dims here. If you reorder the sim PolicyCfg, reorder
+    ``cube_pos_xy_noisy`` field is appended last, so it lands at the
+    trailing 2 dims here. If you reorder the sim PolicyCfg, reorder
     this too or the policy will get a scrambled obs vector.
     """
     joint_pos_rel = (q_rad - JOINT_DEFAULTS_RAD)[:6]
@@ -226,7 +224,7 @@ def _run_subgoal(
 ) -> tuple[np.ndarray, bool]:
     """One sub-goal rollout. Returns ``(q_rad_prev, released_early)``.
 
-    All per-sub-goal latches (``grasped``, ``last_cube_xy``, ``last_action``,
+    All per-sub-goal latches (``grasped``, ``last_cube_xyz``, ``last_action``,
     ``qdot_filt``, detection counters) are local to this function and
     reset at the start of every call — mirroring the sim §10 contract
     where the env resets latches between sub-goals while world state
@@ -239,9 +237,10 @@ def _run_subgoal(
 
     qdot_filt = np.zeros(6, dtype=np.float32)
     last_action = np.zeros(6, dtype=np.float32)
-    # Seed last_cube_xy with the bowl xy as a defensive default; the first
+    # Seed last_cube_xyz with the bowl xy and table-top cube center z as a
+    # defensive default; the first
     # valid detection overrides it.
-    last_cube_xy = bowl_xy.astype(np.float32).copy()
+    last_cube_xyz = np.array([float(bowl_xy[0]), float(bowl_xy[1]), 0.01], dtype=np.float32)
     grasped = False
     n_dropout = 0
     n_detected = 0
@@ -263,7 +262,7 @@ def _run_subgoal(
 
         # ---- AprilTag detection -----------------------------------------
         # Once grasped, skip detection (tag occluded by gripper) and hold
-        # last_cube_xy — matches the sim post-grasp freeze.
+        # last_cube_xyz — matches the sim post-grasp freeze.
         cube_valid = False
         cube_z = float("nan")
         if not grasped:
@@ -273,24 +272,23 @@ def _run_subgoal(
                 rgb = cv2.undistort(rgb, K_mat, dist)
             cube_xy_now, cube_valid = detector.pose(rgb, T_be)
             if cube_valid:
-                last_cube_xy = cube_xy_now
+                last_cube_xyz[:2] = cube_xy_now
                 n_detected += 1
-                # Cheap re-compose for the z component used by vision
-                # release-detect; ``detector.pose`` only returns xy.
-                if release_detect == "vision":
-                    dets = detector.detect(rgb)
-                    tgt = next((d for d in dets
-                                if d["tag_id"] == detector.target_id), None)
-                    if tgt is not None:
-                        T_base_tag = T_be @ detector.T_ee_cam @ tgt["T_cam_tag"]
-                        cube_z = float(T_base_tag[2, 3])
+                # Cheap re-compose for the z component; ``detector.pose``
+                # only returns xy.
+                dets = detector.detect(rgb)
+                tgt = next((d for d in dets if d["tag_id"] == detector.target_id), None)
+                if tgt is not None:
+                    T_base_tag = T_be @ detector.T_ee_cam @ tgt["T_cam_tag"]
+                    cube_z = float(T_base_tag[2, 3])
+                    last_cube_xyz[2] = cube_z
             else:
                 n_dropout += 1
-        cube_xy_obs = last_cube_xy
+        cube_xyz_obs = last_cube_xyz
 
         # ---- Build state + policy ---------------------------------------
         state = _build_state_27(
-            q_rad, qdot_filt, bowl_xy, ee_xy, last_action, cube_xy_obs,
+            q_rad, qdot_filt, bowl_xy, ee_xy, last_action, cube_xyz_obs[:2],
         )
         with torch.no_grad():
             action = policy(
@@ -304,7 +302,7 @@ def _run_subgoal(
         driver.send_joint_targets_sim_rad(target_rad)
 
         if not grasped and action[5] < 0.0:
-            xy_dist = float(np.linalg.norm(last_cube_xy - ee_xy))
+            xy_dist = float(np.linalg.norm(last_cube_xyz[:2] - ee_xy))
             if xy_dist < GRASP_XY_TOL:
                 grasped = True
                 print(f"[state] grasp latched at t={t} "
@@ -326,7 +324,7 @@ def _run_subgoal(
             and np.isfinite(cube_z)
         ):
             in_bowl = (
-                np.linalg.norm(last_cube_xy - bowl_xy) < RELEASE_XY_TOL
+                np.linalg.norm(last_cube_xyz[:2] - bowl_xy) < RELEASE_XY_TOL
                 and cube_z < RELEASE_Z_TOL
             )
             release_hits = release_hits + 1 if in_bowl else 0
@@ -338,13 +336,13 @@ def _run_subgoal(
         if dump_dir is not None:
             _debug_dump_step(
                 dump_dir, sub_k, color, t, state, action, q_rad, ee_xy,
-                target_rad, cube_xy_obs, cube_valid, grasped,
+                target_rad, cube_xyz_obs[:2], cube_valid, grasped,
             )
 
         if (t + 1) % 30 == 0:
             print(
                 f"  k={sub_k}  t={t+1:4d}  action={action.round(2)}  "
-                f"ee_xy={ee_xy.round(3)}  cube_xy={cube_xy_obs.round(3)}  "
+                f"ee_xy={ee_xy.round(3)}  cube_xyz={cube_xyz_obs.round(3)}  "
                 f"grasped={grasped}"
             )
 
@@ -406,10 +404,10 @@ def run(bowl_xy: np.ndarray, colors: list[str], args) -> None:
         q_rad = JOINT_DEFAULTS_RAD.copy()
         qdot_rad = np.zeros(6, dtype=np.float32)
         ee_xy = fk.ee_xyz(q_rad)[:2]
-        cube_xy = np.array([0.20, 0.0], dtype=np.float32)
+        cube_xyz = np.array([0.20, 0.0, 0.01], dtype=np.float32)
         state = _build_state_27(
             q_rad, qdot_rad, bowl_xy, ee_xy,
-            np.zeros(6, dtype=np.float32), cube_xy,
+            np.zeros(6, dtype=np.float32), cube_xyz[:2],
         )
         assert state.shape == (STATE_APRILTAG_STATE_DIM,), state.shape
         with torch.no_grad():

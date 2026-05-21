@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 def all_steps_done(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """Terminate (positive) when all 3 sub-goals have completed."""
+    """Terminate (positive) when the single training target has completed."""
     return env._seq_step_idx >= N_GOAL_STEPS
 
 
@@ -32,14 +32,17 @@ def active_block_off_table(
     xy_max_b: float = 0.6,
     cube_prefix: str = "cube_",
 ) -> torch.Tensor:
-    """Terminate (failure) if any of the 4 active cubes falls off the table."""
+    """Terminate (failure) if any actually active cube falls off the table."""
     robot: Articulation = env.scene[robot_cfg.name]
     active = env._active_cube_indices  # (N, 4)
+    active_count = getattr(env, "_seq_active_count", None)
     out = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     for slot in range(N_ACTIVE_BLOCKS):
         for k, name in enumerate(COLOR_NAMES):
             cube: RigidObject = env.scene[f"{cube_prefix}{name}"]
             mask = active[:, slot] == k
+            if active_count is not None:
+                mask = mask & (slot < active_count)
             if not mask.any():
                 continue
             pos_w = cube.data.root_pos_w[mask]

@@ -24,6 +24,8 @@ from .events import (  # noqa: F401
     expand_block_xy_range,
     init_block_in_gripper,
     randomize_camera_uniform,
+    randomize_vision_rgb_dr,
+    randomize_wrist_hsv_dr,
     randomize_wrist_image_tint,
     reset_cube_pos_bias,
     reset_was_grasped,

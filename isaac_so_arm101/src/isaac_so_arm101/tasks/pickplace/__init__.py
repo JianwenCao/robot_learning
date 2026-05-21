@@ -83,7 +83,7 @@ gym.register(
 )
 
 # State-only + AprilTag deploy path — camera-free env, PolicyCfg extended
-# with ``cube_pos_xy_noisy`` (sim-side mirror of AprilTag pose injection on
+# with deterministic ``cube_pos_xy_noisy`` (sim-side mirror of AprilTag pose injection on
 # the real arm). See ``docs/STATE_APRILTAG_PLAN.md``. Single-stage PPO (no
 # distillation, no vision warm-start). No ``--enable_cameras`` needed.
 gym.register(
@@ -116,7 +116,7 @@ gym.register(
     id="Isaac-SO-ARM101-PickPlace-Bowl-Student-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlVisionStudentEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.distill_cfg:PickPlaceBowlDistillRunnerCfg",
     },
     disable_env_checker=True,
@@ -126,7 +126,7 @@ gym.register(
     id="Isaac-SO-ARM101-PickPlace-Bowl-Student-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlEnvCfg_PLAY",
+        "env_cfg_entry_point": f"{__name__}.joint_pos_env_cfg:SoArm101PickPlaceBowlVisionStudentEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.distill_cfg:PickPlaceBowlDistillRunnerCfg",
     },
     disable_env_checker=True,

@@ -16,14 +16,14 @@ Four blocks of distinct colours in the workspace. Sequence of three `(target_col
 |---|---|
 | Control | 50 Hz |
 | Action | 5 arm joints (`scale=0.5`) + 1 binary gripper |
-| Episode | 15.0 s = 750 steps per rollout (sim env steps the policy through all 3 sub-goals back-to-back, advancing `_seq_step_idx` on each release); deploy slices into ≤ 5 s budgets per sub-goal |
+| Episode | 5.0 s = 250 steps per rollout. Training is a single-target pick-place skill in variable clutter; deploy sequences the skill externally across the 3 requested targets. |
 | Cube workspace | `x ∈ [0.13, 0.28]`, `y ∈ [−0.15, 0.15]`, rejection-sampled with **`min_block_separation = 0.08 m`** (4-cube layout, max 80 attempts) |
 | Bowl | `x ∈ [0.15, 0.28]`, `y ∈ [−0.12, 0.12]`, single bowl per rollout, sampled before cubes; cubes then rejection-sampled to keep ≥ `min_bowl_block_separation = 0.15 m` from the bowl |
 | Terminations | `time_out`, `active_block_off_table` |
 
 **Scene.** Six 2 cm cubes baked palette colours. Per reset, `place_seq_blocks` samples a length-4 permutation of the palette as the 4 active cubes (the other 2 parked at `HIDDEN_PARK_XY`, env-local `x = −0.6 m`, outside the wrist-cam FOV). The 4 active cubes are placed by **sequential rejection sampling** in the cube workspace, each new cube redrawn until it is ≥ `min_block_separation` from all previously-placed cubes AND ≥ `min_bowl_block_separation` from the bowl. A length-3 permutation of the active slots is sampled as the per-step target schedule (`env._seq_goal_color_pos`, distinct across the 3 steps so a placed cube is never re-picked). Bowl is a 2-D goal (no prim).
 
-The previous draft claimed a fixed `place_four_attached_cluster` at `half_separation = 0.0105 m` — that's a fiction; the code has always used spread rejection-sampling. The 8 cm minimum (bumped from the prior 6 cm) gives ≥ 6 cm edge gap for 2 cm cubes — wider than the SO-ARM gripper finger span — so the policy can pick any active cube without colliding with a neighbour. The **within-episode sub-goal sequencing** means the policy naturally trains on 4-cube, 3-cube, and 2-cube cluster states (one cube removed per successful sub-goal); no extra `randomize_active_count` event is needed to close the train→deploy distribution gap.
+The previous draft claimed a fixed `place_four_attached_cluster` at `half_separation = 0.0105 m` — that's a fiction; the code has always used spread rejection-sampling. The training reset now samples `active_count ∈ {2, 3, 4}` and places that many active cubes with 12 cm pairwise spacing. This directly trains the three deploy regimes: 4 cubes before the first target, 3 cubes before the second, and 2 cubes before the third.
 
 ## 3. Observations
 
@@ -42,7 +42,7 @@ Bitwise identical actor to Eval 2 (`[256, 128, 64]` ELU, σ scalar Param, RSL-RL
 
 ## 5. Reward
 
-Verbatim from Eval 2 with two changes: `wrong_cube_in_bowl` widens to "any non-target active cube settled in the bowl" at weight −15; no `distractor_disturb` term.
+Verbatim from Eval 2, indexed to the sampled current target. `wrong_cube_in_bowl` widens to "any non-target active cube settled in the bowl", but remains a zero-weight diagnostic; no `distractor_disturb` term.
 
 | Term | Weight | Trigger |
 |---|---|---|
@@ -50,16 +50,20 @@ Verbatim from Eval 2 with two changes: `wrong_cube_in_bowl` widens to "any non-t
 | `lift_target` | 15.0 | `𝟙[target_z > 0.07]` |
 | `transport_target_to_bowl` (coarse) | 16.0 | `was_lifted · (1 − tanh(‖target_xy − bowl_xy‖ / 0.30))` |
 | `transport_target_to_bowl` (fine) | 5.0 | same with `std = 0.05` |
+| `ee_release_pose_over_bowl` | 20.0 | same release-pose shaping as Eval 1/2 |
 | `release_target_in_bowl` | 30.0 | target near bowl ∧ `z < BOWL_RIM_Z` (= 0.06 m) ∧ gripper open ∧ settled, gated on lift (z ≥ 0.07 m) + over-bowl-above-rim (z ≥ 0.12 m within 6 cm xy) latches — see Eval-1 §4 |
-| `wrong_cube_in_bowl` | −15.0 | any non-target active cube in bowl |
+| `gripper_open_above_bowl_lure` | 3.0 | target currently over bowl and above release height ∧ `action[5] > 0` |
+| `still_grasped_above_bowl_penalty` | −2.0 | target lifted ∧ near bowl ∧ gripper closed |
+| `wrong_cube_in_bowl` | 0.0 | diagnostic only; any non-target active cube in bowl |
 | `action_rate`, `joint_vel` | −1e-4 → −1e-2 | 10 k env-step ramp |
 
 γ = 0.98.
 
 ## 6. Curriculum & DR
 
-- `place_seq_blocks` per §2 (static `min_block_separation = 0.08 m`, `min_bowl_block_separation = 0.15 m`, rejection-sampled).
-- `reset_seq_latches`: clears `_seq_step_idx`, per-step grasp/over-rim/success latches at episode reset.
+- `place_seq_blocks` per §2 (`active_count ∈ {2, 3, 4}`, static `min_block_separation = 0.12 m`, `min_bowl_block_separation = 0.15 m`, rejection-sampled).
+- `randomize_robot_initial_joint_pos`: samples the initial arm pose near home and records it for the hardcoded post-success reset-to-start primitive.
+- `reset_seq_latches`: clears `_seq_step_idx`, grasp/over-rim/success latches at episode reset.
 - `reset_cube_positions_bias`: per-episode shared hand-eye bias U[−5, +5] mm + per-cube tape offset U[−2, +2] mm on `target_cube_pos_xy_noisy`; clears the post-grasp freeze latch (re-keyed per sub-goal at step-advance).
 - Action-rate / joint-vel ramp at 10 k env-steps.
 - `log_seq_success_metrics` TB metric (per-sub-goal success rate, mean step reached).

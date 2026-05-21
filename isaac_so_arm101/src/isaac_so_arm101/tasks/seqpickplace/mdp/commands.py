@@ -8,10 +8,10 @@
 Encapsulates everything the 3-step sequential task needs:
 
 * Per-episode sampling of:
-  - ``active_indices`` ``(N, 4)`` long — which 4 of the 6 palette cubes
+  - ``active_indices`` ``(N, 4)`` long — up to 4 of the 6 palette cubes.
+  - ``active_count`` ``(N,)`` long in {2, 3, 4} — how many active slots
     are placed in the workspace.
-  - ``goal_color_pos`` ``(N, 3)`` long ∈ [0, 4) — for each of the 3
-    steps, which position inside ``active_indices`` is the target.
+  - ``goal_color_pos`` ``(N, 1)`` long — which active slot is the target.
   - ``bowl_positions`` ``(N, 1, 2)`` float — the single bowl xy position
     in the robot frame, sampled with rejection so it's ≥
     ``min_bowl_block_separation`` from every cube. All 3 sequential
@@ -47,8 +47,7 @@ from .events import N_ACTIVE_BLOCKS, N_BOWLS, N_GOAL_STEPS, NUM_COLORS
 # trained for. If a sub-goal isn't released within this budget, the
 # command term auto-advances to the next sub-goal (after arm return-
 # to-home) so the rollout can still attempt the remaining sub-goals.
-# Total rollout budget should be ≥ N_GOAL_STEPS × MAX_STEPS_PER_SUBGOAL
-# (= 3 × 250 = 750 = the env's 15 s ``episode_length_s``).
+# Total rollout budget is one single-shot attempt: 250 steps = 5 s.
 MAX_STEPS_PER_SUBGOAL = 250
 
 if TYPE_CHECKING:
@@ -73,6 +72,8 @@ class SequentialGoalCommand(CommandTerm):
         # term doesn't need to lazy-init.
         if not hasattr(env, "_seq_active_indices"):
             env._seq_active_indices = torch.zeros((N, N_ACTIVE_BLOCKS), dtype=torch.long, device=device)
+        if not hasattr(env, "_seq_active_count"):
+            env._seq_active_count = torch.full((N,), N_ACTIVE_BLOCKS, dtype=torch.long, device=device)
         if not hasattr(env, "_seq_goal_color_pos"):
             env._seq_goal_color_pos = torch.zeros((N, N_GOAL_STEPS), dtype=torch.long, device=device)
         if not hasattr(env, "_seq_bowl_positions"):
@@ -228,17 +229,18 @@ class SequentialGoalCommand(CommandTerm):
         if ind is not None:
             env._seq_step_release_indicator[advance] = False
 
-        # Arm return-to-home for envs that just advanced — only those
-        # still inside the rollout (skip envs that finished all sub-
-        # goals; their idx is now ≥ N_GOAL_STEPS and they'll be reset
-        # by the episode-level pipeline anyway).
-        still_running = env._seq_step_idx < N_GOAL_STEPS
-        retract = advance & still_running
-        if retract.any():
-            retract_ids = torch.nonzero(retract, as_tuple=True)[0]
+        # Hard return to the per-episode randomized initial pose after a
+        # successful/timeout advance. For the training MDP this happens
+        # right before all_done termination; deploy mirrors it with a
+        # scripted reset-to-start primitive between target switches.
+        retract_ids = torch.nonzero(advance, as_tuple=True)[0]
+        if hasattr(env, "_seq_initial_joint_pos"):
+            home_q = env._seq_initial_joint_pos[retract_ids].clone()
+            home_qvel = env._seq_initial_joint_vel[retract_ids].clone()
+        else:
             home_q = self.robot.data.default_joint_pos[retract_ids].clone()
             home_qvel = torch.zeros_like(home_q)
-            self.robot.write_joint_state_to_sim(home_q, home_qvel, env_ids=retract_ids)
+        self.robot.write_joint_state_to_sim(home_q, home_qvel, env_ids=retract_ids)
 
     def _update_metrics(self) -> None:
         pass

@@ -39,6 +39,7 @@ from .events import (  # noqa: F401
     N_ACTIVE_BLOCKS,
     N_GOAL_STEPS,
     place_seq_blocks,
+    randomize_robot_initial_joint_pos,
     reset_seq_latches,
 )
 from .observations import (  # noqa: F401
@@ -60,6 +61,9 @@ from .observations import (  # noqa: F401
 )
 from .rewards import (  # noqa: F401
     log_seq_success_metrics,
+    current_ee_release_pose_over_bowl,
+    current_gripper_open_above_bowl_lure,
+    current_still_grasped_above_bowl_penalty,
     reach_current_target,
     lift_current_target,
     release_current_target_in_bowl,

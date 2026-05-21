@@ -1,0 +1,292 @@
+{
+  "created_wall_time": 1779322085.4219148,
+  "board": {
+    "squares_x": 5,
+    "squares_y": 7,
+    "square_length_m": 0.0285,
+    "marker_length_m": 0.017,
+    "dictionary": "DICT_5X5_50"
+  },
+  "samples": [
+    {
+      "index": 0,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_000_1779322051684.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 1.6013267038057202
+    },
+    {
+      "index": 1,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_001_1779322053307.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 1.4157547605645933
+    },
+    {
+      "index": 2,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_002_1779322054192.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 1.0480098470979038
+    },
+    {
+      "index": 3,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_003_1779322055003.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 0.5438866207374368
+    },
+    {
+      "index": 4,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_004_1779322055851.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.9920977509596308
+    },
+    {
+      "index": 5,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_005_1779322056704.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5716374285395291
+    },
+    {
+      "index": 6,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_006_1779322057543.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5432639253097661
+    },
+    {
+      "index": 7,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_007_1779322058360.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.526557499425694
+    },
+    {
+      "index": 8,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_008_1779322059208.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6139371057771391
+    },
+    {
+      "index": 9,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_009_1779322060019.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.6390682494118571
+    },
+    {
+      "index": 10,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_010_1779322060832.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.4629045279874194
+    },
+    {
+      "index": 11,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_011_1779322061648.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.2763678464151218
+    },
+    {
+      "index": 12,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_012_1779322062461.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8363021267253676
+    },
+    {
+      "index": 13,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_013_1779322065277.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.6685472330992991
+    },
+    {
+      "index": 14,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_014_1779322067142.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.648653803374452
+    },
+    {
+      "index": 15,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_015_1779322067952.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6739236699526555
+    },
+    {
+      "index": 16,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_016_1779322069071.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 1.3715694429136762
+    },
+    {
+      "index": 17,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_017_1779322069884.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7086688201132267
+    },
+    {
+      "index": 18,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_018_1779322070968.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.6952641215924026
+    },
+    {
+      "index": 19,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_019_1779322071784.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6793227089941793
+    },
+    {
+      "index": 20,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_020_1779322072597.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6797047001404916
+    },
+    {
+      "index": 21,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_021_1779322073446.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.6090755870973903
+    },
+    {
+      "index": 22,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_022_1779322074292.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7059105403826548
+    },
+    {
+      "index": 23,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_023_1779322075105.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.6979234237915668
+    },
+    {
+      "index": 24,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_024_1779322075952.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7311329675325677
+    },
+    {
+      "index": 25,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_025_1779322076801.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6511122346758668
+    },
+    {
+      "index": 26,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_026_1779322077647.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7647738876441674
+    },
+    {
+      "index": 27,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_027_1779322078461.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.9515772398405775
+    },
+    {
+      "index": 28,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_028_1779322079277.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.574511495739012
+    },
+    {
+      "index": 29,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_029_1779322080091.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7816597655072515
+    },
+    {
+      "index": 30,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_030_1779322080901.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.9195000174264429
+    },
+    {
+      "index": 31,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_031_1779322082323.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 1.9918911754288526
+    },
+    {
+      "index": 32,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_032_1779322083172.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.8023862811063682
+    },
+    {
+      "index": 33,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_033_1779322084020.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8429361016387583
+    },
+    {
+      "index": 34,
+      "path": "/home/jianwen/Code/eva/robot-learning/deploy/charuco_calib_session/accepted/charuco_034_1779322084831.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6835805417779979
+    }
+  ]
+}

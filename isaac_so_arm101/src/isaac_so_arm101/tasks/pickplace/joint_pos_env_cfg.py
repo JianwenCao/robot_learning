@@ -20,6 +20,7 @@ DexCube — its size is the spec, so we encode it directly.
 import isaaclab.sim as sim_utils
 import isaaclab_tasks.manager_based.manipulation.lift.mdp as lift_mdp  # noqa: F401
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors.camera.camera_cfg import CameraCfg
 from isaaclab.sensors.camera.tiled_camera_cfg import TiledCameraCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import (
@@ -38,12 +39,20 @@ from isaac_so_arm101.robots import SO_ARM101_CFG  # noqa: F401
 from isaac_so_arm101.tasks.pickplace.pickplace_env_cfg import (
     PickPlaceBowlEnvCfg,
     StateAprilTagObservationsCfg,
+    VisionStudentObservationsCfg,
     WRIST_RGB_HEIGHT,
     WRIST_RGB_WIDTH,
 )
 from isaaclab.managers import EventTermCfg as EventTerm
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
+
+
+LEISAAC_WRIST_CAM_OFFSET = CameraCfg.OffsetCfg(
+    pos=(-0.001, 0.1, -0.04),
+    rot=(-0.404379, -0.912179, -0.0451242, 0.0486914),
+    convention="ros",
+)
 
 
 @configclass
@@ -58,13 +67,9 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # SO-ARM101 articulation. Override the home gripper joint to be
-        # **open** (0.5 rad ≈ matches the lift-task ``open_command_expr``)
-        # instead of the SO_ARM101_CFG default 0 rad (closed). With jaws
-        # already open at start, the policy's grasp problem reduces to
-        # "close gripper when ee is close to block", which is one-step
-        # rather than the longer sequence (open → approach → close) that
-        # plagued the closed-jaw home in earlier diagnostics.
+        # SO-ARM101 articulation. Keep the original arm home pose and override
+        # only the gripper to start open, matching the earlier robust
+        # StateAprilTag teacher setup.
         home_state = SO_ARM101_CFG.init_state.replace(
             joint_pos={**SO_ARM101_CFG.init_state.joint_pos, "gripper": 0.5},
         )
@@ -81,6 +86,17 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
             asset_name="robot",
             joint_names=["shoulder_.*", "elbow_flex", "wrist_.*"],
             scale=0.5,
+            # Keep sampled position targets inside URDF limits. With
+            # use_default_offset=True and scale=0.5, PPO can otherwise
+            # command out-of-limit targets around nonzero real-start poses,
+            # destabilizing PhysX and poisoning rewards/metrics with NaNs.
+            clip={
+                "shoulder_pan": (-1.91986, 1.91986),
+                "shoulder_lift": (-1.74533, 1.74533),
+                "elbow_flex": (-1.69, 1.69),
+                "wrist_flex": (-1.65806, 1.65806),
+                "wrist_roll": (-2.74385, 2.84121),
+            },
             use_default_offset=True,
         )
         self.actions.gripper_action = mdp.BinaryJointPositionActionCfg(
@@ -184,10 +200,10 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
         # makes the simulated horizontal FOV match the real camera's exactly,
         # which is what we rely on for sim-to-real visual transfer.
         #
-        # Render resolution is 16:9 (WRIST_RGB_WIDTH × WRIST_RGB_HEIGHT) so
-        # the aspect ratio matches the real cam — preserving the wide
-        # horizontal FOV (~102°) that the policy uses to search for the
-        # block when it spawns at a workspace edge (EVAL1_PLAN §4).
+        # Render resolution is 4:3 (WRIST_RGB_WIDTH × WRIST_RGB_HEIGHT),
+        # matching the real deploy path: capture 640×480, then resize by
+        # 0.5 to the policy input size. Resolution does not change FOV;
+        # the intrinsics/aperture below define the view cone.
         #
         # Extrinsic offset is a starting estimate; measure with calipers
         # before deployment and update both the sim OffsetCfg and the
@@ -240,11 +256,7 @@ class SoArm101PickPlaceBowlEnvCfg(PickPlaceBowlEnvCfg):
             # from the moving jaw) and tilts the lens ~48° down-and-
             # toward-fingers so the table and gripper tips are both in
             # frame at home pose.
-            offset=CameraCfg.OffsetCfg(
-                pos=(-0.001, 0.1, -0.04),
-                rot=(-0.404379, -0.912179, -0.0451242, 0.0486914),
-                convention="ros",
-            ),
+            offset=LEISAAC_WRIST_CAM_OFFSET,
         )
 
 
@@ -264,6 +276,93 @@ class SoArm101PickPlaceBowlEnvCfg_PLAY(SoArm101PickPlaceBowlEnvCfg):
         # fires (kept it on so the eval distribution matches training) but
         # the `corrupt=False` arg short-circuits the per-frame jitters.
         self.observations.wrist_image.wrist_image.params = {"corrupt": False}
+
+
+@configclass
+class SoArm101PickPlaceBowlVisionStudentEnvCfg(SoArm101PickPlaceBowlEnvCfg):
+    """RGB-only vision-student env labelled by the 27-D StateAprilTag teacher."""
+
+    observations: VisionStudentObservationsCfg = VisionStudentObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 320x240 wrist cameras are much heavier than the state-only env.
+        # The base pickplace cfg uses 4096 envs, which OOMs RTX rendering
+        # before training starts. Keep the vision default conservative;
+        # callers can still override with --num_envs after checking VRAM.
+        self.scene.num_envs = 128
+        # Vision policy inputs must not contain training/debug overlays.
+        self.commands.bowl_pose.debug_vis = False
+        self.scene.ee_frame.debug_vis = False
+        # The RGB student no longer uses mask/semantic post-processing.
+        self.scene.wrist_cam.data_types = ["rgb"]
+        self.observations.state_apriltag_policy.cube_pos_xy_noisy.params = {"corrupt": False}
+        # Use a matte 2 cm primitive so the RGB stream has a clean,
+        # randomizable cube colour. Physics mirrors the tuned multi-cube
+        # configs used elsewhere in this project.
+        self.scene.object = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Object",
+            init_state=RigidObjectCfg.InitialStateCfg(pos=[0.2, 0.0, 0.01], rot=[1, 0, 0, 0]),
+            spawn=sim_utils.CuboidCfg(
+                size=(0.02, 0.02, 0.02),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.45, 0.05),
+                    roughness=0.35,
+                    metallic=0.0,
+                ),
+                rigid_props=RigidBodyPropertiesCfg(
+                    solver_position_iteration_count=16,
+                    solver_velocity_iteration_count=1,
+                    max_angular_velocity=1000.0,
+                    max_linear_velocity=1000.0,
+                    max_depenetration_velocity=5.0,
+                    disable_gravity=False,
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.020),
+                collision_props=sim_utils.CollisionPropertiesCfg(),
+                physics_material=RigidBodyMaterialCfg(
+                    friction_combine_mode="multiply",
+                    restitution_combine_mode="multiply",
+                    static_friction=1.0,
+                    dynamic_friction=1.0,
+                ),
+                semantic_tags=[("class", "block")],
+            ),
+        )
+        self.events.reset_cube_pos_bias = None
+        self.events.randomize_vision_rgb = EventTerm(
+            func=mdp.randomize_vision_rgb_dr,
+            mode="reset",
+            params={
+                "block_jitter": 0.08,
+            },
+        )
+        self.events.randomize_wrist_hsv = EventTerm(
+            func=mdp.randomize_wrist_hsv_dr,
+            mode="reset",
+            params={
+                "hue_shift_deg_range": (0.0, 0.0),
+                "sat_scale_range": (1.0, 1.0),
+                "val_scale_range": (0.90, 1.10),
+            },
+        )
+        # Keep the wrist camera fixed at the eva_follower hand-eye pose
+        # while we compare sim images against the real camera view.
+        self.events.randomize_wrist_camera = None
+
+
+@configclass
+class SoArm101PickPlaceBowlVisionStudentEnvCfg_PLAY(SoArm101PickPlaceBowlVisionStudentEnvCfg):
+    """Play variant for RGB-only vision student inspection."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.observations.state_apriltag_policy.enable_corruption = False
+        self.observations.wrist_image.wrist_image.params = {"corrupt": False}
+        self.observations.state_apriltag_policy.cube_pos_xy_noisy.params = {"corrupt": False}
 
 
 @configclass
@@ -314,13 +413,7 @@ class SoArm101PickPlaceBowlStateAprilTagEnvCfg(SoArm101PickPlaceBowlTeacherFastE
     and:
 
     * Swaps in :class:`StateAprilTagObservationsCfg` so ``PolicyCfg`` gains
-      a ``cube_pos_xy_noisy`` term (GT cube xy + per-episode bias +
-      Gaussian + dropout + post-grasp freeze — see
-      :func:`mdp.observations.cube_pos_xy_noisy`).
-    * Adds a ``reset_cube_pos_bias`` event so the per-episode bias and the
-      post-grasp freeze latch are reset each episode. Listed **after**
-      ``reset_block_position`` so ``_cube_pos_last`` is seeded against
-      the freshly-randomized cube xy.
+      noisy absolute ``cube_pos_xy_noisy``.
 
     See ``docs/STATE_APRILTAG_PLAN.md`` for the deploy-side mirror.
     """
@@ -329,14 +422,8 @@ class SoArm101PickPlaceBowlStateAprilTagEnvCfg(SoArm101PickPlaceBowlTeacherFastE
 
     def __post_init__(self):
         super().__post_init__()
-        # The reset event must run AFTER reset_block_position so the
-        # seeded ``env._cube_pos_last`` reflects the post-reset cube xy.
-        # configclass field-insertion via attribute assignment is the
-        # idiomatic pattern used elsewhere in this repo (see e.g. the
-        # bootstrap_grasped term wiring in older revisions).
-        self.events.reset_cube_pos_bias = EventTerm(
-            func=mdp.reset_cube_pos_bias, mode="reset"
-        )
+        self.events.reset_cube_pos_bias = None
+        self.observations.policy.cube_pos_xy_noisy.params = {"corrupt": False}
 
 
 @configclass
@@ -344,10 +431,7 @@ class SoArm101PickPlaceBowlStateAprilTagEnvCfg_PLAY(SoArm101PickPlaceBowlStateAp
     """Play variant: fewer envs, no obs corruption, no AprilTag noise.
 
     The play path is used for sim eval (``play.py``) where we want a clean
-    rollout. ``corrupt=False`` short-circuits the bias / Gaussian / dropout
-    inside :func:`mdp.observations.cube_pos_xy_noisy` so the policy sees
-    the GT cube xy each step — the post-grasp freeze still applies (it
-    reflects physical occlusion, not corruption).
+    rollout. ``corrupt=False`` makes the policy see clean absolute cube xy.
     """
 
     def __post_init__(self):
@@ -355,6 +439,4 @@ class SoArm101PickPlaceBowlStateAprilTagEnvCfg_PLAY(SoArm101PickPlaceBowlStateAp
         self.scene.num_envs = 50
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
-        # Disable corruption inside the obs function itself. Match the
-        # pattern used by SoArm101PickPlaceBowlEnvCfg_PLAY for wrist_image.
         self.observations.policy.cube_pos_xy_noisy.params = {"corrupt": False}

@@ -279,11 +279,103 @@ def _run_n_episodes(env, policy, args_cli, ckpt_path):
 
     No per-step logs — just the aggregate. For per-step traces use ``--diag-rollouts``.
     """
-    import numpy as np
-
     base = env.unwrapped
     n_envs = int(base.num_envs)
     target_n = int(args_cli.n_episodes) * n_envs
+
+    if "SeqPickPlace" in args_cli.task:
+        device = base.device
+        counts = {
+            "episodes": 0,
+            "step0": 0,
+            "step1": 0,
+            "step2": 0,
+            "all": 0,
+            "step0_strict": 0,
+            "step1_strict": 0,
+            "step2_strict": 0,
+            "all_strict": 0,
+        }
+        ever = {
+            "seq": torch.zeros((n_envs, 3), dtype=torch.bool, device=device),
+            "seq_strict": torch.zeros((n_envs, 3), dtype=torch.bool, device=device),
+        }
+
+        print(f"[n-episodes] target {target_n} eps ({args_cli.n_episodes}/env × {n_envs} envs) "
+              f"on {args_cli.task}")
+        print(f"[n-episodes] ckpt: {ckpt_path}")
+        print("[n-episodes] latches: seq=_seq_success_per_step_latch, "
+              "seq_strict=_seq_success_per_step_latch_strict")
+        print("[n-episodes] Eval-3 episodes are 3 sub-goals / up to 750 sim steps; "
+              "first aggregate appears when the first envs finish.")
+
+        def _read_seq_latch(name):
+            t = getattr(base, name, None)
+            if t is None or t.dtype != torch.bool or t.shape[0] != n_envs or t.ndim != 2:
+                return None
+            return t[:, :3]
+
+        obs = env.get_observations()
+        step = 0
+        while counts["episodes"] < target_n:
+            with torch.inference_mode():
+                actions = policy(obs)
+                next_obs, _rewards, dones, _extras = env.step(actions)
+
+            dones_bool = dones.to(dtype=torch.bool, device=device) if hasattr(dones, "to") \
+                else torch.as_tensor(dones, dtype=torch.bool, device=device)
+            not_done = ~dones_bool
+
+            seq = _read_seq_latch("_seq_success_per_step_latch")
+            seq_strict = _read_seq_latch("_seq_success_per_step_latch_strict")
+            if seq is not None:
+                ever["seq"] |= seq & not_done.unsqueeze(-1)
+            if seq_strict is not None:
+                ever["seq_strict"] |= seq_strict & not_done.unsqueeze(-1)
+
+            if dones_bool.any():
+                done_idx = torch.nonzero(dones_bool, as_tuple=True)[0].tolist()
+                for i in done_idx:
+                    counts["episodes"] += 1
+                    seq_i = ever["seq"][i]
+                    seq_s_i = ever["seq_strict"][i]
+                    counts["step0"] += int(bool(seq_i[0].item()))
+                    counts["step1"] += int(bool(seq_i[1].item()))
+                    counts["step2"] += int(bool(seq_i[2].item()))
+                    counts["all"] += int(bool(seq_i.all().item()))
+                    counts["step0_strict"] += int(bool(seq_s_i[0].item()))
+                    counts["step1_strict"] += int(bool(seq_s_i[1].item()))
+                    counts["step2_strict"] += int(bool(seq_s_i[2].item()))
+                    counts["all_strict"] += int(bool(seq_s_i.all().item()))
+                    ever["seq"][i] = False
+                    ever["seq_strict"][i] = False
+
+                if counts["episodes"] % max(1, n_envs) == 0 or counts["episodes"] >= target_n:
+                    n = counts["episodes"]
+                    print(f"  [{n:4d}/{target_n}]  "
+                          f"step0={counts['step0']/n:.3f}  "
+                          f"step1={counts['step1']/n:.3f}  "
+                          f"step2={counts['step2']/n:.3f}  "
+                          f"all={counts['all']/n:.3f}")
+            elif step > 0 and step % 250 == 0:
+                print(f"  [steps={step}] waiting for completed Eval-3 episodes...")
+
+            obs = next_obs
+            step += 1
+
+        n = max(counts["episodes"], 1)
+        print()
+        print(f"=== Aggregate ({n} episodes, {step} steps, {args_cli.task}) ===")
+        print(f"  ckpt:                 {ckpt_path}")
+        print(f"  step0_success:        {counts['step0']}/{n} = {counts['step0']/n:.3f}")
+        print(f"  step1_success:        {counts['step1']}/{n} = {counts['step1']/n:.3f}")
+        print(f"  step2_success:        {counts['step2']}/{n} = {counts['step2']/n:.3f}")
+        print(f"  all_steps_success:    {counts['all']}/{n} = {counts['all']/n:.3f}")
+        print(f"  step0_success_strict: {counts['step0_strict']}/{n} = {counts['step0_strict']/n:.3f}")
+        print(f"  step1_success_strict: {counts['step1_strict']}/{n} = {counts['step1_strict']/n:.3f}")
+        print(f"  step2_success_strict: {counts['step2_strict']}/{n} = {counts['step2_strict']/n:.3f}")
+        print(f"  all_steps_strict:     {counts['all_strict']}/{n} = {counts['all_strict']/n:.3f}")
+        return
 
     # Pick latch names by task family. The target_* latches on Eval-2/3 envs
     # are allocated lazily on the first call to ``release_target_in_bowl``,
@@ -703,7 +795,7 @@ def _finalize_episode(s, ep_idx, n_steps, last_row, bowl_xy_obs):
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+def _main_impl(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
@@ -868,6 +960,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # close the simulator
     env.close()
     return 0
+
+
+def main() -> int:
+    """Console entrypoint.
+
+    Isaac Lab's Hydra wrapper may return ``None`` even when the wrapped
+    function exits cleanly. The generated console script calls
+    ``sys.exit(main())``; under Isaac Kit, ``sys.exit(None)`` is routed to
+    ``app.post_quit(None)``, which raises a TypeError. Normalize clean exits
+    to an integer return code.
+    """
+    status = _main_impl()
+    return 0 if status is None else int(status)
 
 
 if __name__ == "__main__":

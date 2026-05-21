@@ -165,6 +165,71 @@ def transport_current_target_to_bowl(
     return was_lifted * (1.0 - torch.tanh(dist / std)) * _step_active(env)
 
 
+def current_ee_release_pose_over_bowl(
+    env: "ManagerBasedRLEnv",
+    ee_height: float = 0.08,
+    xy_std: float = 0.06,
+    z_std: float = 0.04,
+    r_safe: float = 0.06,
+    bowl_height: float = 0.06,
+    minimal_height: float = 0.07,
+    command_name: str = "seq_goal",
+    ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """Task-1/2 release-pose shaping, indexed to the current target."""
+    del r_safe, bowl_height, cube_prefix
+    ee_frame: FrameTransformer = env.scene[ee_frame_cfg.name]
+    ee_w = ee_frame.data.target_pos_w[..., 0, :]
+    bowl_w = _current_bowl_w(env, command_name)
+    was_lifted = _lifted_mask(env, minimal_height)
+    ee_xy_dist = torch.norm(ee_w[:, :2] - bowl_w, dim=1)
+    xy_factor = torch.exp(-(ee_xy_dist * ee_xy_dist) / (xy_std * xy_std))
+    z_shortfall = (ee_height - ee_w[:, 2]).clamp(min=0.0)
+    z_factor = torch.exp(-(z_shortfall * z_shortfall) / (z_std * z_std))
+    return was_lifted.float() * xy_factor * z_factor * _step_active(env)
+
+
+def current_gripper_open_above_bowl_lure(
+    env: "ManagerBasedRLEnv",
+    rim_clearance: float = 0.08,
+    r_safe: float = 0.06,
+    command_name: str = "seq_goal",
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """Task-1/2 open-gripper lure, indexed to the current target."""
+    target_w = _current_target_pos_w(env, cube_prefix)
+    bowl_w = _current_bowl_w(env, command_name)
+    _over_bowl_high_mask(
+        env, r_safe=r_safe, rim_clearance=rim_clearance,
+        command_name=command_name, cube_prefix=cube_prefix,
+    )
+    over_release_height = (
+        (torch.norm(target_w[:, :2] - bowl_w, dim=1) < r_safe)
+        & (target_w[:, 2] > rim_clearance)
+    )
+    gripper_open_cmd = env.action_manager.action[:, 5] > 0.0
+    return (over_release_height & gripper_open_cmd).float() * _step_active(env)
+
+
+def current_still_grasped_above_bowl_penalty(
+    env: "ManagerBasedRLEnv",
+    rim_clearance: float = 0.08,
+    r_safe: float = 0.06,
+    minimal_height: float = 0.07,
+    command_name: str = "seq_goal",
+    cube_prefix: str = "cube_",
+) -> torch.Tensor:
+    """Task-1/2 closed-gripper near-bowl penalty, indexed to the current target."""
+    del rim_clearance
+    target_w = _current_target_pos_w(env, cube_prefix)
+    bowl_w = _current_bowl_w(env, command_name)
+    was_lifted = _lifted_mask(env, minimal_height, cube_prefix)
+    near_bowl = torch.norm(target_w[:, :2] - bowl_w, dim=1) < r_safe
+    gripper_closed_cmd = env.action_manager.action[:, 5] <= 0.0
+    return (was_lifted & near_bowl & gripper_closed_cmd).float() * _step_active(env)
+
+
 def release_current_target_in_bowl(
     env: "ManagerBasedRLEnv",
     r_safe: float = 0.06,
@@ -291,11 +356,23 @@ def wrong_cube_in_current_bowl(
     bowl_w = _current_bowl_w(env, command_name).unsqueeze(1)  # (N, 1, 2)
     in_xy = torch.norm(all_pos[:, :, :2] - bowl_w, dim=2) < r_safe  # (N, 6)
     low = all_pos[:, :, 2] < bowl_height
+    active = getattr(env, "_active_cube_indices", None)
+    active_count = getattr(env, "_seq_active_count", None)
+    active_mask = torch.zeros_like(in_xy)
+    if active is not None:
+        rows = torch.arange(env.num_envs, device=env.device)
+        for slot in range(active.shape[1]):
+            slot_active = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+            if active_count is not None:
+                slot_active = slot < active_count
+            active_mask[rows, active[:, slot]] |= slot_active
+    else:
+        active_mask[:] = True
     # mask out the current target
     target_idx = _current_target_palette_idx(env)  # (N,)
     target_mask = torch.zeros_like(in_xy)
     target_mask.scatter_(1, target_idx.view(-1, 1), True)
-    wrong = in_xy & low & ~target_mask
+    wrong = in_xy & low & active_mask & ~target_mask
     return wrong.float().sum(dim=1) * _step_active(env)
 
 
@@ -320,11 +397,13 @@ def log_seq_success_metrics(
     outcomes = latch[env_ids].float()  # (n_ended, 3)
     metrics: dict[str, float] = {
         "step0_success": outcomes[:, 0].mean().item(),
-        "step1_success": outcomes[:, 1].mean().item(),
-        "step2_success": outcomes[:, 2].mean().item(),
         "all_steps_success": (outcomes.sum(dim=1) == N_GOAL_STEPS).float().mean().item(),
         "n_episodes_ended": float(outcomes.shape[0]),
     }
+    if N_GOAL_STEPS > 1:
+        metrics["step1_success"] = outcomes[:, 1].mean().item()
+    if N_GOAL_STEPS > 2:
+        metrics["step2_success"] = outcomes[:, 2].mean().item()
     latch[env_ids] = False
 
     # PDF-strict counterparts (in_xy ∧ low ∧ opened, no safety latches /
@@ -334,8 +413,10 @@ def log_seq_success_metrics(
     if strict_latch is not None:
         strict_out = strict_latch[env_ids].float()
         metrics["step0_success_strict"] = strict_out[:, 0].mean().item()
-        metrics["step1_success_strict"] = strict_out[:, 1].mean().item()
-        metrics["step2_success_strict"] = strict_out[:, 2].mean().item()
+        if N_GOAL_STEPS > 1:
+            metrics["step1_success_strict"] = strict_out[:, 1].mean().item()
+        if N_GOAL_STEPS > 2:
+            metrics["step2_success_strict"] = strict_out[:, 2].mean().item()
         metrics["success_rate_strict"] = (strict_out.sum(dim=1) == N_GOAL_STEPS).float().mean().item()
         strict_latch[env_ids] = False
 

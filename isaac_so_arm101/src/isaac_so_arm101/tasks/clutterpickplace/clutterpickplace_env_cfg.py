@@ -391,13 +391,12 @@ class EventCfg:
 class RewardsCfg:
     """Reward stack — direct port of Eval-1 weights, target-cube-indexed.
 
-    Adds two distractor-aware penalties:
+    Tracks two distractor-aware diagnostics at zero weight:
 
-    * ``distractor_disturb``  (weight=-0.5) — small penalty for shoving
-      the wrong cube.
-    * ``wrong_block_in_bowl`` (weight=-20.0) — heavy penalty for placing
-      the wrong cube in the bowl. Sized comparable to ``release_target_in_bowl``'s
-      +30 so a successful target placement still wins net.
+    * ``distractor_disturb`` — shoving the wrong cube.
+    * ``wrong_block_in_bowl`` — placing the wrong cube in the bowl.
+      These remain logged, but they deliberately do not shape PPO:
+      wrong-object behavior gets no reward and no penalty.
 
     Other weights match Eval-1's tuned recipe (reach 1, lift 15,
     transport 16, transport_fine 5, release 30, action_rate -1e-4 →
@@ -438,7 +437,7 @@ class RewardsCfg:
             "minimal_height": 0.07,
             "command_name": "bowl_pose",
         },
-        weight=10.0,
+        weight=20.0,
     )
 
     release_in_bowl = RewTerm(func=mdp.release_target_in_bowl, weight=30.0)
@@ -459,20 +458,14 @@ class RewardsCfg:
         func=mdp.target_still_grasped_above_bowl_penalty, weight=-2.0,
     )
 
-    # Distractor-aware shaping (Eval-2 specific).
+    # Distractor-aware diagnostics (Eval-2 specific). Keep these terms at
+    # zero weight so a wrong cube gets no reward and no penalty. Penalizing
+    # them during early exploration produced a "move less" basin before the
+    # policy had learned reliable target lift.
     distractor_disturb = RewTerm(
-        func=mdp.distractor_disturb_penalty, weight=-0.5,
+        func=mdp.distractor_disturb_penalty, weight=0.0,
         params={"threshold_speed": 0.05},
     )
-    # Start at 0 and ramp to -5 over 20k env-steps (see CurriculumCfg).
-    # Reason: prior runs showed the distractor drifting into the bowl
-    # during random-policy exploration (run 09-00-17: ramped to -1.06
-    # weighted/episode = 21% of steps firing). Penalising that before the
-    # policy has learned to reach + lift creates a "stay still" attractor
-    # — the policy can't tell what motion caused the penalty so safest
-    # response is no motion. Ramping in once reach + lift are established
-    # preserves the directional signal (correct release +30 > wrong-block
-    # -5) without poisoning early exploration.
     wrong_block_in_bowl = RewTerm(func=mdp.wrong_block_in_bowl, weight=0.0)
 
     # Penalties — ramped via curriculum, same as Eval-1.
@@ -532,14 +525,6 @@ class CurriculumCfg:
     joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "joint_vel", "weight": -1e-1, "num_steps": 10000},
-    )
-    # Ramp wrong_block_in_bowl 0 → -5 over 20k env-steps. See RewardsCfg
-    # docstring for the rationale (early -5 was poisoning exploration).
-    # 20k > 15k action ramp so reach + lift consolidate before the
-    # distractor penalty turns on.
-    wrong_block_in_bowl = CurrTerm(
-        func=mdp.modify_reward_weight,
-        params={"term_name": "wrong_block_in_bowl", "weight": -5.0, "num_steps": 20000},
     )
     log_success = CurrTerm(func=mdp.log_target_success_metrics, params={})
 

@@ -679,6 +679,11 @@ class PickPlaceVisionActorCritic(ActorCritic):
         # but is free to push it down anywhere via other losses.
         if getattr(self, "_std_max", None) is not None:
             std = torch.minimum(std, self._std_max.to(std.device).expand_as(std))
+        # RSL-RL's scalar-std mode stores σ directly as a learnable
+        # parameter. A PPO step can push it below zero before the next
+        # sample call, which makes torch.normal fail. Keep the distribution
+        # scale valid even if the raw parameter briefly leaves the domain.
+        std = torch.nan_to_num(std, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1.0e-6)
         self.distribution = Normal(mean, std)
 
     def act(self, obs, **kwargs):

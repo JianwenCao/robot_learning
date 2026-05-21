@@ -1,0 +1,260 @@
+{
+  "created_wall_time": 1779316014.0930233,
+  "board": {
+    "squares_x": 5,
+    "squares_y": 7,
+    "square_length_m": 0.0285,
+    "marker_length_m": 0.017,
+    "dictionary": "DICT_5X5_50"
+  },
+  "samples": [
+    {
+      "index": 0,
+      "path": "/tmp/charuco_good/charuco_000_1779315780401.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 0.819579443234836
+    },
+    {
+      "index": 1,
+      "path": "/tmp/charuco_good/charuco_001_1779315781264.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 0.828461106916526
+    },
+    {
+      "index": 2,
+      "path": "/tmp/charuco_good/charuco_002_1779315782106.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 0.8298201851288174
+    },
+    {
+      "index": 3,
+      "path": "/tmp/charuco_good/charuco_003_1779315782945.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 20,
+      "rms_reprojection_error_px": 0.8178518920071312
+    },
+    {
+      "index": 4,
+      "path": "/tmp/charuco_good/charuco_004_1779315783760.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 13,
+      "charuco_corners": 17,
+      "rms_reprojection_error_px": 1.0883864978006974
+    },
+    {
+      "index": 5,
+      "path": "/tmp/charuco_good/charuco_005_1779315784562.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 13,
+      "charuco_corners": 17,
+      "rms_reprojection_error_px": 0.8916275534854439
+    },
+    {
+      "index": 6,
+      "path": "/tmp/charuco_good/charuco_006_1779315785411.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 0.9038188092373415
+    },
+    {
+      "index": 7,
+      "path": "/tmp/charuco_good/charuco_007_1779315786261.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6541915491580009
+    },
+    {
+      "index": 8,
+      "path": "/tmp/charuco_good/charuco_008_1779315787076.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6854085481944038
+    },
+    {
+      "index": 9,
+      "path": "/tmp/charuco_good/charuco_009_1779315787921.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6908216775474681
+    },
+    {
+      "index": 10,
+      "path": "/tmp/charuco_good/charuco_010_1779315788768.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.9055703940600762
+    },
+    {
+      "index": 11,
+      "path": "/tmp/charuco_good/charuco_011_1779315789602.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6168901987591124
+    },
+    {
+      "index": 12,
+      "path": "/tmp/charuco_good/charuco_012_1779315790427.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8952901467002436
+    },
+    {
+      "index": 13,
+      "path": "/tmp/charuco_good/charuco_013_1779315791276.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7308291247146677
+    },
+    {
+      "index": 14,
+      "path": "/tmp/charuco_good/charuco_014_1779315792121.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7065203661246621
+    },
+    {
+      "index": 15,
+      "path": "/tmp/charuco_good/charuco_015_1779315792967.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.1030881713228007
+    },
+    {
+      "index": 16,
+      "path": "/tmp/charuco_good/charuco_016_1779315793815.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8188968560387745
+    },
+    {
+      "index": 17,
+      "path": "/tmp/charuco_good/charuco_017_1779315794672.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.6913453146731449
+    },
+    {
+      "index": 18,
+      "path": "/tmp/charuco_good/charuco_018_1779315795480.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7664477817426508
+    },
+    {
+      "index": 19,
+      "path": "/tmp/charuco_good/charuco_019_1779315796296.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 16,
+      "charuco_corners": 22,
+      "rms_reprojection_error_px": 1.104322868574764
+    },
+    {
+      "index": 20,
+      "path": "/tmp/charuco_good/charuco_020_1779315797112.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.8193998031574766
+    },
+    {
+      "index": 21,
+      "path": "/tmp/charuco_good/charuco_021_1779315797926.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7927225225233963
+    },
+    {
+      "index": 22,
+      "path": "/tmp/charuco_good/charuco_022_1779315798739.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.5953020606697985
+    },
+    {
+      "index": 23,
+      "path": "/tmp/charuco_good/charuco_023_1779315799581.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.9111723257193486
+    },
+    {
+      "index": 24,
+      "path": "/tmp/charuco_good/charuco_024_1779315800434.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.2084414519106612
+    },
+    {
+      "index": 25,
+      "path": "/tmp/charuco_good/charuco_025_1779315801246.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7089866440200067
+    },
+    {
+      "index": 26,
+      "path": "/tmp/charuco_good/charuco_026_1779315802086.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 0.7942449148850633
+    },
+    {
+      "index": 27,
+      "path": "/tmp/charuco_good/charuco_028_1779315803781.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.9016795344075879
+    },
+    {
+      "index": 28,
+      "path": "/tmp/charuco_good/charuco_029_1779315804628.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 15,
+      "charuco_corners": 21,
+      "rms_reprojection_error_px": 0.9398193188142161
+    },
+    {
+      "index": 29,
+      "path": "/tmp/charuco_good/charuco_032_1779315807132.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.51997295902049
+    },
+    {
+      "index": 30,
+      "path": "/tmp/charuco_good/charuco_033_1779315807962.png",
+      "dictionary": "DICT_5X5_50",
+      "markers": 17,
+      "charuco_corners": 24,
+      "rms_reprojection_error_px": 1.0845983241271828
+    }
+  ]
+}

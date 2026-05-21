@@ -7,9 +7,9 @@
 
 Single-stage from-scratch PPO on the camera-free env
 :class:`SoArm101PickPlaceBowlStateAprilTagEnvCfg`. The actor sees the
-deployable ``policy`` group **plus** the new ``cube_pos_xy_noisy`` obs
-term — i.e. all proprio + a noisy 2-D cube position that mirrors what
-the AprilTag pipeline produces at deploy. The critic still sees the full
+deployable ``policy`` group **plus** deterministic absolute
+``cube_pos_xy_noisy`` — i.e. all proprio plus the cube xy in robot frame.
+The critic still sees the full
 privileged state. See ``docs/STATE_APRILTAG_PLAN.md`` for the rationale.
 
 Key differences vs :mod:`teacher_ppo_cfg`:
@@ -56,7 +56,7 @@ class PickPlaceBowlStateAprilTagPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     Hyperparameters mirror :class:`PickPlaceBowlTeacherPPORunnerCfg` —
     same network width, same algorithm settings — because the MDP is
-    identical except for the extra 2-D obs and the asymmetric A-C split.
+identical except for the extra 2-D cube xy obs and the asymmetric A-C split.
     """
 
     num_steps_per_env = 32
@@ -75,6 +75,7 @@ class PickPlaceBowlStateAprilTagPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     policy = RslRlPpoActorCriticCfg(
         class_name="PickPlaceVisionActorCritic",
         init_noise_std=1.0,
+        noise_std_type="log",
         actor_hidden_dims=[256, 128, 64],
         critic_hidden_dims=[256, 128, 64],
         activation="elu",

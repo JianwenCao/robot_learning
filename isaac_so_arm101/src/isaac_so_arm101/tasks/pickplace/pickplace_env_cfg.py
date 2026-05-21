@@ -54,17 +54,12 @@ from isaaclab.utils import configclass
 # Wrist-camera resolution
 # ---------------------------------------------------------------------------
 #
-# 16:9 to match the real wrist USB cam (1280×720 native — see
-# ``camera_intrinsics.yaml``). 128×72 is a 1/10 scale of native, which
-# preserves the FOV exactly and keeps the per-env render cost cheap. Real
-# horizontal FOV ≈ 102° — matters for "block out of frame" search behavior
-# (EVAL1_PLAN §4); square-cropping would lose ~32° and hurt search.
-#
-# The CNN encoder in :mod:`agents.vision_actor_critic` is sized for these
-# dimensions; bump them in lockstep if the cube becomes too small to
-# resolve at the typical 0.20 m gripper-down standoff.
-WRIST_RGB_WIDTH = 128
-WRIST_RGB_HEIGHT = 72
+# RGB-only vision student input. The real camera can reliably provide
+# 640×480; deploy resizes that by 0.5, so sim trains on the same 4:3
+# policy image size. FOV is set by the real intrinsics loaded from
+# eva_follower, not by this render resolution.
+WRIST_RGB_WIDTH = 320
+WRIST_RGB_HEIGHT = 240
 
 
 @configclass
@@ -111,8 +106,9 @@ class PickPlaceBowlSceneCfg(InteractiveSceneCfg):
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
     )
 
-    # Flat gray cuboid table matching eval color (#B8ADA9 → linear sRGB
-    # ≈ (0.722, 0.678, 0.663)). Top of the table sits at z=0 so block
+    # Flat gray cuboid table. Darkened from #B8ADA9 to #8F8580 so the
+    # table separates clearly from the light background in wrist RGB.
+    # Top of the table sits at z=0 so block
     # init z=0.01 is "block on table".
     #
     # Sim-to-real geometry match: on the real rig the SO-ARM101 base is
@@ -132,7 +128,7 @@ class PickPlaceBowlSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(0.6, 1.0, 0.02),
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.722, 0.678, 0.663),  # #B8ADA9
+                diffuse_color=(0.561, 0.522, 0.502),  # #8F8580
                 roughness=0.7,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(),
@@ -147,7 +143,12 @@ class PickPlaceBowlSceneCfg(InteractiveSceneCfg):
 
     light = AssetBaseCfg(
         prim_path="/World/light",
-        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
+        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1800.0),
+    )
+    key_light = AssetBaseCfg(
+        prim_path="/World/key_light",
+        init_state=AssetBaseCfg.InitialStateCfg(rot=[0.9239, 0.3827, 0.0, 0.0]),
+        spawn=sim_utils.DistantLightCfg(color=(1.0, 0.96, 0.90), intensity=700.0, angle=3.0),
     )
 
 
@@ -350,10 +351,11 @@ class ObservationsCfg:
 class StateAprilTagObservationsCfg(ObservationsCfg):
     """Obs variant for the state-only + AprilTag deploy path.
 
-    Extends :class:`ObservationsCfg` by adding a single ``cube_pos_xy_noisy``
-    term to :class:`PolicyCfg`. This is the sim-side surrogate for the
-    AprilTag pose injection that runs on the real arm at deploy — see
-    ``docs/STATE_APRILTAG_PLAN.md`` §2. Critic and wrist_image groups are
+    Extends :class:`ObservationsCfg` by adding deterministic absolute
+    ``cube_pos_xy_noisy`` to :class:`PolicyCfg`. This is the sim-side
+    surrogate for the AprilTag pose injection that runs on the real arm at
+    deploy — see ``docs/STATE_APRILTAG_PLAN.md`` §2.
+    Critic and wrist_image groups are
     inherited unchanged; the env cfg that uses this variant typically also
     nulls ``scene.wrist_cam`` + ``observations.wrist_image`` (no rendering
     needed for state-only PPO).
@@ -364,6 +366,26 @@ class StateAprilTagObservationsCfg(ObservationsCfg):
         cube_pos_xy_noisy = ObsTerm(func=mdp.cube_pos_xy_noisy)
 
     policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class VisionStudentObservationsCfg(ObservationsCfg):
+    """RGB-only student obs plus a 27-D StateAprilTag teacher obs group."""
+
+    @configclass
+    class WristImageCfg(ObsGroup):
+        wrist_image = ObsTerm(func=mdp.wrist_rgb_dr)
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class StateAprilTagPolicyCfg(ObservationsCfg.PolicyCfg):
+        cube_pos_xy_noisy = ObsTerm(func=mdp.cube_pos_xy_noisy)
+
+    wrist_image: WristImageCfg = WristImageCfg()
+    state_apriltag_policy: StateAprilTagPolicyCfg = StateAprilTagPolicyCfg()
 
 
 # ---------------------------------------------------------------------------
