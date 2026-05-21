@@ -1,0 +1,310 @@
+--- git status ---
+On branch jianwen
+Your branch is up to date with 'origin/jianwen'.
+
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   docs/EVAL2_PLAN.md
+	modified:   docs/EVAL3_PLAN.md
+	deleted:    eval2_curr.png
+	deleted:    eval2_reward.png
+	modified:   isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.onnx
+	modified:   isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.pt
+	modified:   isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/play.py
+	modified:   isaac_so_arm101/src/isaac_so_arm101/tasks/clutterpickplace/clutterpickplace_env_cfg.py
+	modified:   isaac_so_arm101/src/isaac_so_arm101/tasks/seqpickplace/seqpickplace_env_cfg.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/docs/EVAL2_PLAN.md b/docs/EVAL2_PLAN.md
+index ef7e55f..22acde4 100644
+--- a/docs/EVAL2_PLAN.md
++++ b/docs/EVAL2_PLAN.md
+@@ -43,20 +43,20 @@ Eval-1 skeleton + two clutter terms (`mdp/rewards.py`):
+ | `release_in_bowl` | 30.0 | target near bowl ∧ `z < BOWL_RIM_Z` (= 0.06 m) ∧ gripper open ∧ settled, gated on lift (z ≥ 0.07 m) + over-bowl-above-rim (z ≥ 0.12 m within 6 cm xy) latches — see Eval-1 §4 |
+ | `gripper_open_above_bowl_lure` | +3.0 | target-aware port of Eval-1's lure: target currently over bowl and above release height ∧ `action[5] > 0` |
+ | `still_grasped_above_bowl_penalty` | −2.0 | target-aware port of Eval-1's anti-smash: target lifted ∧ near bowl ∧ gripper closed |
+-| `distractor_disturb` | −0.5 | continuous, proportional to distractor speed once `> 0.05 m/s` |
+-| `wrong_block_in_bowl` | **0 → −5** (20 k env-step ramp) | distractor settled in bowl |
++| `distractor_disturb` | 0.0 | diagnostic only; continuous signal when distractor speed is `> 0.05 m/s` |
++| `wrong_block_in_bowl` | 0.0 | diagnostic only; distractor settled in bowl |
+ | `action_rate`, `joint_vel` | −1e-4 → −1e-1 | 10 k env-step ramp, matched to Eval-1 |
+ 
+ γ = 0.98.
+ 
+-**Anti-hover / anti-smash terms + `wrong_block_in_bowl` ramp (2026-05-20 fix).** Two consecutive runs (`08-41-24`, `09-00-17`) of the pre-fix recipe stalled in a "reach-and-camp" basin: reach saturated near 0.7/step but `lifting_object = 0` for the entire 408-iter run, while `wrong_block_in_bowl` ramped to −1.06 weighted/episode (the distractor was drifting into the bowl during random exploration and the −5 fired before the policy had learned to discriminate "what I did" vs "ambient drift"). The current recipe ports Eval-1's latest release shaping target-keyed: EE-high-over-bowl reward stays active after release, open lure pays only when the target is currently high over the bowl, and closed-gripper penalty (w=−2) applies throughout the near-bowl zone to suppress low pressing. `wrong_block_in_bowl` still ramps 0 → −5 over 20 k env-steps so reach+lift consolidate before the distractor penalty turns on. 20 k > the 10 k action-rate ramp so the policy has cleared all reward shaping consolidation before the wrong-block penalty becomes load-bearing.
++**Anti-hover / anti-smash terms; wrong-cube terms are diagnostics only (2026-05-20 fix).** Two consecutive runs (`08-41-24`, `09-00-17`) of the pre-fix recipe stalled in a "reach-and-camp" basin: reach saturated near 0.7/step but `lifting_object = 0` for the entire 408-iter run, while `wrong_block_in_bowl` ramped to −1.06 weighted/episode (the distractor was drifting into the bowl during random exploration and the −5 fired before the policy had learned to discriminate "what I did" vs "ambient drift"). The current recipe ports Eval-1's latest release shaping target-keyed: EE-high-over-bowl reward stays active after release, open lure pays only when the target is currently high over the bowl, and closed-gripper penalty (w=−2) applies throughout the near-bowl zone to suppress low pressing. `distractor_disturb` and `wrong_block_in_bowl` are logged at zero weight: a wrong cube gets no reward and no penalty.
+ 
+ ## 4. Curriculum & DR
+ 
+ - `place_clutter_blocks` per §1 (static `min_block_separation = 0.12 m`, rejection-sampled).
+ - `reset_cube_positions_bias`: per-episode shared hand-eye bias U[−5, +5] mm + per-cube tape offset U[−2, +2] mm on `target_cube_pos_xy_noisy`; clears the post-grasp freeze latch.
+ - `reset_target_latches`: clears per-episode lift / over-bowl / success latches.
+-- Action-rate / joint-vel ramp at 10 k env-steps; `wrong_block_in_bowl` ramp 0 → −5 at 20 k env-steps (see §3).
++- Action-rate / joint-vel ramp at 10 k env-steps; `wrong_block_in_bowl` remains zero-weight diagnostic only (see §3).
+ - `log_target_success_metrics` TB metric (TC.success rate + sub-rates).
+ 
+ No image DR. Tightening curriculum (`min_block_separation: 0.12 → 0.08 m` over 20 k env-steps) is available as a one-line `events.py` change if the policy needs harder distributions; do not drop below 0.08 m without a corresponding reward-shaping pass — the SO-ARM gripper geometry constrains how close the distractor can be without contact during the approach.
+diff --git a/docs/EVAL3_PLAN.md b/docs/EVAL3_PLAN.md
+index e81d2a6..37d952c 100644
+--- a/docs/EVAL3_PLAN.md
++++ b/docs/EVAL3_PLAN.md
+@@ -42,7 +42,7 @@ Bitwise identical actor to Eval 2 (`[256, 128, 64]` ELU, σ scalar Param, RSL-RL
+ 
+ ## 5. Reward
+ 
+-Verbatim from Eval 2 with two changes: `wrong_cube_in_bowl` widens to "any non-target active cube settled in the bowl" at weight −15; no `distractor_disturb` term.
++Verbatim from Eval 2 with one change: `wrong_cube_in_bowl` widens to "any non-target active cube settled in the bowl", but remains a zero-weight diagnostic; no `distractor_disturb` term.
+ 
+ | Term | Weight | Trigger |
+ |---|---|---|
+@@ -51,7 +51,7 @@ Verbatim from Eval 2 with two changes: `wrong_cube_in_bowl` widens to "any non-t
+ | `transport_target_to_bowl` (coarse) | 16.0 | `was_lifted · (1 − tanh(‖target_xy − bowl_xy‖ / 0.30))` |
+ | `transport_target_to_bowl` (fine) | 5.0 | same with `std = 0.05` |
+ | `release_target_in_bowl` | 30.0 | target near bowl ∧ `z < BOWL_RIM_Z` (= 0.06 m) ∧ gripper open ∧ settled, gated on lift (z ≥ 0.07 m) + over-bowl-above-rim (z ≥ 0.12 m within 6 cm xy) latches — see Eval-1 §4 |
+-| `wrong_cube_in_bowl` | −15.0 | any non-target active cube in bowl |
++| `wrong_cube_in_bowl` | 0.0 | diagnostic only; any non-target active cube in bowl |
+ | `action_rate`, `joint_vel` | −1e-4 → −1e-2 | 10 k env-step ramp |
+ 
+ γ = 0.98.
+diff --git a/eval2_curr.png b/eval2_curr.png
+deleted file mode 100644
+index 686b400..0000000
+Binary files a/eval2_curr.png and /dev/null differ
+diff --git a/eval2_reward.png b/eval2_reward.png
+deleted file mode 100644
+index a575d6b..0000000
+Binary files a/eval2_reward.png and /dev/null differ
+diff --git a/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.onnx b/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.onnx
+index 53b9ae0..5daebaa 100644
+Binary files a/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.onnx and b/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.onnx differ
+diff --git a/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.pt b/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.pt
+index 3fc3b52..682a9cc 100644
+Binary files a/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.pt and b/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/exported/policy.pt differ
+diff --git a/isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/play.py b/isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/play.py
+index e51efb2..ab46b46 100644
+--- a/isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/play.py
++++ b/isaac_so_arm101/src/isaac_so_arm101/scripts/rsl_rl/play.py
+@@ -279,12 +279,104 @@ def _run_n_episodes(env, policy, args_cli, ckpt_path):
+ 
+     No per-step logs — just the aggregate. For per-step traces use ``--diag-rollouts``.
+     """
+-    import numpy as np
+-
+     base = env.unwrapped
+     n_envs = int(base.num_envs)
+     target_n = int(args_cli.n_episodes) * n_envs
+ 
++    if "SeqPickPlace" in args_cli.task:
++        device = base.device
++        counts = {
++            "episodes": 0,
++            "step0": 0,
++            "step1": 0,
++            "step2": 0,
++            "all": 0,
++            "step0_strict": 0,
++            "step1_strict": 0,
++            "step2_strict": 0,
++            "all_strict": 0,
++        }
++        ever = {
++            "seq": torch.zeros((n_envs, 3), dtype=torch.bool, device=device),
++            "seq_strict": torch.zeros((n_envs, 3), dtype=torch.bool, device=device),
++        }
++
++        print(f"[n-episodes] target {target_n} eps ({args_cli.n_episodes}/env × {n_envs} envs) "
++              f"on {args_cli.task}")
++        print(f"[n-episodes] ckpt: {ckpt_path}")
++        print("[n-episodes] latches: seq=_seq_success_per_step_latch, "
++              "seq_strict=_seq_success_per_step_latch_strict")
++        print("[n-episodes] Eval-3 episodes are 3 sub-goals / up to 750 sim steps; "
++              "first aggregate appears when the first envs finish.")
++
++        def _read_seq_latch(name):
++            t = getattr(base, name, None)
++            if t is None or t.dtype != torch.bool or t.shape[0] != n_envs or t.ndim != 2:
++                return None
++            return t[:, :3]
++
++        obs = env.get_observations()
++        step = 0
++        while counts["episodes"] < target_n:
++            with torch.inference_mode():
++                actions = policy(obs)
++                next_obs, _rewards, dones, _extras = env.step(actions)
++
++            dones_bool = dones.to(dtype=torch.bool, device=device) if hasattr(dones, "to") \
++                else torch.as_tensor(dones, dtype=torch.bool, device=device)
++            not_done = ~dones_bool
++
++            seq = _read_seq_latch("_seq_success_per_step_latch")
++            seq_strict = _read_seq_latch("_seq_success_per_step_latch_strict")
++            if seq is not None:
++                ever["seq"] |= seq & not_done.unsqueeze(-1)
++            if seq_strict is not None:
++                ever["seq_strict"] |= seq_strict & not_done.unsqueeze(-1)
++
++            if dones_bool.any():
++                done_idx = torch.nonzero(dones_bool, as_tuple=True)[0].tolist()
++                for i in done_idx:
++                    counts["episodes"] += 1
++                    seq_i = ever["seq"][i]
++                    seq_s_i = ever["seq_strict"][i]
++                    counts["step0"] += int(bool(seq_i[0].item()))
++                    counts["step1"] += int(bool(seq_i[1].item()))
++                    counts["step2"] += int(bool(seq_i[2].item()))
++                    counts["all"] += int(bool(seq_i.all().item()))
++                    counts["step0_strict"] += int(bool(seq_s_i[0].item()))
++                    counts["step1_strict"] += int(bool(seq_s_i[1].item()))
++                    counts["step2_strict"] += int(bool(seq_s_i[2].item()))
++                    counts["all_strict"] += int(bool(seq_s_i.all().item()))
++                    ever["seq"][i] = False
++                    ever["seq_strict"][i] = False
++
++                if counts["episodes"] % max(1, n_envs) == 0 or counts["episodes"] >= target_n:
++                    n = counts["episodes"]
++                    print(f"  [{n:4d}/{target_n}]  "
++                          f"step0={counts['step0']/n:.3f}  "
++                          f"step1={counts['step1']/n:.3f}  "
++                          f"step2={counts['step2']/n:.3f}  "
++                          f"all={counts['all']/n:.3f}")
++            elif step > 0 and step % 250 == 0:
++                print(f"  [steps={step}] waiting for completed Eval-3 episodes...")
++
++            obs = next_obs
++            step += 1
++
++        n = max(counts["episodes"], 1)
++        print()
++        print(f"=== Aggregate ({n} episodes, {step} steps, {args_cli.task}) ===")
++        print(f"  ckpt:                 {ckpt_path}")
++        print(f"  step0_success:        {counts['step0']}/{n} = {counts['step0']/n:.3f}")
++        print(f"  step1_success:        {counts['step1']}/{n} = {counts['step1']/n:.3f}")
++        print(f"  step2_success:        {counts['step2']}/{n} = {counts['step2']/n:.3f}")
++        print(f"  all_steps_success:    {counts['all']}/{n} = {counts['all']/n:.3f}")
++        print(f"  step0_success_strict: {counts['step0_strict']}/{n} = {counts['step0_strict']/n:.3f}")
++        print(f"  step1_success_strict: {counts['step1_strict']}/{n} = {counts['step1_strict']/n:.3f}")
++        print(f"  step2_success_strict: {counts['step2_strict']}/{n} = {counts['step2_strict']/n:.3f}")
++        print(f"  all_steps_strict:     {counts['all_strict']}/{n} = {counts['all_strict']/n:.3f}")
++        return
++
+     # Pick latch names by task family. The target_* latches on Eval-2/3 envs
+     # are allocated lazily on the first call to ``release_target_in_bowl``,
+     # which only happens after the first env.step(). A pre-loop hasattr probe
+@@ -703,7 +795,7 @@ def _finalize_episode(s, ep_idx, n_steps, last_row, bowl_xy_obs):
+ 
+ 
+ @hydra_task_config(args_cli.task, args_cli.agent)
+-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
++def _main_impl(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+     """Play with RSL-RL agent."""
+     # grab task name for checkpoint path
+     task_name = args_cli.task.split(":")[-1]
+@@ -870,8 +962,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     return 0
+ 
+ 
++def main() -> int:
++    """Console entrypoint.
++
++    Isaac Lab's Hydra wrapper may return ``None`` even when the wrapped
++    function exits cleanly. The generated console script calls
++    ``sys.exit(main())``; under Isaac Kit, ``sys.exit(None)`` is routed to
++    ``app.post_quit(None)``, which raises a TypeError. Normalize clean exits
++    to an integer return code.
++    """
++    status = _main_impl()
++    return 0 if status is None else int(status)
++
++
+ if __name__ == "__main__":
+     # run the main function
+     main()
+     # close sim app
+-    simulation_app.close()
+\ No newline at end of file
++    simulation_app.close()
+diff --git a/isaac_so_arm101/src/isaac_so_arm101/tasks/clutterpickplace/clutterpickplace_env_cfg.py b/isaac_so_arm101/src/isaac_so_arm101/tasks/clutterpickplace/clutterpickplace_env_cfg.py
+index 8d90652..2f2fa7e 100644
+--- a/isaac_so_arm101/src/isaac_so_arm101/tasks/clutterpickplace/clutterpickplace_env_cfg.py
++++ b/isaac_so_arm101/src/isaac_so_arm101/tasks/clutterpickplace/clutterpickplace_env_cfg.py
+@@ -391,13 +391,12 @@ class EventCfg:
+ class RewardsCfg:
+     """Reward stack — direct port of Eval-1 weights, target-cube-indexed.
+ 
+-    Adds two distractor-aware penalties:
++    Tracks two distractor-aware diagnostics at zero weight:
+ 
+-    * ``distractor_disturb``  (weight=-0.5) — small penalty for shoving
+-      the wrong cube.
+-    * ``wrong_block_in_bowl`` (weight=-20.0) — heavy penalty for placing
+-      the wrong cube in the bowl. Sized comparable to ``release_target_in_bowl``'s
+-      +30 so a successful target placement still wins net.
++    * ``distractor_disturb`` — shoving the wrong cube.
++    * ``wrong_block_in_bowl`` — placing the wrong cube in the bowl.
++      These remain logged, but they deliberately do not shape PPO:
++      wrong-object behavior gets no reward and no penalty.
+ 
+     Other weights match Eval-1's tuned recipe (reach 1, lift 15,
+     transport 16, transport_fine 5, release 30, action_rate -1e-4 →
+@@ -459,20 +458,14 @@ class RewardsCfg:
+         func=mdp.target_still_grasped_above_bowl_penalty, weight=-2.0,
+     )
+ 
+-    # Distractor-aware shaping (Eval-2 specific).
++    # Distractor-aware diagnostics (Eval-2 specific). Keep these terms at
++    # zero weight so a wrong cube gets no reward and no penalty. Penalizing
++    # them during early exploration produced a "move less" basin before the
++    # policy had learned reliable target lift.
+     distractor_disturb = RewTerm(
+-        func=mdp.distractor_disturb_penalty, weight=-0.5,
++        func=mdp.distractor_disturb_penalty, weight=0.0,
+         params={"threshold_speed": 0.05},
+     )
+-    # Start at 0 and ramp to -5 over 20k env-steps (see CurriculumCfg).
+-    # Reason: prior runs showed the distractor drifting into the bowl
+-    # during random-policy exploration (run 09-00-17: ramped to -1.06
+-    # weighted/episode = 21% of steps firing). Penalising that before the
+-    # policy has learned to reach + lift creates a "stay still" attractor
+-    # — the policy can't tell what motion caused the penalty so safest
+-    # response is no motion. Ramping in once reach + lift are established
+-    # preserves the directional signal (correct release +30 > wrong-block
+-    # -5) without poisoning early exploration.
+     wrong_block_in_bowl = RewTerm(func=mdp.wrong_block_in_bowl, weight=0.0)
+ 
+     # Penalties — ramped via curriculum, same as Eval-1.
+@@ -533,14 +526,6 @@ class CurriculumCfg:
+         func=mdp.modify_reward_weight,
+         params={"term_name": "joint_vel", "weight": -1e-1, "num_steps": 10000},
+     )
+-    # Ramp wrong_block_in_bowl 0 → -5 over 20k env-steps. See RewardsCfg
+-    # docstring for the rationale (early -5 was poisoning exploration).
+-    # 20k > 15k action ramp so reach + lift consolidate before the
+-    # distractor penalty turns on.
+-    wrong_block_in_bowl = CurrTerm(
+-        func=mdp.modify_reward_weight,
+-        params={"term_name": "wrong_block_in_bowl", "weight": -5.0, "num_steps": 20000},
+-    )
+     log_success = CurrTerm(func=mdp.log_target_success_metrics, params={})
+ 
+ 
+diff --git a/isaac_so_arm101/src/isaac_so_arm101/tasks/seqpickplace/seqpickplace_env_cfg.py b/isaac_so_arm101/src/isaac_so_arm101/tasks/seqpickplace/seqpickplace_env_cfg.py
+index 695b67c..82826e5 100644
+--- a/isaac_so_arm101/src/isaac_so_arm101/tasks/seqpickplace/seqpickplace_env_cfg.py
++++ b/isaac_so_arm101/src/isaac_so_arm101/tasks/seqpickplace/seqpickplace_env_cfg.py
+@@ -316,7 +316,10 @@ class RewardsCfg:
+         params={"weight_per_step": (4.0, 4.0, 2.0)},
+         weight=1.0,
+     )
+-    wrong_in_bowl = RewTerm(func=mdp.wrong_cube_in_current_bowl, weight=-15.0)
++    # Diagnostic only: wrong-object-in-bowl gets no reward and no penalty.
++    # This avoids training against already-completed sub-goals in the
++    # sequential task while still logging the event.
++    wrong_in_bowl = RewTerm(func=mdp.wrong_cube_in_current_bowl, weight=0.0)
+ 
+     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+     joint_vel = RewTerm(
