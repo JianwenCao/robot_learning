@@ -218,12 +218,11 @@ class SoArm101SeqPickPlaceStateAprilTagEnvCfg(SoArm101SeqPickPlaceTeacherFastEnv
 
     def __post_init__(self):
         super().__post_init__()
-        self.events.reset_all = EventTerm(func=mdp.reset_robot_to_default, mode="reset")
-        self.events.place_blocks = EventTerm(
-            func=mdp.place_seq_blocks_once,
-            mode="reset",
-            params=self.events.place_blocks.params,
-        )
+        # Keep the base Eval-3 episode reset semantics: reset the full scene
+        # and resample cube/bowl/sequence state on every episode boundary.
+        # Sub-goal transitions still only return the arm home inside
+        # SequentialGoalCommand._update_command; this block is only for the
+        # all-steps-done/time-out/failure episode reset path.
         self.events.reset_cube_positions_bias = EventTerm(
             func=mdp.reset_cube_positions_bias, mode="reset"
         )
