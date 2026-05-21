@@ -32,7 +32,7 @@ All commands below are intended to be run from the [`isaac_so_arm101`](isaac_so_
 
 ### Single Cube: Random Color to Bowl
 
-<video src="videos/clipped/eval1.mp4" controls muted loop playsinline width="100%"></video>
+[![Single-cube pick-and-place demo](videos/clipped/eval1.gif)](videos/clipped/eval1.mp4)
 
 The agent picks one randomly colored cube and places it into the target bowl.
 
@@ -44,7 +44,7 @@ succ_rate: 100/100 = 1.000
 
 ### Two Cubes: Color-Conditioned Target Selection
 
-<video src="videos/clipped/eval2.mp4" controls muted loop playsinline width="100%"></video>
+[![Two-cube color-conditioned pick-and-place demo](videos/clipped/eval2.gif)](videos/clipped/eval2.mp4)
 
 The scene contains two cubes. At reset, a target color is sampled, and the agent must pick the matching cube and place it in the bowl.
 
@@ -54,7 +54,7 @@ succ_strict: 94/100 = 0.940
 
 ### Four Cubes: Ordered Sequential Pick-and-Place
 
-<video src="videos/clipped/eval3.mp4" controls muted loop playsinline width="100%"></video>
+[![Four-cube ordered sequential pick-and-place demo](videos/clipped/eval3.gif)](videos/clipped/eval3.mp4)
 
 The scene contains four cubes. A sequence of three target colors is sampled, and the agent must place the requested cubes into the bowl in order.
 
@@ -67,7 +67,7 @@ all_steps_strict:     65/100 = 0.650
 
 ### Vision-Based Student Policy
 
-<video src="videos/clipped/vision.mp4" controls muted loop playsinline width="100%"></video>
+[![Vision-based student policy demo](videos/clipped/vision.gif)](videos/clipped/vision.mp4)
 
 The vision student runs the single-cube bowl task from visual observations.
 
@@ -79,7 +79,7 @@ succ_rate: 55/100 = 0.550
 
 ### Real-World SO-ARM101 Demo
 
-<video src="videos/clipped/real_life.mp4" controls muted loop playsinline width="100%"></video>
+[![Real-world SO-ARM101 demo](videos/clipped/real_life.gif)](videos/clipped/real_life.mp4)
 
 ## Running the Evaluations
 
