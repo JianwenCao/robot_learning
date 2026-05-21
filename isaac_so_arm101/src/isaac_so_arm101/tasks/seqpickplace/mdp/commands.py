@@ -8,10 +8,9 @@
 Encapsulates everything the 3-step sequential task needs:
 
 * Per-episode sampling of:
-  - ``active_indices`` ``(N, 4)`` long — up to 4 of the 6 palette cubes.
-  - ``active_count`` ``(N,)`` long in {2, 3, 4} — how many active slots
-    are placed in the workspace.
-  - ``goal_color_pos`` ``(N, 1)`` long — which active slot is the target.
+  - ``active_indices`` ``(N, 4)`` long — four active palette cubes.
+  - ``active_count`` ``(N,)`` long, normally 4.
+  - ``goal_color_pos`` ``(N, 3)`` long — ordered active slots to pick.
   - ``bowl_positions`` ``(N, 1, 2)`` float — the single bowl xy position
     in the robot frame, sampled with rejection so it's ≥
     ``min_bowl_block_separation`` from every cube. All 3 sequential
@@ -43,11 +42,9 @@ from isaaclab.utils import configclass
 from .events import N_ACTIVE_BLOCKS, N_BOWLS, N_GOAL_STEPS, NUM_COLORS
 
 # Per-sub-goal step budget. 250 steps = 5 s @ 50 Hz, matching the
-# Eval-1 / Eval-2 single-shot episode length the zero-shot actor was
-# trained for. If a sub-goal isn't released within this budget, the
-# command term auto-advances to the next sub-goal (after arm return-
-# to-home) so the rollout can still attempt the remaining sub-goals.
-# Total rollout budget is one single-shot attempt: 250 steps = 5 s.
+# Eval-1 / Eval-2 single-shot episode length. If a sub-goal is not
+# released within this budget, the command advances to the next target
+# after returning the arm home. Total rollout budget is 750 steps = 15 s.
 MAX_STEPS_PER_SUBGOAL = 250
 
 if TYPE_CHECKING:
@@ -81,9 +78,7 @@ class SequentialGoalCommand(CommandTerm):
         if not hasattr(env, "_seq_step_idx"):
             env._seq_step_idx = torch.zeros(N, dtype=torch.long, device=device)
         # Per-sub-goal step counter — incremented every env step in
-        # _update_command, reset on advance. Used to enforce a per-sub-
-        # goal timeout so a failed sub-goal doesn't consume the whole
-        # 15 s rollout and starve later sub-goals.
+        # _update_command, reset on success/timeout advance.
         if not hasattr(env, "_seq_sub_step_count"):
             env._seq_sub_step_count = torch.zeros(N, dtype=torch.long, device=device)
         # Hot-path lookup buffers used by observations and rewards. Must be
@@ -175,21 +170,13 @@ class SequentialGoalCommand(CommandTerm):
     # ---------------------------------------------------------- per-step update
 
     def _update_command(self) -> None:
-        """Advance step idx on release-success OR per-sub-goal timeout.
+        """Advance step idx on release success or sub-goal timeout.
 
-        Two advance triggers:
-
-        * **Success** — the reward term
-          :func:`mdp.rewards.release_current_target_in_bowl` sets
-          ``env._seq_step_release_indicator`` True for envs that
-          satisfied the release predicate this step.
-        * **Timeout** — ``env._seq_sub_step_count`` reached
-          ``MAX_STEPS_PER_SUBGOAL`` without a release. Without this,
-          a failed first sub-goal consumes the whole 15 s rollout and
-          sub-goals 2/3 never get attempted (the Eval-1 zero-shot
-          actor is a single-shot "from home, grasp + place" policy —
-          if its first attempt misses, no recovery in-place is
-          possible without explicit retraction).
+        The reward term :func:`mdp.rewards.release_current_target_in_bowl`
+        sets ``env._seq_step_release_indicator`` True for envs that
+        satisfied the release predicate this step. If the target is not
+        released within ``MAX_STEPS_PER_SUBGOAL``, the env switches to the
+        next target anyway.
 
         On advance, we also **teleport the arm back to its home pose**
         (zero velocity, default joint positions including gripper
@@ -230,9 +217,8 @@ class SequentialGoalCommand(CommandTerm):
             env._seq_step_release_indicator[advance] = False
 
         # Hard return to the per-episode randomized initial pose after a
-        # successful/timeout advance. For the training MDP this happens
-        # right before all_done termination; deploy mirrors it with a
-        # scripted reset-to-start primitive between target switches.
+        # successful/timeout sub-goal. The scene objects are intentionally
+        # left untouched between target switches.
         retract_ids = torch.nonzero(advance, as_tuple=True)[0]
         if hasattr(env, "_seq_initial_joint_pos"):
             home_q = env._seq_initial_joint_pos[retract_ids].clone()

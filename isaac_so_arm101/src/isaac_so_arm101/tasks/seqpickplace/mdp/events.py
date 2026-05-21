@@ -48,18 +48,47 @@ HIDDEN_PARK_XY: tuple[tuple[float, float], ...] = tuple(
     (-0.60, -0.25 + 0.10 * i) for i in range(NUM_COLORS)
 )
 
-# Eval-3 training task constants. The training MDP is a single-target
-# pick-place skill in variable clutter (2/3/4 active cubes). Deployment
-# sequences this skill externally by re-keying the target tag after each
-# successful release.
+# Eval-3 sequence constants: four cubes are active on the table, three
+# distinct cubes are picked in order, and the remaining active cube is a
+# distractor.
 N_ACTIVE_BLOCKS = 4
-N_GOAL_STEPS = 1
+N_GOAL_STEPS = 3
 N_BOWLS = 1  # Single bowl per rollout.
 
 
 # ---------------------------------------------------------------------------
 # Placement
 # ---------------------------------------------------------------------------
+
+
+def reset_robot_to_default(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    asset_name: str = "robot",
+    reset_joint_targets: bool = False,
+) -> None:
+    """Reset only the robot articulation, leaving cubes untouched."""
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        ids = env_ids.long()
+    else:
+        if len(env_ids) == 0:
+            return
+        ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    robot = env.scene[asset_name]
+    root_state = robot.data.default_root_state[ids].clone()
+    root_state[:, 0:3] += env.scene.env_origins[ids]
+    robot.write_root_pose_to_sim(root_state[:, :7], env_ids=ids)
+    robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids=ids)
+
+    joint_pos = robot.data.default_joint_pos[ids].clone()
+    joint_vel = robot.data.default_joint_vel[ids].clone()
+    robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=ids)
+    if reset_joint_targets:
+        robot.set_joint_position_target(joint_pos, env_ids=ids)
+        robot.set_joint_velocity_target(joint_vel, env_ids=ids)
 
 
 def place_seq_blocks(
@@ -70,14 +99,14 @@ def place_seq_blocks(
     min_block_separation: float = 0.12,
     table_z: float = 0.01,
     max_attempts: int = 80,
-    active_count_choices: tuple[int, ...] = (2, 3, 4),
+    active_count_choices: tuple[int, ...] = (4,),
     bowl_x: tuple[float, float] = (0.15, 0.28),
     bowl_y: tuple[float, float] = (-0.12, 0.12),
     min_bowl_block_separation: float = 0.10,
     command_name: str = "seq_goal",
     cube_prefix: str = "cube_",
 ) -> None:
-    """Sample one target in variable clutter, then place 2/3/4 cubes + 1 bowl.
+    """Sample a 3-target sequence, then place 4 cubes + 1 bowl.
 
     Per-episode sampling is done here (not in
     :class:`SequentialGoalCommand`) because Isaac Lab's reset pipeline
@@ -86,14 +115,14 @@ def place_seq_blocks(
 
     * ``env._seq_active_indices``    ``(N, 4)`` long — palette indices of
       up to 4 active cubes per env.
-    * ``env._seq_active_count``      ``(N,)`` long ∈ {2, 3, 4}; slots at
-      index >= active_count are parked off-table and ignored by masks.
-    * ``env._seq_goal_color_pos``    ``(N, 1)`` long ∈ [0, active_count)
-      — the target slot inside ``active_indices``.
+    * ``env._seq_active_count``      ``(N,)`` long, normally all 4.
+    * ``env._seq_goal_color_pos``    ``(N, 3)`` long ∈ [0, active_count)
+      — ordered target slots inside ``active_indices``. The fourth active
+      cube is a distractor.
     * ``env._seq_bowl_positions``    ``(N, 1, 2)`` float — bowl xy in
       robot frame, rejection-sampled against the 4 placed cubes
       (≥ ``min_bowl_block_separation``).
-    * ``env._target_cube_idx_per_step`` ``(N, 1)`` long — derived
+    * ``env._target_cube_idx_per_step`` ``(N, 3)`` long — derived
       ``active[step_color_pos[step]]`` per step, cached for hot-path
       reward access.
 
@@ -119,9 +148,15 @@ def place_seq_blocks(
     device = env.device
 
     # -----------------------------------------------------------------
-    # Sample active cubes + single target + bowl positions.
+    # Sample active cubes + target sequence + bowl position.
     # -----------------------------------------------------------------
     choices = torch.tensor(active_count_choices, device=device, dtype=torch.long)
+    choices = choices[(choices >= N_GOAL_STEPS) & (choices <= N_ACTIVE_BLOCKS)]
+    if choices.numel() == 0:
+        raise ValueError(
+            f"active_count_choices must include values in [{N_GOAL_STEPS}, {N_ACTIVE_BLOCKS}], "
+            f"got {active_count_choices}."
+        )
     active_count = choices[torch.randint(0, choices.numel(), (n,), device=device)]
 
     # Up to 4 distinct palette indices. Only slots < active_count are
@@ -129,8 +164,13 @@ def place_seq_blocks(
     perms = torch.argsort(torch.rand((n, NUM_COLORS), device=device), dim=1)
     active = perms[:, :N_ACTIVE_BLOCKS]  # (n, 4)
 
-    # Single target slot, uniformly sampled among actually active cubes.
-    goal_color_pos = torch.floor(torch.rand((n, 1), device=device) * active_count.view(-1, 1)).long()
+    # Three distinct target slots, sampled in order from the active cubes.
+    # Slots not active in a given env get a high score and cannot enter
+    # the first N_GOAL_STEPS entries after argsort.
+    slot_ids = torch.arange(N_ACTIVE_BLOCKS, device=device).view(1, -1)
+    scores = torch.rand((n, N_ACTIVE_BLOCKS), device=device)
+    scores = torch.where(slot_ids < active_count.view(-1, 1), scores, torch.full_like(scores, 2.0))
+    goal_color_pos = torch.argsort(scores, dim=1)[:, :N_GOAL_STEPS]
 
     # Single bowl per rollout — buffer kept ``(N, N_BOWLS=1, 2)`` for
     # uniformity with the existing observation/reward plumbing.
@@ -263,6 +303,60 @@ def place_seq_blocks(
     env._target_cube_idx_per_step[env_ids_t] = active.gather(1, goal_color_pos)
 
 
+def place_seq_blocks_once(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    block_x: tuple[float, float] = (0.13, 0.28),
+    block_y: tuple[float, float] = (-0.15, 0.15),
+    min_block_separation: float = 0.12,
+    table_z: float = 0.01,
+    max_attempts: int = 80,
+    active_count_choices: tuple[int, ...] = (4,),
+    bowl_x: tuple[float, float] = (0.15, 0.28),
+    bowl_y: tuple[float, float] = (-0.12, 0.12),
+    min_bowl_block_separation: float = 0.10,
+    command_name: str = "seq_goal",
+    cube_prefix: str = "cube_",
+) -> None:
+    """Place cubes only on the first reset for each env.
+
+    Later episode resets preserve the live cube poses while the robot
+    reset/latch events still prepare the next rollout.
+    """
+    if isinstance(env_ids, torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        ids = env_ids.long()
+    else:
+        if len(env_ids) == 0:
+            return
+        ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    if not hasattr(env, "_seq_blocks_initialized"):
+        env._seq_blocks_initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+
+    init_ids = ids[~env._seq_blocks_initialized[ids]]
+    if init_ids.numel() == 0:
+        return
+
+    place_seq_blocks(
+        env,
+        init_ids,
+        block_x=block_x,
+        block_y=block_y,
+        min_block_separation=min_block_separation,
+        table_z=table_z,
+        max_attempts=max_attempts,
+        active_count_choices=active_count_choices,
+        bowl_x=bowl_x,
+        bowl_y=bowl_y,
+        min_bowl_block_separation=min_bowl_block_separation,
+        command_name=command_name,
+        cube_prefix=cube_prefix,
+    )
+    env._seq_blocks_initialized[init_ids] = True
+
+
 def randomize_robot_initial_joint_pos(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
@@ -332,6 +426,8 @@ def reset_seq_latches(env: "ManagerBasedEnv", env_ids: torch.Tensor) -> None:
 
     if hasattr(env, "_seq_step_idx"):
         env._seq_step_idx[ids] = 0
+    if hasattr(env, "_seq_sub_step_count"):
+        env._seq_sub_step_count[ids] = 0
     if hasattr(env, "_seq_was_grasped"):
         env._seq_was_grasped[ids] = False
     if hasattr(env, "_seq_was_over_bowl_above_rim"):

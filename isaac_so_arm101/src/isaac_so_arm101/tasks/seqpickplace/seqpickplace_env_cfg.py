@@ -256,7 +256,7 @@ class EventCfg:
             "min_block_separation": 0.12,
             "table_z": 0.01,
             "max_attempts": 80,
-            "active_count_choices": (2, 3, 4),
+            "active_count_choices": (4,),
             # 2026-05-20: unified to (0.18, 0.30) × (-0.15, 0.15) across
             # Eval-1/2/3 — see EVAL1 docstring for the reach-envelope
             # rationale. Eval-3 previously used a tighter (0.18, 0.26) × ±0.08
@@ -402,7 +402,8 @@ class SeqPickPlaceEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
-        # 5 s = 250 steps @ 50 Hz, matching the single-shot Task-1/2 skill.
-        self.episode_length_s = 5.0
+        # Three 5 s sub-goals @ 50 Hz; the command resets only the arm
+        # between successful sub-goals.
+        self.episode_length_s = 15.0
         self.viewer.eye = (2.5, 2.5, 1.5)
         _multicube_sim.apply_multicube_sim_settings(self)

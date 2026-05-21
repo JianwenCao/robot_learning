@@ -39,7 +39,9 @@ from .events import (  # noqa: F401
     N_ACTIVE_BLOCKS,
     N_GOAL_STEPS,
     place_seq_blocks,
+    place_seq_blocks_once,
     randomize_robot_initial_joint_pos,
+    reset_robot_to_default,
     reset_seq_latches,
 )
 from .observations import (  # noqa: F401

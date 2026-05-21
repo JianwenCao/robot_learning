@@ -218,6 +218,12 @@ class SoArm101SeqPickPlaceStateAprilTagEnvCfg(SoArm101SeqPickPlaceTeacherFastEnv
 
     def __post_init__(self):
         super().__post_init__()
+        self.events.reset_all = EventTerm(func=mdp.reset_robot_to_default, mode="reset")
+        self.events.place_blocks = EventTerm(
+            func=mdp.place_seq_blocks_once,
+            mode="reset",
+            params=self.events.place_blocks.params,
+        )
         self.events.reset_cube_positions_bias = EventTerm(
             func=mdp.reset_cube_positions_bias, mode="reset"
         )
