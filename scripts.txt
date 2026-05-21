@@ -1,0 +1,48 @@
+lerobot-find-port
+sudo chmod 666 /dev/ttyACM0
+lerobot-setup-motors --robot.type=so101_follower --robot.port=/dev/ttyACM0
+lerobot-calibrate --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=eva-follower
+    Calibration saved to /home/jianwen/.cache/huggingface/lerobot/calibration/robots/so_follower/eva.json
+
+lerobot-setup-motors --teleop.type=so101_leader --teleop.port=/dev/ttyACM1
+lerobot-calibrate --teleop.type=so101_leader --teleop.port=/dev/ttyACM1 --teleop.id=eva
+    /home/jianwen/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/eva.json
+
+训练ACT
+lerobot-train --dataset.repo_id=JianwenCao/demo --policy.type=act --output_dir=./outputs/train/50eposides --policy.device=cuda --wandb.enable=true --policy.repo_id=JianwenCao/act_demo
+
+微调Pi0
+PYTORCH_ALLOC_CONF=expandable_segments:True lerobot-train \
+  --policy.type=pi0 \
+  --dataset.repo_id=JianwenCao/retail \
+  --policy.repo_id=JianwenCao/pi0_retail \
+  --policy.pretrained_path=/home/jianwen/Code/eva/lerobot/pi0_patched \
+  --output_dir=./outputs/pi0_retail_carrot \
+  --job_name=pi0 \
+  --steps=80000 \
+  --save_freq=8000 \
+  --batch_size=4 \
+  --policy.dtype=bfloat16 \
+  --policy.compile_model=true \
+  --dataset.image_transforms.enable=true \
+  --dataset.revision=main \
+  --wandb.enable=true \
+  --policy.optimizer_lr=1e-4 \
+  --policy.scheduler_warmup_steps=2000 \
+  --policy.scheduler_decay_steps=20000 \
+  --policy.scheduler_decay_lr=1e-6 \
+  --peft.method_type=LORA \
+  --peft.r=16 \
+  --peft.target_modules='(.*vision_tower.*\.(q_proj|k_proj|v_proj|out_proj|fc1|fc2)|.*gemma_expert.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj))' \
+  --peft.full_training_modules='[action_in_proj,action_out_proj,action_time_mlp_in,action_time_mlp_out,state_proj,multi_modal_projector]'
+
+
+hf upload JianwenCao/act_demo outputs/train/50eposides/checkpoints/last/pretrained_model
+
+
+CUDA_LAUNCH_BLOCKING=1 TORCH_COMPILE_DISABLE=1 python -m lerobot.async_inference.policy_server \
+     --host=127.0.0.1 \
+     --port=8080 \
+     --fps=30 \
+     --inference_latency=0.033 \
+     --obs_queue_timeout=1

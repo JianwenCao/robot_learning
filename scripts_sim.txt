@@ -1,0 +1,111 @@
+./isaaclab.sh -p scripts/sim_sparm.py --enable_cameras
+conda run -n isaac python train_ppo.py --num_envs 8 --total_timesteps 500000000
+
+查看初始位置
+./IsaacLab/isaaclab.sh -p ./rl/view_env.py --enable_cameras --obs_mode vision --num_envs 1
+
+推理
+./IsaacLab/isaaclab.sh -p ./rl/infer_sim.py --obs_mode state --ckpt /home/jianwen/Code/eva/rl/logs/ppo_soarm_grasping/model_final.zip --episodes 3 --num_envs 1 --headless --record_video
+
+
+训练
+cd /home/jianwen/Code/eva/robot-learning/isaac_so_arm101
+uv run train --task Isaac-SO-ARM101-PickPlace-Bowl-StateAprilTag-v0 --headless --resume --load_run 2026-05-20_12-16-05 --checkpoint model_1499.pt --max_iterations 500
+uv run train --task Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0 --headless --max_iterations 500
+uv run train --task Isaac-SO-ARM101-SeqPickPlace-StateAprilTag-v0 --headless
+uv run train \
+    --task Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0 \
+    --headless \
+    --actor-only \
+    --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/model_1450.pt \
+    --run_name from_eval1_134940_m1450_aligned \
+    --max_iterations 500
+uv run train     --task Isaac-SO-ARM101-PickPlace-Bowl-Student-v0     --headless     --enable_cameras     --num_envs 128     --dump_cnn_inputs     --cnn_dump_interval 200     --cnn_dump_max_envs 4     --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-21_08-23-07/model_400.pt
+uv run train \
+    --task Isaac-SO-ARM101-PickPlace-Bowl-Student-v0 \
+    --headless \
+    --enable_cameras \
+    --num_envs 128 \
+    --dump_cnn_inputs \
+    --cnn_dump_interval 200 \
+    --cnn_dump_max_envs 4 \
+    --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-21_08-23-07/model_400.pt \
+    --distill_then_ppo \
+    --distill_iterations 500 \
+    --ppo_iterations 1000
+
+推理
+uv run play     --task Isaac-SO-ARM101-PickPlace-Bowl-StateAprilTag-Play-v0   --num_envs 1  --load_run 2026-05-20_13-49-40  --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/model_1450.pt
+uv run play \
+      --task Isaac-SO-ARM101-PickPlace-Bowl-StateAprilTag-Play-v0 \
+      --actor-only \
+      --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-21_08-23-07/model_400.pt \
+      --num_envs 1
+uv run play \
+      --task Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0 \
+      --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/clutterpickplace_state_apriltag/2026-05-20_18-30-08/model_1499.pt \
+      --num_envs 1
+
+uv run play \
+    --task Isaac-SO-ARM101-PickPlace-Bowl-Student-v0 \
+    --enable_cameras \
+    --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_student/2026-05-21_05-23-59/model_750.pt \
+    --num_envs 1 \
+    --n-episodes 5
+
+测评
+uv run play \
+      --task Isaac-SO-ARM101-PickPlace-Bowl-StateAprilTag-v0 \
+      --headless \
+      --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/model_1450.pt \
+      --num_envs 100 \
+      --n-episodes 1
+    lift_rate:   100/100 = 1.000
+    bowl_rate:   100/100 = 1.000
+    succ_rate:   100/100 = 1.000
+
+uv run play \
+      --task Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0 \
+      --headless \
+      --actor-only \
+      --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/model_1450.pt \
+      --num_envs 100 \
+      --n-episodes 1
+  lift_rate:   89/100 = 0.890
+  bowl_rate:   67/100 = 0.670
+  succ_rate:   63/100 = 0.630
+  succ_strict: 84/100 = 0.840
+uv run play \
+      --task Isaac-SO-ARM101-ClutterPickPlace-StateAprilTag-v0 \
+      --headless \
+      --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/clutterpickplace_state_apriltag/2026-05-20_18-30-08/model_1499.pt \
+      --num_envs 100 \
+      --n-episodes 1
+  lift_rate:   100/100 = 1.000
+  bowl_rate:   89/100 = 0.890
+  succ_rate:   89/100 = 0.890
+  succ_strict: 94/100 = 0.940
+
+uv run play \
+      --task Isaac-SO-ARM101-SeqPickPlace-StateAprilTag-v0 \
+      --headless \
+      --actor-only \
+      --checkpoint /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_state_apriltag/2026-05-20_13-49-40/model_1450.pt \
+      --num_envs 100 \
+      --n-episodes 1
+  step0_success:        77/100 = 0.770
+  step1_success:        71/100 = 0.710
+  step2_success:        68/100 = 0.680
+  all_steps_success:    41/100 = 0.410
+  step0_success_strict: 91/100 = 0.910
+  step1_success_strict: 86/100 = 0.860
+  step2_success_strict: 92/100 = 0.920
+  all_steps_strict:     71/100 = 0.710
+
+
+
+OMNI_KIT_ACCEPT_EULA=YES uv run python src/isaac_so_arm101/scripts/teleop_sim_mirror.py --task Isaac-SO-ARM101-PickPlace-Bowl-Play-v0 --enable_cameras
+python /home/jianwen/Code/eva/robot-learning/deploy/teleop_real_pub.py
+
+真机推理
+python -m deploy.deploy_policy_vision_real     --ckpt /home/jianwen/Code/eva/robot-learning/isaac_so_arm101/logs/rsl_rl/pickplace_bowl_student/2026-05-21_05-23-59/model_900.pt    --bowl-xy 0.24,0.00     --camera /dev/video1     --port /dev/ttyACM0     --debug-dump --max-rad-per-step 0.08

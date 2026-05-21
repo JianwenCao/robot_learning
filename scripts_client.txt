@@ -1,0 +1,96 @@
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/video3 --list-formats-ext
+lerobot-find-port
+
+lerobot-calibrate --teleop.type=so101_leader --teleop.port=/dev/ttyACM1 --teleop.id=eva-leader
+    /home/jianwen/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/eva-leader.json
+
+lerobot-calibrate --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=eva-follower
+    /home/jianwen/.cache/huggingface/lerobot/calibration/robots/so_follower/eva-follower.json
+
+录制
+sudo /home/jianwen/miniconda3/envs/eva/bin/python record.py
+
+可视化某个eposide
+lerobot-dataset-viz --repo-id JianwenCao/demo --root /home/jianwen/.cache/huggingface/lerobot/JianwenCao/demo --mode local --episode-index 0
+
+查看总eposide数量
+cat /home/jianwen/.cache/huggingface/lerobot/JianwenCao/demo/meta/info.json | grep total_episodes
+
+删除某个eposide
+lerobot-edit-dataset --repo_id JianwenCao/demo --root /home/jianwen/.cache/huggingface/lerobot/JianwenCao/demo --operation.type delete_episodes --operation.episode_indices "[10]"
+
+上传数据集
+hf upload datasets/JianwenCao/demo /home/jianwen/.cache/huggingface/lerobot/JianwenCao/demo .
+
+ssh -L 8080:localhost:8080 jianwen@100.92.78.88
+
+python interactive_client.py \
+--server_address=192.168.68.66:8080 \
+--robot.type=so101_follower \
+--robot.port=/dev/ttyACM0 \
+--robot.id=eva-follower \
+--robot.calibration_dir=/home/jianwen/.cache/huggingface/lerobot/calibration/robots/so_follower \
+--robot.cameras="{ front: {type: opencv, index_or_path: 3, width: 640, height: 480, fps: 30}, top: {type: opencv, index_or_path: 0, width: 1280, height: 720, fps: 30}}" \
+--policy_type=pi0 \
+--pretrained_name_or_path=/home/jianwen/Code/eva/outputs/pi0_retail_carrot/checkpoints/040000/merged_model \
+--policy_device=cuda \
+--actions_per_chunk=50 \
+--aggregate_fn_name=weighted_average \
+--task="Restock the carrots on the shelf."
+
+
+内参标定
+python -m deploy.calibrate_camera_charuco \
+    --camera /dev/video1 \
+    --width 1280 \
+    --height 720 \
+    --fps 30 \
+    --fourcc MJPG \
+    --dictionary DICT_5X5_50 \
+    --squares-x 5 \
+    --squares-y 7 \
+    --min-corners 20 \
+    --samples 35 \
+    --auto \
+    --clean-session
+
+手眼标定
+python -m deploy.calibrate_hand_eye_charuco \
+    --camera /dev/video1 \
+    --width 1280 \
+    --height 720 \
+    --fps 30 \
+    --fourcc MJPG \
+    --port /dev/ttyACM0 \
+    --robot-id eva-follower \
+    --squares-x 5 \
+    --squares-y 7 \
+    --dictionary DICT_5X5_50 \
+    --min-corners 16 \
+    --samples 20
+
+PnP
+python -m deploy.verify_apriltag_base_transform \
+    --camera /dev/video1 \
+    --width 1280 \
+    --height 720 \
+    --fps 30 \
+    --fourcc MJPG \
+    --port /dev/ttyACM0 \
+    --robot-id eva-follower \
+    --family tagStandard41h12 \
+    --tag-size 0.014
+std xyz = [7.53, 17.95, 9.23] mm
+valid detections = 399
+
+python -m deploy.deploy_policy_apriltag_real \
+    --tag-size 0.014 \
+    --camera /dev/video1 \
+    --width 1280 \
+    --height 720 \
+    --fps 30 \
+    --fourcc MJPG \
+    --port /dev/ttyACM0 \
+    --robot-id eva-follower \
+    --debug-dump
