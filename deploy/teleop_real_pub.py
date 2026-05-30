@@ -21,19 +21,38 @@ if str(PROJECT_ROOT) not in sys.path:
 from deploy.driver import JOINT_NAMES, _gripper_sim_rad_from_pct
 
 
-def _read_q_sim_rad(robot) -> np.ndarray:
-    obs = robot.get_observation()
+def _is_leader(robot_id: str) -> bool:
+    return robot_id.endswith("-leader") or robot_id == "leader"
+
+
+def _read_q_sim_rad(readings: dict[str, float]) -> np.ndarray:
     q = np.empty(6, dtype=np.float32)
     for i, name in enumerate(JOINT_NAMES[:5]):
-        q[i] = float(obs[f"{name}.pos"]) * (np.pi / 180.0)
-    q[5] = _gripper_sim_rad_from_pct(float(obs["gripper.pos"]))
+        q[i] = float(readings[f"{name}.pos"]) * (np.pi / 180.0)
+    q[5] = _gripper_sim_rad_from_pct(float(readings["gripper.pos"]))
     return q
+
+
+def _connect_real_device(args: argparse.Namespace):
+    if _is_leader(args.robot_id):
+        from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+
+        device = SO101Leader(SO101LeaderConfig(port=args.port, id=args.robot_id))
+        read_fn = device.get_action
+    else:
+        from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+
+        device = SO101Follower(SO101FollowerConfig(port=args.port, id=args.robot_id))
+        read_fn = device.get_observation
+
+    device.connect(calibrate=args.calibrate)
+    return device, read_fn
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Publish real SO-ARM101 joints over UDP for Isaac mirroring.")
     parser.add_argument("--port", type=str, default="/dev/ttyACM0", help="LeRobot serial port.")
-    parser.add_argument("--robot-id", type=str, default="eva-follower", help="LeRobot calibration id.")
+    parser.add_argument("--robot-id", type=str, default="eva-leader", help="LeRobot calibration id.")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="UDP receiver host.")
     parser.add_argument("--udp-port", type=int, default=5005, help="UDP receiver port.")
     parser.add_argument("--fps", type=int, default=50, help="Publish frequency.")
@@ -47,16 +66,13 @@ def main() -> None:
     parser.add_argument("--out", type=str, default=None, help="Optional JSONL log path.")
     args = parser.parse_args()
 
-    from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
-
-    cfg = SO101FollowerConfig(port=args.port, id=args.robot_id)
-    robot = SO101Follower(cfg)
+    robot = None
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     log_f = open(args.out, "w") if args.out else None
 
     try:
         print(f"[teleop_real_pub] connecting {args.robot_id} on {args.port}")
-        robot.connect(calibrate=args.calibrate)
+        robot, read_real_joints = _connect_real_device(args)
         if args.disable_torque:
             robot.bus.disable_torque()
             print("[teleop_real_pub] torque disabled; move the arm by hand")
@@ -68,7 +84,7 @@ def main() -> None:
         step = 0
         dst = (args.host, args.udp_port)
         while True:
-            q = _read_q_sim_rad(robot)
+            q = _read_q_sim_rad(read_real_joints())
             msg = {
                 "step": step,
                 "wall_time": time.time(),
@@ -97,7 +113,8 @@ def main() -> None:
         if log_f is not None:
             log_f.close()
         sock.close()
-        robot.disconnect()
+        if robot is not None:
+            robot.disconnect()
 
 
 if __name__ == "__main__":
